@@ -15,7 +15,7 @@ Vario reads the local data of AI applications on your machine (read-only), norma
 - **Token usage** per provider turn, with cached, cache-creation, uncached, output, and reasoning tokens tracked separately and their provenance preserved
 - **Raw source events** as an audit log
 
-It runs as a single process, either in the foreground or as a per-user background service. Data is buffered in a local spool, so the collector tolerates network outages, ClickHouse downtime, application restarts, and reboots without losing or duplicating data.
+It runs as a single process, either in the foreground or as a per-user background service. Data is buffered in a local spool, so the collector tolerates network outages, ClickHouse downtime, application restarts, and reboots. Delivery is at-least-once; retried or repeated rows carry the same key and version, so the `*_latest` views and the aggregate views count each record once (see [Delivery semantics](#delivery-semantics)).
 
 ## Supported integrations
 
@@ -102,16 +102,16 @@ The schema is created automatically on first delivery (or with `vario doctor --c
 
 | Table | Contents | Engine / key |
 | --- | --- | --- |
-| `sources` | One row per collected installation | `ReplacingMergeTree(version)` by `source_id` |
-| `projects` | Projects/workspaces | by `(source_id, project_id)` |
+| `sources` | One row per collected installation: host name, source database path, collection mode | `ReplacingMergeTree(version)` by `source_id` |
+| `projects` | Projects/workspaces; title and workspace path in messages+ mode | by `(source_id, project_id)` |
 | `conversations` | Threads: provider, model, mode, lineage, timestamps, title (messages+ mode) | by `(source_id, conversation_id)` |
 | `runs` | User requests and their model selection | by `(source_id, conversation_id, run_id)` |
 | `messages` | User/assistant messages; text in messages+ mode, token bloom-filter index | by `(source_id, conversation_id, message_id)` |
 | `execution_events` | Turn items: commands, tools, file changes, reasoning, errors; status, exit code, duration, sizes; payloads in full mode | by `(source_id, conversation_id, event_id)` |
 | `provider_turns` | Token usage and context snapshot per provider turn | by `(source_id, conversation_id, provider_turn_id)` |
-| `raw_events` | Source event log (payloads in full mode) | by `(source_id, sequence, event_id)` |
+| `raw_events` | Source event log: type, ids, time, known metadata keys; payloads in full mode | by `(source_id, sequence, event_id)` |
 
-Mutable tables keep every version; the highest `version` wins. Because ClickHouse merges asynchronously, query the `*_latest` views (which use `FINAL`) or use `argMax(..., version)`. Two aggregate views are provided: `token_usage_daily` and `tool_usage`.
+Mutable tables keep every version until ClickHouse merges them; the highest `version` wins. Because merges are asynchronous, query the `*_latest` views (which use `FINAL`, including `raw_events_latest`) or use `argMax(..., version)`; plain `SELECT`s on the base tables can return several versions of a row. Two aggregate views are provided: `token_usage_daily` (per day, source, provider, model and usage scope) and `tool_usage`.
 
 Example queries:
 
@@ -142,7 +142,7 @@ SELECT conversation_id, created_at, role, substring(text, 1, 200)
 FROM vario.messages_latest WHERE hasToken(lower(text), 'kubernetes') ORDER BY created_at DESC LIMIT 20;
 ```
 
-Token columns follow the source's reporting: `input_tokens` already includes cached and cache-creation tokens, and reasoning tokens are not added to `output_tokens`. `context_*` columns are context-window snapshots and must not be summed. Missing usage is `NULL`, not zero. See [docs/architecture.md](docs/architecture.md) for details.
+Token columns follow the source's reporting: `input_tokens` already includes cached and cache-creation tokens, and reasoning tokens are not added to `output_tokens`. `context_*` columns are context-window snapshots and must not be summed. Missing usage is `NULL`, not zero. Usage the source marks `partial` is stored as reported (a lower bound) and counted in `turns_incomplete_usage`. `token_usage_daily` keeps `usage_scope` as a grouping column; T3 Code currently reports only `main_agent`, and other scopes should not be added together until their relationship is known. See [docs/architecture.md](docs/architecture.md) for details.
 
 ## Collector operation
 
@@ -150,8 +150,23 @@ Token columns follow the source's reporting: `input_tokens` already includes cac
 - **Incremental sync** polls the event log every `poll_interval` and re-reads the entities touched by new events. Sequence gaps from compaction are handled.
 - **Reconciliation** re-reads all source state every `reconcile_interval` (and whenever the event log was compacted past the cursor or replaced). Unchanged records are not re-sent.
 - **Spool**: records and the cursor are committed atomically to a local SQLite database. Delivery batches rows per table, compresses them, and retries with exponential backoff and jitter. The spool is bounded; collection pauses when it is full.
-- **Only one collector** runs per data directory (lease). `vario backfill` refuses to run while the collector is active, because the collector backfills new sources itself.
+- **Only one collector** runs per data directory (lease). `vario backfill` refuses to run while the collector is active, because the collector backfills new sources itself. A lease left by a collector that crashed on the same host is taken over immediately; otherwise it expires after 30 s. A collector that loses its lease (for example after the machine slept past the expiry and another collector started) stops with exit code 1.
+- **Source replacement**: the cursor records the id of the last processed event. If the T3 Code database is replaced or restored from a backup, the collector detects it, re-reads the full state, and starts a new version epoch so the replacement's state wins.
 - **Shutdown**: `SIGINT`/`SIGTERM` stop polling and delivery; pending data stays spooled and is delivered on the next start.
+
+### Delivery semantics
+
+- Transport is **at-least-once**. A record is removed from the spool only after ClickHouse acknowledged the insert. If a response is lost after ClickHouse committed the insert (timeout, dropped connection, termination), the batch is sent again.
+- Re-sent rows are identical (same key and version), and a newer state always has a higher version, so `FINAL` views, `argMax(..., version)` and the aggregate views return each logical record once. Physical duplicates exist in the base tables until background merges remove them (`OPTIMIZE TABLE ... FINAL` forces this).
+- `insert_deduplication_token` additionally drops an identical retried batch, but only within ClickHouse's deduplication window (last 1000 blocks per table, non-replicated tables). Correctness does not depend on it.
+- Vario does not provide exactly-once delivery, and ClickHouse is not told about records deleted in the source (see limitations).
+
+### Recovery
+
+- **ClickHouse unreachable**: data stays spooled; delivery retries with exponential backoff up to `retry_max_backoff`. `vario status` shows pending rows and the last error. Batches rejected with a non-retryable error (for example a schema mismatch) are retried every `retry_max_backoff` and do not block other batches.
+- **Spool full** (`spool.max_size_mb`): collection pauses without advancing cursors and resumes when delivery catches up; nothing is dropped.
+- **Re-sending everything** (for example after dropping the ClickHouse database): stop the collector, then `vario backfill --source t3code --force`.
+- **Resetting local state**: stop the collector and delete `state.db*` in the data directory. Undelivered spooled data is lost; the next start re-reads the source's current state (events that T3 Code has already pruned cannot be recovered).
 
 ## Background service
 
@@ -161,7 +176,7 @@ vario service status
 vario service uninstall   # stops gracefully and removes the agent; data and config are kept
 ```
 
-On macOS, Vario installs a per-user LaunchAgent (`~/Library/LaunchAgents/io.github.nedanwr.vario.plist`) that runs `vario run` with your configuration, starts at login, restarts after abnormal exits (throttled to once per 30 s), and runs at background priority. Logs go to `~/Library/Logs/Vario/vario.log` (rotated at 10 MiB). No privileged daemon is installed. Re-run `vario service install` after moving the executable or the configuration.
+On macOS, Vario installs a per-user LaunchAgent (`~/Library/LaunchAgents/io.github.nedanwr.vario.plist`) that runs `vario run` with your configuration, starts at login, restarts after abnormal exits (throttled to once per 30 s), and runs at background priority. Logs go to `~/Library/Logs/Vario/vario.log` (mode `0600`, rotated at 10 MiB, one previous file kept); `vario.stdout.log` and `vario.stderr.log` in the same directory receive only startup failures and are not rotated. No privileged daemon is installed and nothing is installed unless you run `vario service install`. Re-run `vario service install` after moving the executable or the configuration. A configuration error makes the service exit with a failure, so launchd retries it every 30 s until it is fixed or uninstalled.
 
 Linux (systemd user units) and Windows service installation are **not implemented**. On those platforms, run `vario run` under your own supervisor.
 
@@ -170,17 +185,20 @@ Linux (systemd user units) and Windows service installation are **not implemente
 Vario handles potentially sensitive content. Transcripts and command output can contain credentials, private files, and proprietary source code.
 
 - **Collection modes** (shown in the configuration and in `vario status`):
-  - `metrics` (default): token usage, models, timings, tool names, statuses, exit codes, and content sizes. No message text, titles, tool inputs/outputs, or file names.
-  - `messages`: adds user/assistant message text, conversation titles, branch names, attachment metadata, and changed file names.
-  - `full`: adds command and tool inputs/outputs, reasoning text, file diffs, web searches, and raw event payloads.
+  - `metrics` (default): token usage, models, timings, tool names, statuses, exit codes, and content sizes. No message text, conversation or project titles, workspace paths, tool inputs/outputs, or file names. Identifiers (conversation, message, project ids) are exported as-is.
+  - `messages`: adds user/assistant message text, conversation and project titles, workspace paths, branch names, linked pull requests, attachment metadata, and changed file names.
+  - `full`: adds command and tool inputs/outputs, reasoning text, file diffs, web searches, raw event payloads and metadata, and every other source field.
+- Every mode exports the machine's host name and the source database path (`sources` table) so installations can be told apart. Raw source events outside `full` mode carry only their type, ids, timestamp and a fixed allow-list of operational metadata keys; outside `full` mode, unknown source fields are dropped.
 - `messages` and `full` require `allow_sensitive_content = true`, which `vario init` only sets after you type `yes`.
-- **Redaction** runs before data is written to the spool. Built-in rules cover private keys, Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/Google keys, JWTs, bearer tokens, credentials in URLs, and `password=`/`secret:`-style assignments. Add your own with `extra_redaction_patterns`. Redaction counts are recorded per row. Redaction is best-effort and cannot catch every secret.
+- **Redaction** runs before data is written to the spool, on every exported text field and kept JSON attribute. Built-in rules cover private keys, Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/Google keys, JWTs, `Authorization` headers (bearer, basic and others), credentials in URLs and connection strings, and assignments to credential-named keys (`password=`, `DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY=`, `"apiKey": "..."`, `token: ...`), including inside JSON. Add your own with `extra_redaction_patterns`. Redaction counts are recorded per row.
+- **What redaction does not do**: it matches known formats and credential-named assignments. It does not detect secrets without a recognizable shape or name (for example a bare random password in prose, or a key pasted on its own), personal data, or proprietary code. Treat `messages` and `full` data in ClickHouse as sensitive, and protect it accordingly.
 - Long fields are truncated at `max_field_bytes` and flagged.
 - Logs contain counts, identifiers, and error summaries, never message contents or credentials. ClickHouse errors that echo row data are sanitized.
+- Local files: the configuration, password file, spool database (including its `-wal`/`-shm` files) and log files are created with mode `0600`, and directories Vario creates with `0700`. The password is sent only in the `X-ClickHouse-Key` header; HTTP redirects are never followed, so it cannot be forwarded to another host.
 - **No telemetry.** Vario sends data only to the ClickHouse endpoint you configure.
 - Source databases are opened read-only and are never modified.
 
-Changing the collection mode applies to records collected afterwards. Existing records are re-sent under the new policy only when they change or on `vario backfill --source t3code --force`. Lowering the mode does not delete content already stored in ClickHouse.
+Changing the collection or redaction settings applies to records collected afterwards. Existing records are re-sent under the new policy at the next periodic reconciliation (`reconcile_interval`) or on `vario backfill --source t3code --force`; this replaces the latest version of each row, but older versions remain in the base tables until ClickHouse merges them. Lowering the mode therefore does not immediately remove content already stored in ClickHouse; to purge it, delete it in ClickHouse yourself (for example `OPTIMIZE TABLE vario.messages FINAL` after re-sending, or dropping the affected tables and re-sending with `--force`).
 
 ## Current limitations
 
@@ -189,7 +207,9 @@ Changing the collection mode applies to records collected afterwards. Existing r
 - Credentials are stored in a `0600` file, not in the OS keychain.
 - Tables are created as non-replicated `ReplacingMergeTree`; for ClickHouse clusters, create replicated equivalents yourself before running Vario.
 - Deletions in the source are reflected only for conversations and projects (`deleted_at` / `is_deleted`); messages or items hard-deleted from T3 Code remain archived in ClickHouse.
-- If the T3 Code database is replaced by a new one whose event log has already grown past the old cursor, Vario cannot detect the reset until the next periodic reconciliation.
+- Events T3 Code prunes from its event log before Vario reads them are missing from `raw_events`; the projected state is still collected through reconciliation.
+- A replaced T3 Code database is detected by the event id at the cursor. If T3 Code has also pruned that event, detection falls back to the log-length check and the periodic reconciliation.
+- Delivery is at-least-once; see [Delivery semantics](#delivery-semantics). Base tables can contain duplicate rows until merges.
 - Schema evolution of the ClickHouse tables is not yet automated beyond `CREATE ... IF NOT EXISTS`.
 - Not tested against ClickHouse Cloud or ClickHouse versions other than 25.8.
 
@@ -200,7 +220,7 @@ make test             # unit tests (synthetic fixture databases; no private data
 make race             # tests with the race detector
 make lint             # gofmt, go vet, staticcheck
 make clickhouse-up    # start a local ClickHouse 25.8 in Docker on 127.0.0.1:18123
-make integration      # ClickHouse integration tests (schema, versioned dedup, retries, search)
+make integration      # ClickHouse integration tests (schema, versioned dedup, aggregation, ambiguous retries)
 make clickhouse-down
 ```
 
