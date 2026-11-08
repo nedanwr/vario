@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -171,6 +172,78 @@ func (a *Agent) Uninstall() error {
 		return err
 	}
 	return nil
+}
+
+// ErrNotLoaded is returned by Restart when the agent is not loaded.
+var ErrNotLoaded = errors.New("service is not loaded")
+
+// Restart stops the running agent (gracefully, with SIGTERM) and starts it
+// again so that it reads the current configuration. The definition is not
+// changed.
+func (a *Agent) Restart() error {
+	if !a.loaded() {
+		return ErrNotLoaded
+	}
+	if out, err := a.exec("kickstart", "-k", a.service()); err != nil {
+		return fmt.Errorf("launchctl kickstart: %v: %s", err, out)
+	}
+	return nil
+}
+
+// ProgramArguments reads the program and arguments from the installed plist.
+func (a *Agent) ProgramArguments() ([]string, error) {
+	f, err := os.Open(a.PlistPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotInstalled
+		}
+		return nil, err
+	}
+	defer f.Close()
+	return parseProgramArguments(f)
+}
+
+// parseProgramArguments extracts the ProgramArguments array from a plist.
+func parseProgramArguments(r io.Reader) ([]string, error) {
+	dec := xml.NewDecoder(r)
+	dec.Strict = false
+	var (
+		lastKey string
+		inArray bool
+		out     []string
+		text    strings.Builder
+		depth   int
+	)
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse plist: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			text.Reset()
+			if t.Name.Local == "array" && lastKey == "ProgramArguments" && depth == 3 {
+				inArray = true
+			}
+		case xml.CharData:
+			text.Write(t)
+		case xml.EndElement:
+			depth--
+			switch {
+			case t.Name.Local == "key" && depth == 2:
+				lastKey = text.String()
+			case t.Name.Local == "string" && inArray:
+				out = append(out, text.String())
+			case t.Name.Local == "array" && inArray:
+				return out, nil
+			}
+		}
+	}
+	return nil, errors.New("plist has no ProgramArguments")
 }
 
 type Status struct {

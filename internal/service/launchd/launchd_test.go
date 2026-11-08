@@ -104,3 +104,38 @@ func TestInstallStatusUninstall(t *testing.T) {
 		t.Fatalf("second uninstall: %v", err)
 	}
 }
+
+func TestProgramArgumentsAndRestart(t *testing.T) {
+	fake := &fakeLaunchctl{}
+	a := &Agent{Label: "io.example.vario", Dir: filepath.Join(t.TempDir(), "LaunchAgents"), uid: 501, exec: fake.run}
+	if _, err := a.ProgramArguments(); !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("missing plist: %v", err)
+	}
+	if err := a.Restart(); !errors.Is(err, ErrNotLoaded) {
+		t.Fatalf("restart when not loaded: %v", err)
+	}
+	s := spec()
+	s.StdoutPath, s.StderrPath = "", ""
+	if err := a.Install(s); err != nil {
+		t.Fatal(err)
+	}
+	args, err := a.ProgramArguments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]string{s.Program}, s.Args...)
+	if strings.Join(args, "|") != strings.Join(want, "|") {
+		t.Fatalf("args = %q, want %q", args, want)
+	}
+	fake.calls = nil
+	if err := a.Restart(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(fake.calls, ",") != "print,kickstart" {
+		t.Fatalf("restart calls: %v", fake.calls)
+	}
+	// Restarting does not rewrite the definition.
+	if args2, _ := a.ProgramArguments(); strings.Join(args2, "|") != strings.Join(want, "|") {
+		t.Fatal("restart must not change the plist")
+	}
+}
