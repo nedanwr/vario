@@ -15,6 +15,7 @@ import (
 	"github.com/nedanwr/vario/internal/collector"
 	"github.com/nedanwr/vario/internal/config"
 	"github.com/nedanwr/vario/internal/privacy"
+	"github.com/nedanwr/vario/internal/service"
 	"github.com/nedanwr/vario/internal/sources"
 	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/spool"
@@ -99,17 +100,51 @@ ClickHouse for analysis. Data goes only to the destination you configure.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.PersistentFlags().StringVar(&a.configPath, "config", "", "configuration file (default: $VARIO_CONFIG or the platform config directory)")
+	root.PersistentFlags().StringVar(&a.configPath, "config", "", "configuration file (default: $VARIO_CONFIG, else $VARIO_HOME/config.toml, else ~/.vario/config.toml)")
 	root.PersistentFlags().BoolVarP(&a.verbose, "verbose", "v", false, "enable debug logging")
-	root.AddCommand(a.initCmd(), a.sourcesCmd(), a.backfillCmd(), a.runCmd(), a.statusCmd(), a.doctorCmd(), a.serviceCmd(), a.versionCmd())
+	root.AddCommand(a.initCmd(), a.sourcesCmd(), a.backfillCmd(), a.runCmd(), a.statusCmd(), a.doctorCmd(), a.serviceCmd(), a.configCmd(), a.versionCmd())
 	return root
 }
 
+// resolveLocation applies the configuration precedence shared by every
+// command, the collector and the background service (see config.Resolve).
+func (a *app) resolveLocation() (config.Location, error) {
+	return config.Resolve(a.configPath)
+}
+
 func (a *app) resolveConfigPath() (string, error) {
-	if a.configPath != "" {
-		return config.ExpandPath(a.configPath)
+	loc, err := a.resolveLocation()
+	return loc.Path, err
+}
+
+// serviceManager returns the platform service manager; tests replace it.
+var serviceManager = service.Default
+
+// serviceNotice tells the user how configuration changes reach the
+// background service. It never restarts or reinstalls the service. It returns
+// true if a service is installed.
+func (a *app) serviceNotice(cfgPath string, changed bool) bool {
+	mgr, err := serviceManager()
+	if err != nil {
+		return false
 	}
-	return config.DefaultConfigPath()
+	st, err := mgr.Status()
+	if err != nil || !st.Installed {
+		return false
+	}
+	if args, err := mgr.Args(); err == nil {
+		if p := service.ConfigPath(args); p != "" && p != cfgPath {
+			fmt.Fprintf(a.stdout, "\n! The background service reads %s, not %s.\n"+
+				"  Run `vario service install` once to point it at this configuration.\n",
+				config.DisplayPath(p), config.DisplayPath(cfgPath))
+			return true
+		}
+	}
+	if changed && st.Running {
+		fmt.Fprint(a.stdout, "\nThe background service is running with the previous settings. Apply the changes with:\n"+
+			"  vario service restart\n")
+	}
+	return true
 }
 
 // loadConfig loads and validates the configuration file.
@@ -128,7 +163,9 @@ func (a *app) loadConfig() (*config.Config, error) {
 	return cfg, nil
 }
 
-func statePath(cfg *config.Config) string { return filepath.Join(cfg.Collector.DataDir, "state.db") }
+func statePath(cfg *config.Config) string {
+	return filepath.Join(cfg.Collector.DataDir, config.StateFileName)
+}
 
 func openStore(cfg *config.Config) (*spool.Store, error) {
 	return spool.Open(statePath(cfg), int64(cfg.Spool.MaxSizeMB)<<20)

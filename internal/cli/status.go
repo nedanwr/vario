@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nedanwr/vario/internal/model"
-	"github.com/nedanwr/vario/internal/service"
 	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/spool"
 )
@@ -32,7 +31,7 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 			fmt.Fprintf(w, "ClickHouse     %s  database=%s user=%s\n", cfg.ClickHouse.URL, cfg.ClickHouse.Database, cfg.ClickHouse.Username)
 			fmt.Fprintf(w, "State          %s\n", statePath(cfg))
 
-			if mgr, err := service.Default(); err == nil {
+			if mgr, err := serviceManager(); err == nil {
 				st, _ := mgr.Status()
 				switch {
 				case st.Running:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -13,10 +14,11 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nedanwr/vario/internal/config"
-	"github.com/nedanwr/vario/internal/model"
 	"github.com/nedanwr/vario/internal/privacy"
+	"github.com/nedanwr/vario/internal/service"
 	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/spool"
+	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
 
 type checker struct {
@@ -30,6 +32,8 @@ func (c *checker) warn(format string, a ...any) {
 	c.warnings++
 	fmt.Fprintf(c.w, "  ! "+format+"\n", a...)
 }
+func (c *checker) info(format string, a ...any) { fmt.Fprintf(c.w, "  · "+format+"\n", a...) }
+func (c *checker) hint(s string)                { fmt.Fprintf(c.w, "    %s\n", s) }
 func (c *checker) fail(format string, a ...any) {
 	c.failures++
 	fmt.Fprintf(c.w, "  ✗ "+format+"\n", a...)
@@ -44,7 +48,10 @@ func (a *app) doctorCmd() *cobra.Command {
 source (read-only), the local spool, and the ClickHouse connection,
 authentication and schema. It exits with status 1 if any check fails.
 
-With --create-schema, missing ClickHouse tables and views are created.`,
+Doctor only reads from ClickHouse. With --create-schema, missing Vario tables
+and views are created in the configured database (and the database itself if
+it is missing and clickhouse.create_database = true). Existing objects are
+never dropped or altered; incompatible ones are reported.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c := &checker{w: &strings.Builder{}}
@@ -71,6 +78,10 @@ With --create-schema, missing ClickHouse tables and views are created.`,
 			}
 			c.ok("configuration is valid")
 			checkPrivate(c, path, "configuration file")
+			if dir := filepath.Dir(path); filepath.Base(dir) == ".vario" {
+				checkPrivate(c, dir, "configuration directory")
+			}
+			a.checkServiceConfig(c, path)
 			c.ok("collection mode: %s (secret redaction %s)", cfg.Privacy.Mode, onOff(cfg.Privacy.RedactSecrets))
 			if !cfg.Privacy.RedactSecrets && cfg.Privacy.Mode != config.ModeMetrics {
 				c.warn("secret redaction is disabled while collecting conversation content")
@@ -130,7 +141,7 @@ With --create-schema, missing ClickHouse tables and views are created.`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&fixSchema, "create-schema", false, "create missing ClickHouse tables and views")
+	cmd.Flags().BoolVar(&fixSchema, "create-schema", false, "create missing Vario tables and views (and the database if create_database = true)")
 	return cmd
 }
 
@@ -140,10 +151,30 @@ func checkPrivate(c *checker, path, what string) {
 		return
 	}
 	if runtime.GOOS != "windows" && st.Mode().Perm()&0o077 != 0 {
-		c.warn("%s %s is accessible by other users (mode %o); run: chmod 600 %q", what, path, st.Mode().Perm(), path)
+		mode := "600"
+		if st.IsDir() {
+			mode = "700"
+		}
+		c.warn("%s %s is accessible by other users (mode %o); run: chmod %s %q", what, path, st.Mode().Perm(), mode, path)
 		return
 	}
 	c.ok("%s permissions are restricted", what)
+}
+
+// checkServiceConfig warns when the installed background service reads a
+// different configuration file than this command.
+func (a *app) checkServiceConfig(c *checker, path string) {
+	mgr, err := serviceManager()
+	if err != nil {
+		return
+	}
+	args, err := mgr.Args()
+	if err != nil {
+		return
+	}
+	if p := service.ConfigPath(args); p != "" && p != path {
+		c.warn("the background service reads %s, not this configuration; run `vario service install` to switch it", p)
+	}
 }
 
 func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Config, fixSchema bool) {
@@ -166,40 +197,75 @@ func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Confi
 	} else {
 		c.warn("no password configured (%s or $%s)", cfg.PasswordPath(), config.EnvPassword)
 	}
+	if cfg.ClickHouse.CreateDatabase {
+		c.ok("database %s: Vario may create it if missing (create_database = true)", cfg.ClickHouse.Database)
+	} else {
+		c.ok("database %s: existing database only (create_database = false)", cfg.ClickHouse.Database)
+	}
 	client, err := newClient(cfg)
 	if err != nil {
 		c.fail("client setup: %v", err)
 		return
 	}
-	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := client.Ping(cctx); err != nil {
-		c.fail("endpoint unreachable: %v", err)
-		return
-	}
-	c.ok("endpoint reachable")
-	ver, err := client.ServerVersion(cctx)
-	if err != nil {
-		c.fail("authentication or query failed: %v", err)
-		return
-	}
-	c.ok("authenticated as %s (ClickHouse %s)", cfg.ClickHouse.Username, ver)
 	if fixSchema {
-		if err := client.EnsureSchema(cctx); err != nil {
-			c.fail("schema creation failed: %v", err)
+		res, err := client.InitSchema(cctx)
+		if err != nil {
+			kind := clickhouse.Classify(err)
+			c.fail("schema creation failed (%s): %v", kind, err)
+			c.hint(clickhouse.Hint(kind))
 			return
 		}
-		c.ok("schema created or already up to date")
+		var b strings.Builder
+		printSchemaResult(&b, cfg.ClickHouse.Database, res)
+		for _, line := range strings.Split(strings.TrimSpace(b.String()), "\n") {
+			if strings.HasPrefix(line, "!") {
+				c.warn("%s", strings.TrimSpace(strings.TrimPrefix(line, "!")))
+			} else {
+				c.ok("%s", strings.TrimSpace(strings.TrimPrefix(line, "✓")))
+			}
+		}
 	}
-	missing, err := client.MissingTables(cctx)
-	switch {
-	case err != nil:
-		c.fail("cannot inspect schema: %v", err)
-	case len(missing) == len(model.Tables):
-		c.warn("database %s has no Vario tables yet; they are created on first delivery (or run `vario doctor --create-schema`)", cfg.ClickHouse.Database)
-	case len(missing) > 0:
-		c.warn("missing tables: %s (created automatically on next delivery)", strings.Join(missing, ", "))
-	default:
-		c.ok("all Vario tables present in database %s", cfg.ClickHouse.Database)
+	rep, err := client.CheckConnection(cctx)
+	if err != nil {
+		var ce *clickhouse.CheckError
+		kind := clickhouse.Classify(err)
+		stage := "reach"
+		if errors.As(err, &ce) {
+			kind, stage = ce.Kind, ce.Stage
+		}
+		switch stage {
+		case "reach":
+			c.fail("endpoint unreachable (%s): %v", kind, err)
+		case "authenticate":
+			c.ok("endpoint reachable")
+			c.fail("authentication or query failed (%s): %v", kind, err)
+		default:
+			c.ok("endpoint reachable")
+			c.fail("cannot inspect database %s (%s): %v", cfg.ClickHouse.Database, kind, err)
+		}
+		c.hint(clickhouse.Hint(kind))
+		return
+	}
+	var b strings.Builder
+	printReport(&b, rep)
+	for _, line := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "✓ "):
+			c.ok("%s", t[len("✓ "):])
+		case strings.HasPrefix(t, "✗ "):
+			c.fail("%s", t[len("✗ "):])
+		case strings.HasPrefix(t, "! "):
+			c.warn("%s", t[2:])
+		case strings.HasPrefix(t, "· "):
+			c.info("%s", t[len("· "):])
+		default:
+			c.hint(t)
+		}
+	}
+	if !fixSchema && rep.Ready() && !rep.Schema.Complete() {
+		c.info("run `vario doctor --create-schema` to create the schema now")
 	}
 }

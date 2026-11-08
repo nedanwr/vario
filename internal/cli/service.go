@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/nedanwr/vario/internal/config"
 	"github.com/nedanwr/vario/internal/service"
 )
 
@@ -23,9 +24,12 @@ at login, restarts after abnormal exits and keeps running without a terminal.
 Implemented for macOS (per-user LaunchAgent). Linux and Windows are not yet
 supported; run 'vario run' under your own supervisor there.`,
 	}
-	cmd.AddCommand(a.serviceInstallCmd(), a.serviceUninstallCmd(), a.serviceStatusCmd())
+	cmd.AddCommand(a.serviceInstallCmd(), a.serviceUninstallCmd(), a.serviceRestartCmd(), a.serviceStatusCmd())
 	return cmd
 }
+
+// executable returns the running binary's path; tests replace it.
+var executable = os.Executable
 
 func logDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -43,11 +47,14 @@ func (a *app) serviceInstallCmd() *cobra.Command {
 		Use:   "install",
 		Short: "Install and start the background service for the current user",
 		Long: `Install writes a LaunchAgent definition to ~/Library/LaunchAgents and loads
-it immediately. The service runs this vario executable with the current
-configuration file. Re-run install after moving the executable or config.`,
+it immediately. The service runs this vario executable with the resolved
+configuration file (see 'vario config path'); no credentials are written to
+the definition. Configuration changes (endpoint, database, mode, ...) only
+need 'vario service restart'. Re-run install after moving the executable or
+switching to a different configuration file.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			mgr, err := service.Default()
+			mgr, err := serviceManager()
 			if err != nil {
 				return err
 			}
@@ -58,7 +65,7 @@ configuration file. Re-run install after moving the executable or config.`,
 			if len(cfg.Sources) == 0 {
 				return withCode(ExitUsage, errors.New("no sources configured; run `vario sources add t3code` first"))
 			}
-			exe, err := os.Executable()
+			exe, err := executable()
 			if err != nil {
 				return err
 			}
@@ -101,7 +108,7 @@ func (a *app) serviceUninstallCmd() *cobra.Command {
 and cursors) and removes its definition. Configuration and local state are kept.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			mgr, err := service.Default()
+			mgr, err := serviceManager()
 			if err != nil {
 				return err
 			}
@@ -118,13 +125,62 @@ and cursors) and removes its definition. Configuration and local state are kept.
 	}
 }
 
+func (a *app) serviceRestartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the background service to apply configuration changes",
+		Long: `Restart stops the running collector gracefully (spooled data and cursors are
+kept) and starts it again, so that it reads the current configuration. The
+service definition is not changed. The configuration is validated first so
+that a broken configuration does not stop a working collector.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			mgr, err := serviceManager()
+			if err != nil {
+				return err
+			}
+			st, err := mgr.Status()
+			if err != nil {
+				return err
+			}
+			if !st.Installed {
+				return withCode(ExitUsage, errors.New("the service is not installed; run `vario service install`"))
+			}
+			path, err := a.resolveConfigPath()
+			if err != nil {
+				return withCode(ExitUsage, err)
+			}
+			if args, err := mgr.Args(); err == nil {
+				if p := service.ConfigPath(args); p != "" {
+					path = p
+				}
+			}
+			cfg, err := config.Load(path)
+			if err == nil {
+				err = cfg.Validate()
+			}
+			if err != nil {
+				return withCode(ExitUsage, fmt.Errorf("not restarting: the configuration used by the service (%s) is invalid:\n  %s", path, strings.ReplaceAll(err.Error(), "\n", "\n  ")))
+			}
+			if err := mgr.Restart(); err != nil {
+				if errors.Is(err, service.ErrNotLoaded) {
+					return fmt.Errorf("the service is installed but not loaded; run `vario service install` to load it")
+				}
+				return err
+			}
+			fmt.Fprintf(a.stdout, "Restarted the background service with %s\n", config.DisplayPath(path))
+			return nil
+		},
+	}
+}
+
 func (a *app) serviceStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Show whether the background service is installed and running",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			mgr, err := service.Default()
+			mgr, err := serviceManager()
 			if err != nil {
 				return err
 			}
@@ -133,6 +189,14 @@ func (a *app) serviceStatusCmd() *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(a.stdout, "Definition  %s (installed: %t)\n", mgr.Definition(), st.Installed)
+			if args, err := mgr.Args(); err == nil {
+				if p := service.ConfigPath(args); p != "" {
+					fmt.Fprintf(a.stdout, "Config      %s\n", p)
+					if cur, err := a.resolveConfigPath(); err == nil && cur != p {
+						fmt.Fprintf(a.stdout, "            ! differs from the current configuration %s; run `vario service install` to switch\n", cur)
+					}
+				}
+			}
 			switch {
 			case st.Running:
 				fmt.Fprintf(a.stdout, "State       running (pid %d)\n", st.PID)

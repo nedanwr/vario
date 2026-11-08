@@ -187,8 +187,9 @@ its default location.`,
 			if !d.Compatible && !force {
 				return fmt.Errorf("source not usable at %s (use --force to add it anyway)", check)
 			}
-			cfg.UpsertSource(config.SourceConfig{Kind: config.SourceT3Code, Enabled: !disabled, Path: check})
-			if err := cfg.Save(); err != nil {
+			next := cfg.Clone()
+			next.UpsertSource(config.SourceConfig{Kind: config.SourceT3Code, Enabled: !disabled, Path: check})
+			if _, err := config.Update(cfgPath, cfg.Fingerprint(), config.Diff(cfg, next)); err != nil {
 				return err
 			}
 			state := "enabled"
@@ -197,6 +198,7 @@ its default location.`,
 			}
 			fmt.Fprintf(a.stdout, "\nSource t3code %s in %s\n", state, cfgPath)
 			fmt.Fprintln(a.stdout, "Next: `vario backfill --source t3code` or `vario run`.")
+			a.serviceNotice(cfgPath, true)
 			return nil
 		},
 	}
