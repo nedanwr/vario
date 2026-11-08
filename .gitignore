@@ -1,0 +1,56 @@
+# --- Go binaries and build artifacts ---
+/vario
+/bin/
+/dist/
+/build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+*.coverprofile
+go.work
+go.work.sum
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# --- Editors and IDEs ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+
+# --- Local configuration and secrets ---
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+*.pem
+*.key
+
+# --- Temporary files and logs ---
+tmp/
+*.tmp
+*.log
+logs/
+
+# --- Local databases and data ---
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+/data/
+clickhouse-data/
