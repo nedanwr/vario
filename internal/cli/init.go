@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -119,6 +121,23 @@ func (p *prompter) secret(label string) (string, error) {
 	}
 	fmt.Fprintf(p.w, "%s: ", label)
 	if f, ok := p.in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		// ReadPassword disables echo; restore it if the user presses Ctrl-C,
+		// which would otherwise leave the terminal without echo.
+		if st, err := term.GetState(int(f.Fd())); err == nil {
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+			done := make(chan struct{})
+			defer func() { signal.Stop(sig); close(done) }()
+			go func() {
+				select {
+				case <-sig:
+					_ = term.Restore(int(f.Fd()), st)
+					fmt.Fprintln(p.w)
+					os.Exit(130)
+				case <-done:
+				}
+			}()
+		}
 		b, err := term.ReadPassword(int(f.Fd()))
 		fmt.Fprintln(p.w)
 		return string(b), err
@@ -258,7 +277,7 @@ func (a *app) runInit(ctx context.Context, o initOptions) error {
 	// Collection mode.
 	fmt.Fprintln(a.stdout, `Collection modes:
   metrics   token usage, models, timings, tool names and statuses (no conversation text)
-  messages  metrics + user/assistant message text and conversation titles
+  messages  metrics + user/assistant message text, conversation and project titles
   full      messages + tool inputs/outputs, reasoning, file diffs, web searches, raw events`)
 	for {
 		mode, err := p.ask("Collection mode", def(o.mode, config.ModeMetrics))

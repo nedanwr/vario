@@ -471,3 +471,103 @@ func TestSchemaChangeIsDetected(t *testing.T) {
 		t.Fatalf("schema change must be re-inspected and rejected: %v", err)
 	}
 }
+
+// Metrics mode must not export project titles or workspace paths, and raw
+// event metadata must be reduced to known operational keys outside full mode.
+func TestMetricsModeHasNoProjectNamesOrUnknownMetadata(t *testing.T) {
+	f := t3codetest.New(t)
+	f.Standard()
+	f.EventWithMetadata("thread.visited", "thread-1", map[string]any{"id": "thread-1"},
+		map[string]any{"driver": "claudeAgent", "origin": map[string]any{"surface": "web", "appVersion": "1.2.3"},
+			"note": "customer acme-merger password=hunter2secret"})
+	src := t3code.New(f.Path, policy(t, config.ModeMetrics), 100)
+	defer src.Close()
+	c, _ := snapshot(t, src, "", true)
+
+	pr := find[*model.ProjectRow](t, c.byTable[model.TableProjects], "proj-1")
+	if pr.Title != "" || pr.WorkspaceRoot != "" {
+		t.Errorf("metrics mode leaked project title/path: %+v", pr)
+	}
+	sawOrigin := false
+	for _, r := range c.byTable[model.TableRawEvents] {
+		ev := r.Row.(*model.RawEventRow)
+		if strings.Contains(ev.Metadata, "acme-merger") || strings.Contains(ev.Metadata, "hunter2") {
+			t.Fatalf("unknown metadata keys must be dropped outside full mode: %s", ev.Metadata)
+		}
+		if strings.Contains(ev.Metadata, `"surface":"web"`) && strings.Contains(ev.Metadata, `"driver":"claudeAgent"`) {
+			sawOrigin = true
+		}
+	}
+	if !sawOrigin {
+		t.Error("known operational metadata should be kept")
+	}
+
+	full := t3code.New(f.Path, policy(t, config.ModeFull), 100)
+	defer full.Close()
+	c, _ = snapshot(t, full, "", true)
+	for _, r := range c.byTable[model.TableRawEvents] {
+		ev := r.Row.(*model.RawEventRow)
+		if strings.Contains(ev.Metadata, "hunter2secret") {
+			t.Fatalf("full mode metadata must be redacted: %s", ev.Metadata)
+		}
+	}
+	pr = find[*model.ProjectRow](t, c.byTable[model.TableProjects], "proj-1")
+	if pr.Title != "demo" || pr.WorkspaceRoot != "/home/dev/demo" {
+		t.Errorf("full mode should keep project title/path: %+v", pr)
+	}
+}
+
+// Attributes kept outside full mode are redacted too.
+func TestAttributesAreRedacted(t *testing.T) {
+	f := t3codetest.New(t)
+	f.Standard()
+	f.ThreadPayload("thread-1", map[string]any{"pullRequests": []any{map[string]any{"url": "https://bob:hunter2pass@git.example.com/pr/1"}}})
+	src := t3code.New(f.Path, policy(t, config.ModeMessages), 100)
+	defer src.Close()
+	c, _ := snapshot(t, src, "", false)
+	conv := find[*model.ConversationRow](t, c.byTable[model.TableConversations], "thread-1")
+	if !strings.Contains(conv.Attributes, "pullRequests") || strings.Contains(conv.Attributes, "hunter2pass") {
+		t.Fatalf("attributes not redacted: %s", conv.Attributes)
+	}
+}
+
+// A replaced database whose event log already extends past the stored cursor
+// is detected by the cursor's event-id anchor, and the snapshot that follows
+// starts a new version epoch so the replacement's state wins.
+func TestReplacedDatabaseWithLongerLogIsDetected(t *testing.T) {
+	a := t3codetest.New(t)
+	a.Standard()
+	srcA := t3code.New(a.Path, policy(t, config.ModeMetrics), 100)
+	defer srcA.Close()
+	_, cur := snapshot(t, srcA, "", false)
+
+	b := t3codetest.New(t)
+	b.Standard()
+	for i := 0; i < 5; i++ {
+		b.TouchThread("thread-1", "2026-05-01T00:00:00.000Z")
+	}
+	if _, err := b.DB.Exec(`UPDATE orchestration_events SET event_id = 'other-' || event_id`); err != nil {
+		t.Fatal(err)
+	}
+	srcB := t3code.New(b.Path, policy(t, config.ModeMetrics), 100)
+	defer srcB.Close()
+	cs, err := srcB.Changes(context.Background(), cur, 100)
+	if err != nil || !strings.Contains(cs.Reconcile, "replaced") {
+		t.Fatalf("replacement not detected: %+v %v", cs, err)
+	}
+	_, next := snapshot(t, srcB, cur, false)
+	if !strings.Contains(next, `"epoch":2`) {
+		t.Fatalf("snapshot after replacement must start a new epoch: %s", next)
+	}
+
+	// No false positive when the anchored event was merely pruned.
+	_, cur = snapshot(t, srcA, "", false)
+	a.Message("msg-new", "thread-1", "run-1", "user", "hello", false)
+	if _, err := a.DB.Exec(`DELETE FROM orchestration_events WHERE sequence = ?`, cursorSeq(t, cur)); err != nil {
+		t.Fatal(err)
+	}
+	cs, err = srcA.Changes(context.Background(), cur, 100)
+	if err != nil || cs.Reconcile != "" || len(cs.Records) == 0 {
+		t.Fatalf("pruned anchor must not force a reset: %+v %v", cs, err)
+	}
+}

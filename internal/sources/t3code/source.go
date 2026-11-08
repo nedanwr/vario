@@ -142,6 +142,10 @@ type cursor struct {
 	V     int   `json:"v"`
 	Epoch int64 `json:"epoch"`
 	Seq   int64 `json:"seq"`
+	// Anchor is the event_id at Seq, when that event exists. Event ids are
+	// unique and never change, so a different id at Seq means the database was
+	// replaced (for example restored from a backup) even if its log is longer.
+	Anchor string `json:"anchor,omitempty"`
 }
 
 func parseCursor(s string) (cursor, bool) {
@@ -153,7 +157,7 @@ func parseCursor(s string) (cursor, bool) {
 }
 
 func (c cursor) String() string {
-	b, _ := json.Marshal(cursor{V: 1, Epoch: c.Epoch, Seq: c.Seq})
+	b, _ := json.Marshal(cursor{V: 1, Epoch: c.Epoch, Seq: c.Seq, Anchor: c.Anchor})
 	return string(b)
 }
 
@@ -209,13 +213,20 @@ func (s *Source) Snapshot(ctx context.Context, prevCursor string, includeHistory
 	var historyAfter int64
 	if prev, ok := parseCursor(prevCursor); ok {
 		cur.Epoch = prev.Epoch
-		if b.maxSequence < prev.Seq {
+		reason, err := logReplaced(ctx, tx, b, prev)
+		if err != nil {
+			return "", err
+		}
+		if reason != "" {
 			cur.Epoch++
 		} else if !includeHistory {
 			historyAfter = prev.Seq
 		}
 	}
 	cur.Seq = b.projected
+	if cur.Anchor, err = eventIDAt(ctx, tx, cur.Seq); err != nil {
+		return "", err
+	}
 	n := &normalizer{sourceID: s.id, version: version(cur.Epoch, cur.Seq), policy: s.policy, threadCreated: map[string]model.Time{}}
 
 	if err := emit([]model.Record{s.sourceRecord(n.version)}); err != nil {
@@ -366,9 +377,13 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 	if err != nil {
 		return sources.ChangeSet{}, err
 	}
+	reason, err := logReplaced(ctx, tx, b, cur)
+	if err != nil {
+		return sources.ChangeSet{}, err
+	}
 	switch {
-	case b.maxSequence < cur.Seq:
-		return sources.ChangeSet{Reconcile: "the T3 Code event log restarted (database replaced or reset)"}, nil
+	case reason != "":
+		return sources.ChangeSet{Reconcile: reason}, nil
 	case b.pruneMark > cur.Seq && b.pruneMark <= b.projected:
 		return sources.ChangeSet{Reconcile: "T3 Code compacted events after the stored cursor"}, nil
 	case b.projected <= cur.Seq:
@@ -519,6 +534,9 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 	more := len(evs) == limit
 	if more {
 		next.Seq = n.rawSeq(evs[len(evs)-1])
+		next.Anchor = evs[len(evs)-1].get("event_id")
+	} else if next.Anchor, err = eventIDAt(ctx, tx, next.Seq); err != nil {
+		return sources.ChangeSet{}, err
 	}
 	return sources.ChangeSet{Records: recs, Cursor: next.String(), More: more}, nil
 }
@@ -616,4 +634,36 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// logReplaced reports why the event log no longer continues from c, or "".
+func logReplaced(ctx context.Context, q querier, b boundary, c cursor) (string, error) {
+	if b.maxSequence < c.Seq {
+		return "the T3 Code event log restarted (database replaced or reset)", nil
+	}
+	if c.Anchor == "" {
+		return "", nil
+	}
+	id, err := eventIDAt(ctx, q, c.Seq)
+	if err != nil {
+		return "", err
+	}
+	// A missing event was pruned; that is not evidence of replacement.
+	if id != "" && id != c.Anchor {
+		return "the T3 Code database was replaced (event at the stored cursor differs)", nil
+	}
+	return "", nil
+}
+
+// eventIDAt returns the id of the event with the given sequence, or "" if there is none.
+func eventIDAt(ctx context.Context, q querier, seq int64) (string, error) {
+	if seq <= 0 {
+		return "", nil
+	}
+	var id string
+	err := q.QueryRowContext(ctx, fmt.Sprintf(`SELECT event_id FROM "%s" WHERE sequence = ?`, tEvents), seq).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }

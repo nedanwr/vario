@@ -154,11 +154,9 @@ func (n *normalizer) attributes(p payload, drop, keep map[string]bool, extra map
 	if err != nil {
 		return ""
 	}
-	if n.policy.Full() {
-		s, _, _ := n.policy.JSON(string(b))
-		return s
-	}
-	return string(b)
+	// Kept values can carry text (pull request URLs, paths) in every mode.
+	s, _, _ := n.policy.JSON(string(b))
+	return s
 }
 
 var (
@@ -221,7 +219,6 @@ func (n *normalizer) project(r row) model.ProjectRow {
 	pr := model.ProjectRow{
 		Envelope:  n.env(),
 		ProjectID: r.get("project_id"),
-		Title:     r.get("title"),
 		CreatedAt: model.ParseTime(r.get("created_at")),
 		UpdatedAt: model.ParseTime(r.get("updated_at")),
 		DeletedAt: model.ParseTime(r.get("deleted_at")),
@@ -229,8 +226,11 @@ func (n *normalizer) project(r row) model.ProjectRow {
 	if !pr.DeletedAt.IsZero() {
 		pr.IsDeleted = 1
 	}
+	// Project titles are usually repository names; like conversation titles
+	// and paths they are content, not metrics.
 	if n.policy.Messages() {
-		pr.WorkspaceRoot = r.get("workspace_root")
+		pr.Title, _, _ = n.policy.Text(r.get("title"))
+		pr.WorkspaceRoot, _, _ = n.policy.Text(r.get("workspace_root"))
 	}
 	return pr
 }
@@ -417,7 +417,7 @@ func (n *normalizer) executionEvent(r row) model.ExecutionEventRow {
 		}
 	case "notification":
 		output = strings.TrimSpace(p.text("summary") + "\n" + p.text("detail"))
-	case "system_notice", "run_interrupt_request":
+	case "system_notice", "run_interrupt_request", "run_interrupt_result":
 		output = p.text("message")
 	case "user_input_request":
 		input, output = p.text("questions"), p.text("questionAnswer")
@@ -563,13 +563,42 @@ func (n *normalizer) rawEvent(r row) model.RawEventRow {
 	if s := parseInt(r.get("sequence")); s != nil {
 		ev.Sequence = *s
 	}
-	if !json.Valid([]byte(ev.Metadata)) {
-		ev.Metadata = ""
-	}
+	ev.Metadata = n.eventMetadata(ev.Metadata)
 	if n.policy.Full() {
 		var dropped bool
 		ev.Payload, _, dropped = n.policy.JSON(r.get("payload_json"))
 		ev.PayloadIncluded = boolToUint8(!dropped && ev.Payload != "")
 	}
 	return ev
+}
+
+// eventMetaKeep lists the event metadata keys T3 Code writes; all are
+// operational identifiers or versions. Other keys are only kept in full mode.
+var eventMetaKeep = set("origin", "applicationEventVersion", "migration", "providerInstanceId", "driver", "runId", "nodeId")
+
+// eventMetadata applies the collection policy to an event's metadata object.
+func (n *normalizer) eventMetadata(raw string) string {
+	p := parsePayload(raw)
+	if len(p) == 0 {
+		return ""
+	}
+	if n.policy.Full() {
+		s, _, _ := n.policy.JSON(raw)
+		return s
+	}
+	out := map[string]json.RawMessage{}
+	for k, v := range p {
+		if eventMetaKeep[k] {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return ""
+	}
+	s, _, _ := n.policy.JSON(string(b))
+	return s
 }

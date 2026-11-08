@@ -426,7 +426,7 @@ log_level = {{q .Collector.LogLevel}}
 
 [privacy]
 # metrics  - token usage, timings, tool names and statuses; no conversation text.
-# messages - adds user/assistant message text and conversation titles.
+# messages - adds user/assistant message text, conversation and project titles.
 # full     - adds tool inputs/outputs, reasoning, file diffs, web searches and raw event payloads.
 mode = {{q .Privacy.Mode}}
 # Must be true for the messages and full modes.

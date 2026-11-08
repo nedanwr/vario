@@ -21,8 +21,9 @@ log_level = "info"
 [privacy]
 # metrics  - token usage, models, timings, tool names, statuses, exit codes, sizes.
 #            No message text, titles, tool inputs/outputs or file names.
-# messages - metrics + user/assistant message text, conversation titles,
-#            branches, attachment metadata, file names of changed files.
+# messages - metrics + user/assistant message text, conversation and project
+#            titles, workspace paths, branches, attachment metadata, file
+#            names of changed files.
 # full     - messages + command/tool inputs and outputs, reasoning text, file
 #            diffs, web searches and raw source event payloads.
 mode = "metrics"

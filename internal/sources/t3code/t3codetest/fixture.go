@@ -272,3 +272,27 @@ func (f *Fixture) Bytes() []byte {
 	}
 	return b
 }
+
+// EventWithMetadata appends an event with explicit metadata.
+func (f *Fixture) EventWithMetadata(eventType, streamID string, payload, metadata any) int64 {
+	f.t.Helper()
+	seq := f.Event(eventType, streamID, payload)
+	f.exec(`UPDATE orchestration_events SET metadata_json = ? WHERE sequence = ?`, js(metadata), seq)
+	return seq
+}
+
+// ThreadPayload merges fields into a thread's projected payload and records a metadata update.
+func (f *Fixture) ThreadPayload(id string, fields map[string]any) {
+	f.t.Helper()
+	var payload string
+	if err := f.DB.QueryRow(`SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ?`, id).Scan(&payload); err != nil {
+		f.t.Fatal(err)
+	}
+	var p map[string]any
+	_ = json.Unmarshal([]byte(payload), &p)
+	for k, v := range fields {
+		p[k] = v
+	}
+	f.exec(`UPDATE orchestration_v2_projection_threads SET payload_json = ? WHERE thread_id = ?`, js(p), id)
+	f.Event("thread.metadata-updated", id, p)
+}
