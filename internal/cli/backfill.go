@@ -58,7 +58,7 @@ delivered later by 'vario run' (exit code 3).`,
 			defer store.Close()
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			release, err := collector.Lease(ctx, store, "backfill", 0)
+			lctx, release, err := collector.Lease(ctx, store, "backfill", 0)
 			if errors.Is(err, spool.ErrLeaseHeld) {
 				return fmt.Errorf("%w; the running collector backfills new sources automatically (stop it to run a manual backfill)", err)
 			}
@@ -66,6 +66,7 @@ delivered later by 'vario run' (exit code 3).`,
 				return err
 			}
 			defer release()
+			ctx = lctx
 
 			client, err := newClient(cfg)
 			if err != nil {

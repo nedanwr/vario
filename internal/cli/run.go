@@ -70,7 +70,7 @@ delivered on the next start. The background service runs this same command.`,
 
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			release, err := collector.Lease(ctx, store, "run", 45*time.Second)
+			lctx, release, err := collector.Lease(ctx, store, "run", 45*time.Second)
 			if err != nil {
 				return err
 			}
@@ -79,7 +79,11 @@ delivered on the next start. The background service runs this same command.`,
 			log.Info("vario collector starting", "version", buildinfo.Version, "mode", policy.Mode(), "sources", len(srcs),
 				"clickhouse", cfg.ClickHouse.URL, "database", cfg.ClickHouse.Database)
 			c := newCollector(cfg, store, client, srcs, policy, log)
-			err = c.Run(ctx)
+			err = c.Run(lctx)
+			if cause := context.Cause(lctx); errors.Is(cause, collector.ErrLeaseLost) {
+				log.Error("collector stopped", "error", cause.Error())
+				return cause
+			}
 			log.Info("vario collector stopped")
 			return err
 		},

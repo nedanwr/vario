@@ -2,8 +2,12 @@ package spool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -188,4 +192,50 @@ func TestLease(t *testing.T) {
 	if err := s.AcquireLease(ctx, "c", "run", time.Minute); err != nil {
 		t.Fatalf("expired lease should be taken over: %v", err)
 	}
+}
+
+// A lease left behind by a crashed collector on this host is taken over
+// immediately instead of after the TTL.
+func TestLeaseOfDeadProcessIsTakenOver(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process liveness is not probed on Windows")
+	}
+	s, _ := open(t, 0)
+	pid := deadPID(t)
+	host, _ := os.Hostname()
+	b, _ := json.Marshal(Lease{Owner: "crashed", Host: host, PID: pid, Command: "run", Expires: time.Now().Add(time.Hour)})
+	if err := s.SetKV(ctx, leaseKey, string(b)); err != nil {
+		t.Fatal(err)
+	}
+	if _, active, _ := s.CurrentLease(ctx); active {
+		t.Error("a dead holder's lease must not be reported as active")
+	}
+	if err := s.AcquireLease(ctx, "new", "run", time.Minute); err != nil {
+		t.Fatalf("lease of dead process should be taken over: %v", err)
+	}
+	// A live holder on another host is respected until it expires.
+	b, _ = json.Marshal(Lease{Owner: "remote", Host: "other-host", PID: pid, Command: "run", Expires: time.Now().Add(time.Hour)})
+	_ = s.SetKV(ctx, leaseKey, string(b))
+	if err := s.AcquireLease(ctx, "new", "run", time.Minute); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("lease from another host must be respected: %v", err)
+	}
+	// A live local process (this one) is respected.
+	b, _ = json.Marshal(Lease{Owner: "live", Host: host, PID: os.Getpid(), Command: "run", Expires: time.Now().Add(time.Hour)})
+	_ = s.SetKV(ctx, leaseKey, string(b))
+	if err := s.AcquireLease(ctx, "new", "run", time.Minute); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("live holder must be respected: %v", err)
+	}
+}
+
+func deadPID(t *testing.T) int {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=^$")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
 }

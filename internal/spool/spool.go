@@ -76,6 +76,16 @@ func Open(path string, maxBytes int64) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
+	// SQLite creates the -wal and -shm files with the database file's mode, so
+	// create the database privately before SQLite does (umask would give 0644).
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	f.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
 	q := url.Values{}
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(FULL)")
@@ -90,7 +100,10 @@ func Open(path string, maxBytes int64) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("initialize spool %s: %w", path, err)
 	}
-	_ = os.Chmod(path, 0o600)
+	// Files left by older versions may still be world-readable.
+	for _, p := range []string{path + "-wal", path + "-shm"} {
+		_ = os.Chmod(p, 0o600)
+	}
 	return &Store{db: db, path: path, maxBytes: maxBytes}, nil
 }
 
@@ -440,6 +453,7 @@ func (s *Store) KV(ctx context.Context, key string) (string, time.Time, bool, er
 
 type Lease struct {
 	Owner   string    `json:"owner"`
+	Host    string    `json:"host,omitempty"`
 	PID     int       `json:"pid"`
 	Command string    `json:"command"`
 	Expires time.Time `json:"expires"`
@@ -461,11 +475,12 @@ func (s *Store) AcquireLease(ctx context.Context, owner, command string, ttl tim
 	}
 	if err == nil {
 		var cur Lease
-		if json.Unmarshal([]byte(raw), &cur) == nil && cur.Owner != owner && time.Now().Before(cur.Expires) {
+		if json.Unmarshal([]byte(raw), &cur) == nil && cur.Owner != owner && cur.live() {
 			return fmt.Errorf("%w (%s, pid %d)", ErrLeaseHeld, cur.Command, cur.PID)
 		}
 	}
-	b, _ := json.Marshal(Lease{Owner: owner, PID: os.Getpid(), Command: command, Expires: time.Now().Add(ttl)})
+	host, _ := os.Hostname()
+	b, _ := json.Marshal(Lease{Owner: owner, Host: host, PID: os.Getpid(), Command: command, Expires: time.Now().Add(ttl)})
 	if _, err := tx.ExecContext(ctx, `INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, leaseKey, string(b), nowMs()); err != nil {
 		return err
@@ -489,5 +504,19 @@ func (s *Store) CurrentLease(ctx context.Context) (Lease, bool, error) {
 	if err := json.Unmarshal([]byte(v), &l); err != nil {
 		return Lease{}, false, nil
 	}
-	return l, time.Now().Before(l.Expires), nil
+	return l, l.live(), nil
+}
+
+// live reports whether the lease still binds other processes: it has not
+// expired and, when it was taken on this host, its process still exists. A
+// collector that crashed is therefore replaced immediately rather than after
+// the TTL. A reused PID only delays takeover until expiry.
+func (l Lease) live() bool {
+	if !time.Now().Before(l.Expires) {
+		return false
+	}
+	if host, err := os.Hostname(); err == nil && l.Host != "" && l.Host == host && l.PID > 0 && l.PID != os.Getpid() {
+		return processExists(l.PID)
+	}
+	return true
 }

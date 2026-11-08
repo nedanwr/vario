@@ -307,3 +307,37 @@ func TestBackoff(t *testing.T) {
 		t.Fatalf("backoff must be capped: %v", d)
 	}
 }
+
+// A collector whose lease was taken over (for example after the machine slept
+// past the TTL) must stop instead of running alongside the new holder.
+func TestLeaseLossCancelsCollector(t *testing.T) {
+	old := leaseTTL
+	leaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { leaseTTL = old })
+	store, err := spool.Open(filepath.Join(t.TempDir(), "state.db"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lctx, release, err := Lease(ctx, store, "run", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if _, _, err := Lease(ctx, store, "backfill", 0); !errors.Is(err, spool.ErrLeaseHeld) {
+		t.Fatalf("second collector must be refused: %v", err)
+	}
+	// Simulate another collector taking over an expired lease.
+	b, _ := json.Marshal(spool.Lease{Owner: "intruder", PID: 1, Command: "run", Expires: time.Now().Add(time.Hour)})
+	if err := store.SetKV(ctx, "collector.lease", string(b)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lctx.Done():
+		if !errors.Is(context.Cause(lctx), ErrLeaseLost) {
+			t.Fatalf("cause = %v", context.Cause(lctx))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("collector context was not cancelled after losing its lease")
+	}
+}

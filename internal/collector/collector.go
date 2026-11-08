@@ -50,29 +50,39 @@ func New(store *spool.Store, sink Sink, srcs []sources.Source, opts Options, log
 	return &Collector{store: store, sink: sink, sources: srcs, opts: opts, log: log, wake: make(chan struct{}, 1)}
 }
 
-const leaseTTL = 30 * time.Second
+// leaseTTL bounds how long a collector that stopped renewing (crashed on
+// another host, or suspended) blocks others. Collectors that crash on this
+// host are detected by PID and replaced immediately.
+var leaseTTL = 30 * time.Second
 
-// Lease acquires the single-collector lease, waiting up to wait for a stale
-// holder to expire, and renews it until the returned release func is called.
-func Lease(ctx context.Context, store *spool.Store, command string, wait time.Duration) (release func(), err error) {
+// ErrLeaseLost is the cancellation cause when another process took the lease.
+var ErrLeaseLost = errors.New("the collector lease was taken over by another vario process")
+
+// Lease acquires the single-collector lease, waiting up to wait for the
+// current holder to release or expire, and renews it until release is called.
+// The returned context is cancelled with ErrLeaseLost if the lease is taken
+// over (for example after this machine slept past the TTL), so that two
+// collectors never keep running at the same time.
+func Lease(ctx context.Context, store *spool.Store, command string, wait time.Duration) (context.Context, func(), error) {
 	host, _ := os.Hostname()
 	owner := fmt.Sprintf("%s/%d/%d", host, os.Getpid(), time.Now().UnixNano())
 	deadline := time.Now().Add(wait)
 	for {
-		err = store.AcquireLease(ctx, owner, command, leaseTTL)
+		err := store.AcquireLease(ctx, owner, command, leaseTTL)
 		if err == nil {
 			break
 		}
 		if !errors.Is(err, spool.ErrLeaseHeld) || time.Now().After(deadline) {
-			return nil, err
+			return nil, nil, err
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+			return nil, nil, ctx.Err()
+		case <-time.After(min(2*time.Second, leaseTTL/3)):
 		}
 	}
-	renewCtx, cancel := context.WithCancel(context.Background())
+	lctx, cancelLease := context.WithCancelCause(ctx)
+	renewCtx, stopRenew := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -83,13 +93,19 @@ func Lease(ctx context.Context, store *spool.Store, command string, wait time.Du
 			case <-renewCtx.Done():
 				return
 			case <-t.C:
-				_ = store.AcquireLease(renewCtx, owner, command, leaseTTL)
+				// Other errors (a busy database) are retried on the next tick; if
+				// the lease expires meanwhile and is taken, the next renewal sees it.
+				if err := store.AcquireLease(renewCtx, owner, command, leaseTTL); errors.Is(err, spool.ErrLeaseHeld) {
+					cancelLease(ErrLeaseLost)
+					return
+				}
 			}
 		}
 	}()
-	return func() {
-		cancel()
+	return lctx, func() {
+		stopRenew()
 		<-done
+		cancelLease(context.Canceled)
 		_ = store.ReleaseLease(context.Background(), owner)
 	}, nil
 }
