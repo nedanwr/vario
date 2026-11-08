@@ -1,0 +1,65 @@
+# Example Vario configuration. `vario init` writes this file for you.
+#
+# Default location:
+#   macOS    ~/Library/Application Support/vario/config.toml
+#   Linux    $XDG_CONFIG_HOME/vario/config.toml (~/.config/vario/config.toml)
+#   Windows  %AppData%\vario\config.toml
+# Override with --config or $VARIO_CONFIG. Keep this file mode 0600.
+
+[collector]
+# How often sources are checked for new events.
+poll_interval = "5s"
+# Full re-read of source state to recover from compaction, missed events or
+# schema changes. Unchanged records are not re-sent. "0s" disables it.
+reconcile_interval = "6h"
+# Source records read per batch.
+batch_size = 500
+# Spool, cursors and lease. Default: platform data directory.
+# data_dir = "~/Library/Application Support/vario"
+log_level = "info"
+
+[privacy]
+# metrics  - token usage, models, timings, tool names, statuses, exit codes, sizes.
+#            No message text, titles, tool inputs/outputs or file names.
+# messages - metrics + user/assistant message text, conversation titles,
+#            branches, attachment metadata, file names of changed files.
+# full     - messages + command/tool inputs and outputs, reasoning text, file
+#            diffs, web searches and raw source event payloads.
+mode = "metrics"
+# Required (true) for the messages and full modes.
+allow_sensitive_content = false
+# Redact known credential formats before data is spooled or sent.
+redact_secrets = true
+# Additional regular expressions (RE2 syntax) to redact.
+extra_redaction_patterns = ["ACME-[0-9]{6}"]
+# Longest text kept per field; longer values are truncated and flagged.
+max_field_bytes = 65536
+
+[clickhouse]
+# The ClickHouse HTTP(S) interface. Plain http:// is only accepted for
+# localhost unless allow_insecure_http = true.
+url = "https://clickhouse.example.com:8443"
+database = "vario"
+username = "vario"
+# Password file (mode 0600). Default: clickhouse-password next to this file.
+# $VARIO_CLICKHOUSE_PASSWORD takes precedence when set.
+# password_file = "~/.config/vario/clickhouse-password"
+timeout = "30s"
+# Minimum interval between delivery rounds; small updates are batched.
+flush_interval = "10s"
+max_insert_rows = 5000
+retry_initial_backoff = "2s"
+retry_max_backoff = "5m"
+# Custom CA bundle for private certificate authorities.
+# ca_file = "/etc/ssl/my-ca.pem"
+tls_insecure_skip_verify = false
+allow_insecure_http = false
+
+[spool]
+# Upper bound for undelivered data on disk. Collection pauses when reached.
+max_size_mb = 512
+
+[[sources]]
+kind = "t3code"
+enabled = true
+path = "~/.t3/userdata/statev2.sqlite"
