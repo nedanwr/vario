@@ -1,11 +1,13 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func valid() *Config {
@@ -150,5 +152,101 @@ func TestExampleConfigIsValid(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func mustTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	v, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func setHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for _, k := range []string{EnvConfig, EnvHome} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+	return home
+}
+
+func TestResolvePrecedence(t *testing.T) {
+	home := setHome(t)
+	std := filepath.Join(home, ".vario", "config.toml")
+	loc, err := Resolve("")
+	if err != nil || loc.Path != std || loc.Origin != FromDefault {
+		t.Fatalf("default: %+v %v", loc, err)
+	}
+	alt := filepath.Join(home, "alt")
+	t.Setenv(EnvHome, alt)
+	if loc, _ := Resolve(""); loc.Path != filepath.Join(alt, "config.toml") || loc.Origin != FromHome {
+		t.Fatalf("$VARIO_HOME: %+v", loc)
+	}
+	t.Setenv(EnvConfig, "~/env.toml")
+	if loc, _ := Resolve(""); loc.Path != filepath.Join(home, "env.toml") || loc.Origin != FromEnv {
+		t.Fatalf("$VARIO_CONFIG: %+v", loc)
+	}
+	if loc, _ := Resolve("rel/flag.toml"); !filepath.IsAbs(loc.Path) || loc.Origin != FromFlag {
+		t.Fatalf("--config: %+v", loc)
+	}
+}
+
+func TestDefaultDataDir(t *testing.T) {
+	home := setHome(t)
+	d, err := DefaultDataDir()
+	if err != nil || d != filepath.Join(home, ".vario", "data") {
+		t.Fatalf("default data dir: %q %v", d, err)
+	}
+	t.Setenv(EnvHome, filepath.Join(home, "iso"))
+	if d, _ := DefaultDataDir(); d != filepath.Join(home, "iso", "data") {
+		t.Fatalf("$VARIO_HOME data dir: %q", d)
+	}
+}
+
+func TestLoadErrors(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.toml")
+	os.WriteFile(bad, []byte("[clickhouse\nurl="), 0o600)
+	if _, err := Load(bad); err == nil || errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "parse") {
+		t.Fatalf("malformed: %v", err)
+	}
+	if runtime.GOOS != "windows" && os.Getuid() != 0 {
+		locked := filepath.Join(dir, "locked.toml")
+		os.WriteFile(locked, []byte(minimal), 0o000)
+		if _, err := Load(locked); err == nil || errors.Is(err, ErrNotFound) {
+			t.Fatalf("unreadable file must be reported, not treated as missing: %v", err)
+		}
+	}
+}
+
+func TestCheckHelpers(t *testing.T) {
+	for _, u := range []string{"http://localhost:8123", "https://ch.example.com:8443/prefix"} {
+		if err := CheckURL(u); err != nil {
+			t.Errorf("%s: %v", u, err)
+		}
+	}
+	for _, u := range []string{"localhost:8123", "https://", "https://a:b@h", "https://h/?x=1", "tcp://h:9000", "://"} {
+		if err := CheckURL(u); err == nil {
+			t.Errorf("%s should be rejected", u)
+		}
+	}
+	if !InsecureRemote("http://10.0.0.1:8123") || InsecureRemote("http://127.0.0.1:8123") || InsecureRemote("https://h") {
+		t.Error("InsecureRemote")
+	}
+	for _, n := range []string{"vario", "_x1", "Vario_2"} {
+		if CheckDatabaseName(n) != nil {
+			t.Errorf("%s should be valid", n)
+		}
+	}
+	for _, n := range []string{"", "1abc", "a-b", "a.b", "a`b", "x; DROP"} {
+		if CheckDatabaseName(n) == nil {
+			t.Errorf("%q should be rejected", n)
+		}
 	}
 }

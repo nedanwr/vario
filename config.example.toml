@@ -1,10 +1,9 @@
-# Example Vario configuration. `vario init` writes this file for you.
+# Example Vario configuration. `vario init` writes this file for you; change it
+# later with `vario config set <key> <value>` or `vario config edit`.
 #
-# Default location:
-#   macOS    ~/Library/Application Support/vario/config.toml
-#   Linux    $XDG_CONFIG_HOME/vario/config.toml (~/.config/vario/config.toml)
-#   Windows  %AppData%\vario\config.toml
-# Override with --config or $VARIO_CONFIG. Keep this file mode 0600.
+# Default location: ~/.vario/config.toml (on every platform).
+# Precedence: --config, then $VARIO_CONFIG, then $VARIO_HOME/config.toml, then
+# ~/.vario/config.toml. Keep this file mode 0600. It never contains passwords.
 
 [collector]
 # How often sources are checked for new events.
@@ -14,8 +13,8 @@ poll_interval = "5s"
 reconcile_interval = "6h"
 # Source records read per batch.
 batch_size = 500
-# Spool, cursors and lease. Default: platform data directory.
-# data_dir = "~/Library/Application Support/vario"
+# Spool, cursors and lease. Default: ~/.vario/data ($VARIO_HOME/data).
+# data_dir = "~/.vario/data"
 log_level = "info"
 
 [privacy]
@@ -40,11 +39,18 @@ max_field_bytes = 65536
 # The ClickHouse HTTP(S) interface. Plain http:// is only accepted for
 # localhost unless allow_insecure_http = true.
 url = "https://clickhouse.example.com:8443"
+# The database Vario writes to. A dedicated database is recommended; the
+# server may host any number of unrelated databases.
 database = "vario"
+# false (default): use an existing database; Vario never runs CREATE DATABASE.
+# true: create the database if it is missing (needs CREATE DATABASE).
+# Either way, Vario creates its own tables and views inside the database.
+create_database = false
 username = "vario"
 # Password file (mode 0600). Default: clickhouse-password next to this file.
-# $VARIO_CLICKHOUSE_PASSWORD takes precedence when set.
-# password_file = "~/.config/vario/clickhouse-password"
+# Set it with `vario config set-password`. $VARIO_CLICKHOUSE_PASSWORD takes
+# precedence when set.
+# password_file = "~/.vario/clickhouse-password"
 timeout = "30s"
 # Minimum interval between delivery rounds; small updates are batched.
 flush_interval = "10s"
