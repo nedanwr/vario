@@ -234,7 +234,7 @@ func viewDDL(db string) []string {
 	t := func(name string) string { return quoteIdent(db) + "." + quoteIdent(name) }
 	var out []string
 	for _, name := range []string{model.TableSources, model.TableProjects, model.TableConversations, model.TableRuns,
-		model.TableMessages, model.TableExecutionEvents, model.TableProviderTurns} {
+		model.TableMessages, model.TableExecutionEvents, model.TableProviderTurns, model.TableRawEvents} {
 		out = append(out, fmt.Sprintf("CREATE OR REPLACE VIEW %s AS SELECT * FROM %s FINAL", t(name+"_latest"), t(name)))
 	}
 	out = append(out,
@@ -244,6 +244,7 @@ SELECT
   source_id,
   provider,
   model,
+  usage_scope,
   count() AS provider_turns,
   countIf(p.input_tokens IS NOT NULL) AS turns_with_usage,
   countIf(usage_status != 'complete') AS turns_incomplete_usage,
@@ -254,7 +255,7 @@ SELECT
   sum(p.output_tokens) AS output_tokens,
   sum(p.reasoning_tokens) AS reasoning_tokens
 FROM %s AS p FINAL
-GROUP BY day, source_id, provider, model`, t("token_usage_daily"), t(model.TableProviderTurns)),
+GROUP BY day, source_id, provider, model, usage_scope`, t("token_usage_daily"), t(model.TableProviderTurns)),
 		fmt.Sprintf(`CREATE OR REPLACE VIEW %s AS
 SELECT
   source_id,
