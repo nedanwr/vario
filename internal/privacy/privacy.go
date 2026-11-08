@@ -2,6 +2,7 @@
 package privacy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,23 +28,33 @@ type rule struct {
 	repl string
 	// skip reports matches that are clearly not secrets, given the match's submatches.
 	skip func(sub []string) bool
+	// hints are lowercase literals of which at least one must occur in the
+	// text for the rule to match at all. They let Redact skip a regular
+	// expression scan, which dominates redaction cost.
+	hints []string
 }
+
+// secretName matches identifiers that name a credential, including prefixed
+// environment-variable and camelCase forms such as DB_PASSWORD,
+// AWS_SECRET_ACCESS_KEY, x-api-key and accessToken.
+const secretName = `\b[a-z0-9_.-]*?(?:password|passwd|secret|api[_-]?key|access[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|token)`
 
 // builtinRules target credentials with recognizable shapes. Order matters:
 // more specific patterns run first so their labels win.
 var builtinRules = []rule{
-	{"private_key", regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`), "", nil},
-	{"anthropic_key", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_\-]{20,}`), "", nil},
-	{"openai_key", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}`), "", nil},
-	{"aws_access_key_id", regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`), "", nil},
-	{"github_token", regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b`), "", nil},
-	{"slack_token", regexp.MustCompile(`\bxox[abposr]-[A-Za-z0-9-]{10,}`), "", nil},
-	{"stripe_key", regexp.MustCompile(`\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}`), "", nil},
-	{"google_api_key", regexp.MustCompile(`\bAIza[0-9A-Za-z_\-]{35}\b`), "", nil},
-	{"jwt", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`), "", nil},
-	{"bearer_token", regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/\-]{16,}=*`), "${1}[REDACTED:bearer_token]", nil},
-	{"url_credentials", regexp.MustCompile(`\b([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@"'\\]+:)[^\s@/"'\\]+@`), "${1}[REDACTED:url_credentials]@", nil},
-	{"secret_assignment", regexp.MustCompile(`(?i)\b((?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key)(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)([^\s"'\\,;}]{6,})`), "${1}[REDACTED:secret_assignment]", placeholderValue},
+	{"private_key", regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`), "", nil, nil},
+	{"anthropic_key", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_\-]{20,}`), "", nil, []string{"sk-ant-"}},
+	{"openai_key", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}`), "", nil, []string{"sk-"}},
+	{"aws_access_key_id", regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`), "", nil, []string{"akia", "asia"}},
+	{"github_token", regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b`), "", nil, []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"}},
+	{"slack_token", regexp.MustCompile(`\bxox[abposr]-[A-Za-z0-9-]{10,}`), "", nil, []string{"xox"}},
+	{"stripe_key", regexp.MustCompile(`\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}`), "", nil, []string{"_live_", "_test_"}},
+	{"google_api_key", regexp.MustCompile(`\bAIza[0-9A-Za-z_\-]{35}\b`), "", nil, []string{"aiza"}},
+	{"jwt", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`), "", nil, []string{"eyj"}},
+	{"bearer_token", regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/\-]{16,}=*`), "${1}[REDACTED:bearer_token]", nil, []string{"bearer"}},
+	{"authorization", regexp.MustCompile(`(?i)\b(authorization(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?(?:basic|digest|token)?\s*)([A-Za-z0-9._~+/\-]{8,}=*)`), "${1}[REDACTED:authorization]", nil, []string{"authorization"}},
+	{"url_credentials", regexp.MustCompile(`\b([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@"'\\]+:)[^\s@/"'\\]+@`), "${1}[REDACTED:url_credentials]@", nil, []string{"://"}},
+	{"secret_assignment", regexp.MustCompile(`(?i)(` + secretName + `(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)([^\s"'\\,;}]{6,})`), "${1}[REDACTED:secret_assignment]", placeholderValue, []string{"pass", "secret", "key", "token"}},
 }
 
 var shellVarRe = regexp.MustCompile(`^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$`)
@@ -81,7 +92,7 @@ func New(c config.PrivacyConfig) (*Policy, error) {
 			}
 			p.rules = append(p.rules, r)
 		}
-		h.Write([]byte("builtin-v1;"))
+		h.Write([]byte("builtin-v2;"))
 	}
 	for _, pat := range c.ExtraPatterns {
 		re, err := regexp.Compile(pat)
@@ -109,8 +120,17 @@ func (p *Policy) Fingerprint() string { return p.fingerprint }
 // Redact replaces secrets in s and returns the number of replacements.
 func (p *Policy) Redact(s string) (string, int) {
 	n := 0
+	var lower []byte
 	for _, r := range p.rules {
-		matches := r.re.FindAllStringSubmatchIndex(s, -1)
+		var matches [][]int
+		if len(r.hints) == 0 {
+			matches = r.re.FindAllStringSubmatchIndex(s, -1)
+		} else {
+			if lower == nil {
+				lower = asciiLower(s)
+			}
+			matches = r.findNearHints(s, lower)
+		}
 		if matches == nil {
 			continue
 		}
@@ -135,10 +155,92 @@ func (p *Policy) Redact(s string) (string, int) {
 			last = m[1]
 			n++
 		}
-		b.WriteString(s[last:])
-		s = b.String()
+		if last > 0 {
+			b.WriteString(s[last:])
+			s = b.String()
+			lower = nil // recompute for the modified text
+		}
 	}
 	return s, n
+}
+
+// findNearHints returns the rule's matches, scanning only the lines that
+// contain one of its hints plus the line after each (so a value may follow
+// its name on the next line). Every match of a hinted rule contains a hint on
+// the line where the match starts, so this finds the same matches as a scan
+// of the whole text while skipping most of it.
+func (r rule) findNearHints(s string, lower []byte) [][]int {
+	next := make([]int, len(r.hints)) // next occurrence of each hint at or after from
+	for i := range next {
+		next[i] = -2 // unknown
+	}
+	hintFrom := func(from, to int) int {
+		best := -1
+		for i, h := range r.hints {
+			if next[i] == -2 || (next[i] >= 0 && next[i] < from) {
+				next[i] = -1
+				if from <= len(lower) {
+					if j := bytes.Index(lower[from:], []byte(h)); j >= 0 {
+						next[i] = from + j
+					}
+				}
+			}
+			if next[i] >= 0 && next[i] < to && (best < 0 || next[i] < best) {
+				best = next[i]
+			}
+		}
+		return best
+	}
+	var out [][]int
+	end := 0
+	for {
+		pos := hintFrom(end, len(lower))
+		if pos < 0 {
+			return out
+		}
+		start := max(bytes.LastIndexByte(lower[:pos], '\n')+1, end)
+		lineStop := lineEnd(lower, pos)
+		stop := lineEnd(lower, lineStop+1)
+		for {
+			q := hintFrom(lineStop+1, stop)
+			if q < 0 {
+				break
+			}
+			lineStop = lineEnd(lower, q)
+			stop = lineEnd(lower, lineStop+1)
+		}
+		for _, m := range r.re.FindAllStringSubmatchIndex(s[start:stop], -1) {
+			for i := range m {
+				if m[i] >= 0 {
+					m[i] += start
+				}
+			}
+			out = append(out, m)
+		}
+		end = stop
+	}
+}
+
+// lineEnd returns the index of the first newline at or after i, or len(b).
+func lineEnd(b []byte, i int) int {
+	if i >= len(b) {
+		return len(b)
+	}
+	if j := bytes.IndexByte(b[i:], '\n'); j >= 0 {
+		return i + j
+	}
+	return len(b)
+}
+
+// asciiLower lowercases ASCII letters only, keeping byte offsets aligned with s.
+func asciiLower(s string) []byte {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return b
 }
 
 // Text redacts and then truncates free text to the configured limit.

@@ -2,6 +2,8 @@ package privacy
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -9,7 +11,7 @@ import (
 	"github.com/nedanwr/vario/internal/config"
 )
 
-func newPolicy(t *testing.T, mutate func(*config.PrivacyConfig)) *Policy {
+func newPolicy(t testing.TB, mutate func(*config.PrivacyConfig)) *Policy {
 	t.Helper()
 	c := config.Default().Privacy
 	if mutate != nil {
@@ -123,5 +125,101 @@ func TestModes(t *testing.T) {
 	full := newPolicy(t, func(c *config.PrivacyConfig) { c.Mode = config.ModeFull })
 	if !full.Messages() || !full.Full() {
 		t.Fatal("full mode")
+	}
+}
+
+// Environment-variable style names (prefixed keywords), generic tokens and
+// non-bearer authorization headers are redacted.
+func TestRedactAssignmentsAndHeaders(t *testing.T) {
+	p := newPolicy(t, nil)
+	for in, secret := range map[string]string{
+		"export DB_PASSWORD=s3cr3t-value-123":                         "s3cr3t-value-123",
+		"POSTGRES_PASSWORD: 'pg-pass-9876'":                           "pg-pass-9876",
+		"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLE": "wJalrXUtnFEMI",
+		"MY_SERVICE_TOKEN=abc123def456ghi":                            "abc123def456",
+		`{"token": "tok_9f8e7d6c5b4a"}`:                               "tok_9f8e7d6c5b4a",
+		`{\"DB_PASSWORD\":\"escaped-secret-1\"}`:                      "escaped-secret-1",
+		"Authorization: Basic dXNlcjpodW50ZXIycGFzcw==":               "dXNlcjpodW50ZXIycGFzcw",
+		"x-api-key: 0123456789abcdef0123":                             "0123456789abcdef",
+		"auth_token=qwertyuiop1234":                                   "qwertyuiop1234",
+	} {
+		out, n := p.Redact(in)
+		if n == 0 || strings.Contains(out, secret) {
+			t.Errorf("not redacted: %q -> %q", in, out)
+		}
+	}
+	for _, in := range []string{
+		"input_tokens: 818885",
+		"max_tokens=4096",
+		"const tokenizer = newTokenizer()",
+		"A basic configuration works",
+		"cd $HOME && pwd=/home/dev",
+		"token_count = 12345678",
+		"password: string;",
+		"api_key = os.environ['API_KEY']",
+		"token: ${GITHUB_TOKEN}",
+	} {
+		if out, n := p.Redact(in); n != 0 {
+			t.Errorf("false positive: %q -> %q", in, out)
+		}
+	}
+}
+
+// naiveRedact is the reference implementation: every rule scans the whole text.
+func naiveRedact(p *Policy, s string) (string, int) {
+	n := 0
+	for _, r := range p.rules {
+		var b strings.Builder
+		last := 0
+		for _, m := range r.re.FindAllStringSubmatchIndex(s, -1) {
+			if r.skip != nil {
+				sub := []string{}
+				for i := 0; i < len(m); i += 2 {
+					if m[i] >= 0 {
+						sub = append(sub, s[m[i]:m[i+1]])
+					} else {
+						sub = append(sub, "")
+					}
+				}
+				if r.skip(sub) {
+					continue
+				}
+			}
+			b.WriteString(s[last:m[0]])
+			b.Write(r.re.ExpandString(nil, r.repl, s, m))
+			last = m[1]
+			n++
+		}
+		if last > 0 {
+			b.WriteString(s[last:])
+			s = b.String()
+		}
+	}
+	return s, n
+}
+
+func TestHintScanMatchesFullScan(t *testing.T) {
+	p := newPolicy(t, func(c *config.PrivacyConfig) { c.ExtraPatterns = []string{"ACME-[0-9]{6}"} })
+	corpus := []string{
+		"password =\n  hunter2-next-line\nother",
+		"x\nAuthorization:\nBasic dXNlcjpodW50ZXIy\n",
+		"İSTANBUL password=ünïcødé-sécret ẞ token: ÄÖÜäöü123456",
+		"line1 key\nline2 key\nline3 api_key = abcdefgh\nline4 = zzzzzzzzz",
+		"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\npostgres://u:p4ssw0rd@h/db ACME-123456 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefghijkl",
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIE\npassword=inner-secret\n-----END RSA PRIVATE KEY-----",
+		"TOKEN=", "token", "\n\n\n", "",
+	}
+	files, _ := filepath.Glob("../*/*.go")
+	files2, _ := filepath.Glob("../*/*/*.go")
+	for _, f := range append(files, files2...) {
+		b, _ := os.ReadFile(f)
+		corpus = append(corpus, string(b))
+	}
+	for i, s := range corpus {
+		got, gn := p.Redact(s)
+		want, wn := naiveRedact(p, s)
+		if got != want || gn != wn {
+			t.Fatalf("corpus %d: hint scan differs from full scan (%d vs %d redactions)", i, gn, wn)
+		}
 	}
 }
