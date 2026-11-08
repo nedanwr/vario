@@ -48,6 +48,7 @@ func TestIntegrationRedeliveryDoesNotInflateResults(t *testing.T) {
 	cfg.URL = url
 	cfg.Username = os.Getenv("VARIO_TEST_CLICKHOUSE_USER")
 	cfg.Database = fmt.Sprintf("vario_e2e_%d", time.Now().UnixNano())
+	cfg.CreateDatabase = true // throwaway database
 	ch, err := clickhouse.New(cfg, os.Getenv("VARIO_TEST_CLICKHOUSE_PASSWORD"))
 	if err != nil {
 		t.Fatal(err)

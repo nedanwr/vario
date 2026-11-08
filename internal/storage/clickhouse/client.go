@@ -30,9 +30,11 @@ import (
 type Client struct {
 	base     *url.URL
 	database string
-	user     string
-	password string
-	http     *http.Client
+	// createDatabase permits CREATE DATABASE when the database is missing.
+	createDatabase bool
+	user           string
+	password       string
+	http           *http.Client
 }
 
 // New creates a client. The password is sent only in request headers.
@@ -64,10 +66,11 @@ func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
 		ForceAttemptHTTP2:     true,
 	}
 	return &Client{
-		base:     u,
-		database: cfg.Database,
-		user:     cfg.Username,
-		password: password,
+		base:           u,
+		database:       cfg.Database,
+		createDatabase: cfg.CreateDatabase,
+		user:           cfg.Username,
+		password:       password,
 		http: &http.Client{
 			Transport: transport,
 			Timeout:   cfg.Timeout.Duration,
@@ -80,6 +83,9 @@ func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
 }
 
 func (c *Client) Database() string { return c.database }
+
+// User returns the ClickHouse user the client authenticates as.
+func (c *Client) User() string { return c.user }
 
 // Error is a ClickHouse or transport failure with a sanitized message.
 type Error struct {
@@ -192,8 +198,12 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set("User-Agent", buildinfo.UserAgent())
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return &Error{Message: sanitizeTransport(err), Transient: true}
 	}
 	defer resp.Body.Close()

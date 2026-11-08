@@ -27,6 +27,7 @@ func integrationClient(t *testing.T) *Client {
 	cfg.URL = url
 	cfg.Username = envOr("VARIO_TEST_CLICKHOUSE_USER", "default")
 	cfg.Database = fmt.Sprintf("vario_test_%d", time.Now().UnixNano())
+	cfg.CreateDatabase = true // throwaway database
 	c, err := New(cfg, os.Getenv("VARIO_TEST_CLICKHOUSE_PASSWORD"))
 	if err != nil {
 		t.Fatal(err)
