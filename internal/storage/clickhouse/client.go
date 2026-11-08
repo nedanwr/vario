@@ -68,7 +68,14 @@ func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
 		database: cfg.Database,
 		user:     cfg.Username,
 		password: password,
-		http:     &http.Client{Transport: transport, Timeout: cfg.Timeout.Duration},
+		http: &http.Client{
+			Transport: transport,
+			Timeout:   cfg.Timeout.Duration,
+			// ClickHouse never redirects. Following one would forward the
+			// X-ClickHouse-Key header to the redirect target (Go only strips
+			// standard auth headers) and could downgrade https to http.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}, nil
 }
 
@@ -154,6 +161,9 @@ func (c *Client) do(ctx context.Context, method string, params url.Values, body 
 	}
 	if resp.StatusCode == http.StatusOK {
 		return data, nil
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, &Error{Status: resp.StatusCode, Message: "unexpected redirect (not followed; check clickhouse.url)"}
 	}
 	e := &Error{Status: resp.StatusCode, Message: sanitize(string(data))}
 	if code := resp.Header.Get("X-ClickHouse-Exception-Code"); code != "" {

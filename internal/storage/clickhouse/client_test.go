@@ -144,3 +144,35 @@ func jsonFields(t reflect.Type) []string {
 	}
 	return out
 }
+
+// A redirect must never carry the ClickHouse credentials to another endpoint
+// (Go forwards custom headers such as X-ClickHouse-Key across hosts).
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	leaked := make(chan string, 16)
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case leaked <- r.Header.Get("X-ClickHouse-Key"):
+		default:
+		}
+	}))
+	defer evil.Close()
+	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, evil.URL+"/", code)
+		}))
+		c := testClient(t, redirect.URL)
+		err := c.Insert(context.Background(), "messages", gz(`{"a":1}`+"\n"), "tok")
+		if err == nil {
+			t.Errorf("HTTP %d: redirect must fail the request", code)
+		}
+		if _, err := c.ServerVersion(context.Background()); err == nil {
+			t.Errorf("HTTP %d: redirect must fail queries", code)
+		}
+		redirect.Close()
+	}
+	select {
+	case pw := <-leaked:
+		t.Fatalf("credentials forwarded to redirect target (key %q)", pw)
+	default:
+	}
+}
