@@ -7,10 +7,14 @@ LDFLAGS := -s -w -X $(PKG).Version=$(VERSION) -X $(PKG).Commit=$(COMMIT) -X $(PK
 CH_IMAGE ?= clickhouse/clickhouse-server:25.8
 CH_PORT  ?= 18123
 
-.PHONY: build test race lint fmt integration clickhouse-up clickhouse-down
+.PHONY: build dist test race lint fmt integration clickhouse-up clickhouse-down
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/vario ./cmd/vario
+
+# Release archives and checksums for all supported platforms (see scripts/dist.sh).
+dist:
+	VERSION=$(VERSION) COMMIT=$(COMMIT) ./scripts/dist.sh
 
 test:
 	go test ./...

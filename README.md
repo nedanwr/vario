@@ -26,7 +26,9 @@ It runs as a single process, either in the foreground or as a per-user backgroun
 
 ## Install and build
 
-Requires Go 1.25 or newer. The binary is a standalone executable with no CGO and no runtime dependencies.
+Prebuilt binaries for macOS, Linux and Windows (amd64 and arm64) are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases), together with a `checksums.txt` file. Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Releases](#releases).
+
+To build from source, you need Go 1.25 or newer. The binary is a standalone executable with no CGO and no runtime dependencies.
 
 ```bash
 git clone https://github.com/nedanwr/vario.git
@@ -313,6 +315,7 @@ make lint             # gofmt, go vet, staticcheck
 make clickhouse-up    # start a local ClickHouse 25.8 in Docker on 127.0.0.1:18123
 make integration      # ClickHouse integration tests (schema, versioned dedup, aggregation, ambiguous retries)
 make clickhouse-down
+make dist             # release archives and checksums for all platforms in dist/
 ```
 
 Integration tests are skipped unless `VARIO_TEST_CLICKHOUSE_URL` is set (optionally with `VARIO_TEST_CLICKHOUSE_USER` and `VARIO_TEST_CLICKHOUSE_PASSWORD`). Each run uses a throwaway database.
@@ -334,6 +337,56 @@ internal/model/            normalized row types
 ```
 
 The module path is `github.com/nedanwr/vario`, derived from the `origin` remote.
+
+## Continuous integration
+
+The **Build** workflow (`.github/workflows/build.yml`) runs on pull requests targeting `master` (when opened, updated with new commits, or reopened) and on every push to `master`, including merges. It does not run for pushes to other branches. On one Ubuntu runner, it:
+
+1. verifies module checksums (`go mod verify`) and `gofmt` formatting,
+2. runs `go vet ./...` for Linux, macOS and Windows,
+3. runs the unit tests (`make test`),
+4. builds and packages every release target with `make dist` and checks the result.
+
+The workflow has read-only repository access and uses no secrets. The ClickHouse integration tests are not part of it; run them locally with `make integration`.
+
+The build for macOS and Windows is **cross-compiled** on Linux (Vario is pure Go with `CGO_ENABLED=0`, including its SQLite driver). This proves the code compiles and links for each platform, but the tests run only on Linux, and the macOS and Windows binaries are not executed in CI.
+
+## Releases
+
+Releases are published by the **Release** workflow (`.github/workflows/release.yml`) only when a maintainer pushes a version tag. Merging into `master` never publishes anything, and the workflow never creates tags.
+
+| OS | Architectures | Archive |
+| --- | --- | --- |
+| macOS | amd64, arm64 | `vario_<version>_darwin_<arch>.tar.gz` |
+| Linux | amd64, arm64 | `vario_<version>_linux_<arch>.tar.gz` |
+| Windows | amd64, arm64 | `vario_<version>_windows_<arch>.zip` |
+
+Each archive contains a single directory with the executable, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`. Tags follow [Semantic Versioning](https://semver.org) with a `v` prefix: `v0.1.0`, `v1.2.3`, or a prerelease like `v0.2.0-rc.1` (published as a GitHub prerelease). The tag is embedded in the binary, so `vario version` reports it along with the commit.
+
+Before publishing, the workflow checks that the tag is valid SemVer and points to a commit in `master`'s history, then runs vet and tests and builds all archives and `checksums.txt` from a clean module cache. A separate job, the only one with write access, uploads them to a draft release with generated release notes, checks the upload, and then publishes the release. If a release or draft for the tag already exists, the workflow stops without changing it; to publish again, delete the release and re-run the workflow.
+
+To release, merge the changes into `master`, then tag the merged commit and push the tag:
+
+```bash
+git switch master && git pull --ff-only
+git tag -a v0.1.0 -m "Vario v0.1.0"
+git push origin v0.1.0
+```
+
+Builds are reproducible: given the same commit and Go version, `make dist VERSION=v0.1.0` produces the same binaries (the embedded build date is the commit time).
+
+**Code signing:** release binaries are **not signed**. The macOS binaries are not notarized, so Gatekeeper may refuse to run a binary downloaded through a browser; after verifying the checksum, remove the quarantine attribute (`xattr -d com.apple.quarantine vario`). Windows SmartScreen may also warn about the unsigned executable.
+
+### Verifying downloads
+
+Download `checksums.txt` from the same release, place it next to the archive, and run:
+
+```bash
+sha256sum --check --ignore-missing checksums.txt         # Linux
+shasum -a 256 --check --ignore-missing checksums.txt     # macOS
+```
+
+On Windows (PowerShell), compare the output of `Get-FileHash vario_<version>_windows_amd64.zip -Algorithm SHA256` with the corresponding line in `checksums.txt`.
 
 ## Principles
 

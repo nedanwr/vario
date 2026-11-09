@@ -1,0 +1,180 @@
+# Publishes a GitHub Release when a maintainer pushes a version tag (vX.Y.Z or
+# vX.Y.Z-prerelease) that points to a commit on master. Pull requests and
+# branch pushes never trigger this workflow, and it never creates tags.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Verify and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Validate tag
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [ "$REF_TYPE" != tag ] || ! [[ $TAG =~ $semver ]]; then
+            echo "::error::'$TAG' is not a release tag (expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE)."
+            exit 1
+          fi
+          if [[ $TAG == *-* ]]; then
+            echo "prerelease=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out (full history for the master check)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag is on master
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tag_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          if [ "$tag_commit" != "$GITHUB_SHA" ] || [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $TAG now points to $tag_commit, but this run was started for $GITHUB_SHA."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/master; then
+            echo "::error::Tag $TAG points to $GITHUB_SHA, which is not in the history of master."
+            exit 1
+          fi
+          echo "$TAG -> $GITHUB_SHA (on master)"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # build from a clean cache; no cache poisoning of release builds
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Vet
+        run: |
+          for goos in linux darwin windows; do
+            echo "go vet (GOOS=$goos)"
+            GOOS=$goos go vet ./...
+          done
+
+      - name: Test
+        run: make test
+
+      - name: Build release archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make dist VERSION="$TAG" COMMIT="$GITHUB_SHA"
+
+      - name: Check archives
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v=${TAG#v}
+          expected="checksums.txt
+          vario_${v}_darwin_amd64.tar.gz
+          vario_${v}_darwin_arm64.tar.gz
+          vario_${v}_linux_amd64.tar.gz
+          vario_${v}_linux_arm64.tar.gz
+          vario_${v}_windows_amd64.zip
+          vario_${v}_windows_arm64.zip"
+          actual=$(printf '%s\n' * | LC_ALL=C sort)
+          if [ "$actual" != "$(echo "$expected" | sed 's/^ *//' | LC_ALL=C sort)" ]; then
+            echo "::error::Unexpected release files:"
+            echo "$actual"
+            exit 1
+          fi
+          sha256sum --check --strict checksums.txt
+          tar -xzf "vario_${v}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
+          out=$("$RUNNER_TEMP/vario_${v}_linux_amd64/vario" version)
+          echo "$out"
+          case $out in
+            "vario $TAG (commit ${GITHUB_SHA::12},"*) ;;
+            *) echo "::error::Binary reports the wrong version."; exit 1 ;;
+          esac
+
+      - name: Upload release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check --strict checksums.txt
+
+      - name: Refuse to touch an existing release
+        run: |
+          if gh release view "$TAG" --json isDraft,url >release.json 2>gh.err; then
+            echo "::error::A release (or draft) for $TAG already exists: $(jq -r .url release.json). Nothing was changed. Delete it manually to republish."
+            exit 1
+          fi
+          if ! grep -qi 'not found' gh.err; then
+            cat gh.err
+            echo "::error::Could not check for an existing release."
+            exit 1
+          fi
+
+      - name: Create draft release with assets
+        working-directory: dist
+        run: |
+          args=(--verify-tag --draft --generate-notes --title "Vario $TAG")
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}" vario_* checksums.txt
+
+      - name: Verify uploaded assets
+        working-directory: dist
+        run: |
+          uploaded=$(gh release view "$TAG" --json assets --jq '.assets[] | select(.state == "uploaded") | .name' | LC_ALL=C sort)
+          local_files=$(printf '%s\n' vario_* checksums.txt | LC_ALL=C sort)
+          if [ "$uploaded" != "$local_files" ]; then
+            echo "::error::Uploaded assets do not match; the release was left as a draft."
+            diff <(echo "$local_files") <(echo "$uploaded") || true
+            exit 1
+          fi
+
+      - name: Publish release
+        run: |
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json url --jq .url
