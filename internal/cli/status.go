@@ -57,6 +57,18 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 			} else {
 				fmt.Fprintln(w, "Collector      not running")
 			}
+			hasState := selectConfigured(ctx, store, cfg)
+			if active, ok, _ := store.Active(ctx); ok {
+				d, _, _ := store.Lookup(ctx, cfg.ClickHouse.Endpoint(), cfg.ClickHouse.Database)
+				switch {
+				case store.Legacy() || active.Legacy():
+					fmt.Fprintln(w, "Destination    not recorded yet (state from an earlier version; assigned to the configured destination on the next run)")
+				case hasState && d.ID == active.ID:
+					fmt.Fprintf(w, "Destination    %s (destination id %s)\n", active, orDash(active.ServerID))
+				default:
+					fmt.Fprintf(w, "Destination    the collector last delivered to %s; the configured destination differs (see `vario destination`)\n", active)
+				}
+			}
 
 			fmt.Fprintln(w, "\nSources")
 			if len(cfg.Sources) == 0 {
@@ -65,7 +77,10 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 			for _, sc := range cfg.Sources {
 				path := sourcePath(sc)
 				id := t3code.SourceID(path)
-				cur, last := cursorSummary(ctx, store, id)
+				cur, last := "none (not yet synchronized for this destination)", "never"
+				if hasState {
+					cur, last = cursorSummary(ctx, store, id)
+				}
 				fmt.Fprintf(w, "  %s  enabled=%t  %s\n", sc.Kind, sc.Enabled, path)
 				fmt.Fprintf(w, "    id             %s\n", id)
 				fmt.Fprintf(w, "    cursor         %s\n", cur)
@@ -82,8 +97,14 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(w, "\nDelivery")
-			fmt.Fprintf(w, "  spooled        %d rows in %d batches (%s of %d MiB)\n", st.Rows, st.Entries, human(st.StoredBytes), cfg.Spool.MaxSizeMB)
+			if !hasState {
+				st.Entries, st.Rows, st.ByTable, st.FailingEntries, st.OtherRows = 0, 0, map[string]int64{}, 0, st.Rows+st.OtherRows
+			}
+			fmt.Fprintln(w, "\nDelivery (configured destination)")
+			fmt.Fprintf(w, "  spooled        %d rows in %d batches (spool: %s of %d MiB)\n", st.Rows, st.Entries, human(st.TotalBytes), cfg.Spool.MaxSizeMB)
+			if st.OtherRows > 0 {
+				fmt.Fprintf(w, "  other          %d rows queued for other destinations (see `vario destination`)\n", st.OtherRows)
+			}
 			if st.Entries > 0 {
 				fmt.Fprintf(w, "  oldest         %s\n", st.Oldest.Local().Format(time.DateTime))
 				var parts []string

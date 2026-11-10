@@ -7,13 +7,11 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
 	"github.com/nedanwr/vario/internal/config"
-	"github.com/nedanwr/vario/internal/model"
 	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
@@ -44,19 +42,40 @@ func (a *app) initCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Set up or update the Vario configuration interactively",
-		Long: `Init walks through the ClickHouse connection, database, collection mode and
-data sources, optionally tests the connection, and writes the configuration
-(default ~/.vario/config.toml) and the ClickHouse password file, both readable
-only by you.
+		Long: `Init sets up Vario's ClickHouse access, collection mode and data sources, and
+writes the configuration (default ~/.vario/config.toml) and the operational
+password file, both readable only by you.
 
-Init is safe to re-run: an existing configuration is offered for review with
-its current values as defaults, and only the settings you change are
-rewritten. Init never creates databases or tables unless you confirm it, and
-never installs or starts the background service.
+ClickHouse access uses two kinds of credentials:
 
-All prompts can be answered with flags. In scripts use --non-interactive;
-with an existing configuration add --update (apply the given flags, keep
-everything else) or --force (start over from defaults, keeping a backup).`,
+  administrative  asked for only during guided setup (and by 'vario migrate')
+                  to list and create databases and users, grant privileges and
+                  create the schema; never saved
+  operational     a restricted user that the collector, backfill and the
+                  background service use; its password is saved
+
+Guided setup signs in with an administrative account, lets you pick an
+existing database or create one, pick an existing user or create a dedicated
+one (with a generated password if you like), shows every change it would make
+and applies it only after you confirm. Manually managed setup uses an existing
+database and operational user without administrative credentials. Either way,
+the operational login is verified before saving.
+
+The password of a user created by guided setup is kept in
+pending-credentials.json (next to the configuration, readable only by you)
+from before the user is created until a configuration using it is saved, so
+an interrupted setup (Ctrl-C, closed input, a crash) never loses it; the next
+init offers to finish the setup with it.
+
+Init is safe to re-run: existing databases, users and schema objects are
+reused, never recreated, and an existing user's privileges are changed only
+with your explicit confirmation. Only the settings you change are rewritten.
+Init never installs or starts the background service.
+
+In scripts use --non-interactive (manually managed setup); with an existing
+configuration add --update (apply the given flags, keep everything else) or
+--force (start over from defaults, keeping a backup). Then create the schema
+with 'vario migrate'.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			o.flags = cmd.Flags()
@@ -69,14 +88,15 @@ everything else) or --force (start over from defaults, keeping a backup).`,
 	f.BoolVar(&o.force, "force", false, "replace an existing configuration with defaults and the given flags (a backup is kept)")
 	f.StringVar(&o.url, "clickhouse-url", "", "ClickHouse HTTP(S) endpoint, e.g. https://ch.example.com:8443")
 	f.StringVar(&o.database, "database", "", "ClickHouse database (default vario)")
-	f.BoolVar(&o.createDatabase, "create-database", false, "allow Vario to create the database if it is missing (default: use an existing database)")
-	f.StringVar(&o.username, "username", "", "ClickHouse user (default default)")
-	f.BoolVar(&o.passwordStdin, "password-stdin", false, "read the ClickHouse password from stdin")
+	f.BoolVar(&o.createDatabase, "create-database", false, "deprecated and ignored: create the database with `vario migrate`")
+	_ = f.MarkHidden("create-database")
+	f.StringVar(&o.username, "username", "", "operational ClickHouse user (default default)")
+	f.BoolVar(&o.passwordStdin, "password-stdin", false, "read the operational ClickHouse password from stdin")
 	f.StringVar(&o.mode, "mode", "", "collection mode: metrics, messages or full (default metrics)")
 	f.BoolVar(&o.allowSensitive, "allow-sensitive-content", false, "confirm collecting conversation content (required for messages/full)")
 	f.StringVar(&o.t3Path, "t3code-path", "", "path to T3 Code's statev2.sqlite")
 	f.BoolVar(&o.noT3, "no-t3code", false, "do not enable the T3 Code source")
-	f.BoolVar(&o.skipCheck, "skip-connection-check", false, "do not test the ClickHouse connection")
+	f.BoolVar(&o.skipCheck, "skip-connection-check", false, "do not verify the operational ClickHouse login")
 	f.StringVar(&o.dataDir, "data-dir", "", "directory for the spool and state (default ~/.vario/data)")
 	return cmd
 }
@@ -94,6 +114,7 @@ type checkStatus int
 const (
 	checkNotRun checkStatus = iota
 	checkVerified
+	checkPartial // no problems found, some checks inconclusive
 	checkFailed
 )
 
@@ -108,18 +129,44 @@ type wizard struct {
 
 	orig     *config.Config // existing configuration, nil when starting fresh
 	origData []byte
-	replace  bool // replace an existing file (backup kept)
-	cfg      *config.Config
+	// prev is the configuration found on disk (even when starting over), used
+	// to keep queued data bound to its destination.
+	prev    *config.Config
+	replace bool // replace an existing file (backup kept)
+	cfg     *config.Config
 
 	pwAction    pwAction
 	pwValue     string
 	pwStored    string // existing password file, if any
 	pwFromEnv   bool
 	sensitiveOK bool // sensitive content already confirmed in the existing configuration
+	pwGenerated bool // pwValue was generated by Vario
+
+	// ClickHouse setup. The administrative connection (and its password)
+	// lives only in memory for the duration of init.
+	setup       string // "guided" or "manual"
+	admin       *clickhouse.Admin
+	adminUser   string
+	dbState     string // how the database was chosen, for the summary
+	userState   string // how the operational user was chosen
+	privState   string // privilege changes made by this setup
+	schemaState string // schema changes made by this setup
+	changedCH   bool   // something was changed in ClickHouse
 
 	check     checkStatus
 	checkNote string
 	report    *clickhouse.Report
+
+	// Passwords of users created by guided setup that no saved configuration
+	// uses yet (see pendingCredentials).
+	pend      *pendingStore
+	pendErr   error
+	pendPath  string
+	creating  string            // name of the user the current plan creates
+	newUsers  map[string]string // endpoint|user -> "created" or "unknown" (this run)
+	pendFound map[string]bool   // endpoint|user entries that existed before this run
+	resumed   *pendingCredentials
+	applying  bool // a confirmed plan is being applied
 }
 
 func (a *app) runInit(ctx context.Context, o initOptions) error {
@@ -136,7 +183,8 @@ func (a *app) runInit(ctx context.Context, o initOptions) error {
 		fmt.Fprintln(a.stderr, "stdin is not a terminal; continuing non-interactively with flags and defaults")
 	}
 	w := &wizard{a: a, ctx: ctx, o: o, out: a.stdout, loc: loc, path: loc.Path,
-		p: newPrompter(a.stdin, a.stdout, interactive)}
+		p: newPrompter(a.stdin, a.stdout, interactive), pendPath: pendingPath(loc.Path),
+		newUsers: map[string]string{}, pendFound: map[string]bool{}}
 	_, w.pwFromEnv = os.LookupEnv(config.EnvPassword)
 	return w.run()
 }
@@ -146,6 +194,9 @@ func (w *wizard) printf(format string, args ...any) { fmt.Fprintf(w.out, format,
 func (w *wizard) run() error {
 	interactive := w.p.interactive
 	if interactive {
+		// Ctrl-C at any prompt restores the terminal and explains what was
+		// applied and what was kept, instead of silently killing the process.
+		defer w.p.trapInterrupts("Setup interrupted.\nNothing was saved.\n")()
 		w.welcome()
 	}
 	proceed, err := w.loadExisting()
@@ -157,10 +208,79 @@ func (w *wizard) run() error {
 	if w.pwStored == "" && w.cfg.HasStoredPassword() {
 		w.pwStored = w.cfg.PasswordPath()
 	}
+	if err := w.reviewPending(); err != nil {
+		return err
+	}
 	if !interactive {
 		return w.runNonInteractive()
 	}
-	return w.runInteractive()
+	err = w.runInteractive()
+	if err != nil {
+		w.printf("\n")
+		w.unsavedNotice(false)
+	}
+	return err
+}
+
+// updateNotice prepares what an interrupt (Ctrl-C) prints at this point.
+func (w *wizard) updateNotice() {
+	w.p.setNotice("Setup interrupted.\n" + w.unsavedText(true))
+}
+
+// unsavedNotice explains what remains after the wizard ends without saving:
+// changes applied in ClickHouse and the passwords of users it created, which
+// are kept for the next `vario init`. Nothing is said when nothing happened,
+// unless always is set.
+func (w *wizard) unsavedNotice(always bool) { w.printf("%s", w.unsavedText(always)) }
+
+func (w *wizard) unsavedText(always bool) string {
+	var b strings.Builder
+	users := w.unsavedUsers()
+	for _, k := range users {
+		e := w.pend.find(splitKey(k))
+		if e == nil {
+			continue
+		}
+		verb := "was created"
+		if w.newUsers[k] != "created" {
+			verb = "may have been created (setup stopped before ClickHouse confirmed it)"
+		}
+		fmt.Fprintf(&b, "! ClickHouse user %s %s at %s, but no configuration using it was saved.\n"+
+			"  Its password is kept in %s (readable only by you).\n"+
+			"  Run `vario init` again to finish the setup with it.\n", e.User, verb, e.Endpoint, config.DisplayPath(w.pendPath))
+	}
+	switch {
+	case w.applying:
+		b.WriteString("! Setup stopped while applying confirmed changes in ClickHouse; some of them may have been applied.\n" +
+			"  Review with `vario init` or `vario migrate --dry-run`. The configuration was not saved.\n")
+	case w.changedCH:
+		b.WriteString("! Changes confirmed earlier were applied in ClickHouse and remain in effect; the configuration was not saved.\n")
+	case len(users) == 0 && always:
+		b.WriteString("Nothing was saved.\n")
+	}
+	return b.String()
+}
+
+func pendKey(endpoint, user string) string { return config.NormalizeEndpoint(endpoint) + "|" + user }
+
+func splitKey(k string) (string, string) {
+	i := strings.LastIndexByte(k, '|')
+	return k[:i], k[i+1:]
+}
+
+// unsavedUsers returns the users created (or possibly created) in this run
+// whose password is pending, in a stable order.
+func (w *wizard) unsavedUsers() []string {
+	var out []string
+	if w.pend == nil {
+		return nil
+	}
+	for _, e := range w.pend.Users {
+		if _, ok := w.newUsers[pendKey(e.Endpoint, e.User)]; ok {
+			out = append(out, pendKey(e.Endpoint, e.User))
+		}
+	}
+	return out
 }
 
 func (w *wizard) welcome() {
@@ -183,9 +303,7 @@ unless you explicitly ask it to.
 func (w *wizard) loadExisting() (bool, error) {
 	data, err := os.ReadFile(w.loc.Path)
 	if errors.Is(err, os.ErrNotExist) {
-		w.cfg = config.Default()
-		w.cfg.SetPath(w.path)
-		return true, nil
+		return true, w.startFresh()
 	}
 	if err != nil {
 		return false, withCode(ExitFailure, fmt.Errorf("cannot read the existing configuration %s: %w", w.loc.Path, err))
@@ -228,15 +346,14 @@ func (w *wizard) loadExisting() (bool, error) {
 		w.printf("\n")
 		choice = c
 	}
+	w.prev = parsed
 	switch choice {
 	case 1:
 		w.printf("The configuration was left unchanged.\n")
 		return false, nil
 	case 2:
-		w.cfg = config.Default()
-		w.cfg.SetPath(w.path)
 		w.replace = true
-		return true, nil
+		return true, w.startFresh()
 	}
 	w.orig, w.origData = parsed, data
 	w.cfg = parsed.Clone()
@@ -248,10 +365,29 @@ func (w *wizard) loadExisting() (bool, error) {
 	return true, nil
 }
 
+// startFresh begins from the defaults. The data directory is written as an
+// absolute path, so that the background service, which does not inherit
+// $VARIO_HOME, uses the same spool, cursors and lease as this shell.
+func (w *wizard) startFresh() error {
+	w.cfg = config.Default()
+	w.cfg.SetPath(w.path)
+	d, err := config.DefaultDataDir()
+	if err != nil {
+		return err
+	}
+	w.cfg.Collector.DataDir = d
+	return nil
+}
+
 // ---- interactive flow -------------------------------------------------------
 
 func (w *wizard) runInteractive() error {
-	if err := w.connectionSteps(); err != nil {
+	if err := w.resumeOrConnect(); err != nil {
+		if errors.Is(err, errCancelled) {
+			w.printf("Setup cancelled.\n")
+			w.unsavedNotice(true)
+			return nil
+		}
 		return err
 	}
 	if err := w.stepMode(); err != nil {
@@ -285,372 +421,24 @@ func (w *wizard) runInteractive() error {
 			return w.saveAndFinish()
 		case 1:
 			err = w.connectionSteps()
+			if errors.Is(err, errCancelled) {
+				err = nil
+			}
 		case 2:
 			err = w.stepMode()
 		case 3:
 			err = w.stepSources()
 		case 4:
-			w.printf("Nothing was saved.\n")
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-}
-
-func (w *wizard) connectionSteps() error {
-	for {
-		if err := w.stepEndpoint(); err != nil {
-			return err
-		}
-		if err := w.stepAuth(); err != nil {
-			return err
-		}
-		for {
-			if err := w.stepDatabase(); err != nil {
-				return err
+			quit, qerr := w.confirmQuit()
+			if qerr != nil {
+				return qerr
 			}
-			next, err := w.stepValidate()
-			if err != nil {
-				return err
-			}
-			switch next {
-			case nextContinue:
+			if quit {
 				return nil
-			case nextDatabase:
-				continue
 			}
-			break // nextConnection
 		}
-	}
-}
-
-func (w *wizard) stepEndpoint() error {
-	w.printf("ClickHouse connection\n\n")
-	def := w.cfg.ClickHouse.URL
-	if def == "" {
-		def = "http://localhost:8123"
-	}
-	for {
-		u, err := w.p.askValid("ClickHouse endpoint (HTTP interface)", def, func(s string) error {
-			if err := config.CheckURL(s); err != nil {
-				return fmt.Errorf("the endpoint %v", err)
-			}
-			return nil
-		})
 		if err != nil {
 			return err
-		}
-		if config.InsecureRemote(u) {
-			w.printf("  Warning: plain http:// sends your data and credentials unencrypted over the network.\n")
-			ok, err := w.p.confirm("  Use unencrypted HTTP for this remote server anyway?", false)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				def = "https://" + strings.TrimPrefix(u, "http://")
-				continue
-			}
-			w.cfg.ClickHouse.AllowInsecureHTTP = true
-		}
-		if u != w.cfg.ClickHouse.URL {
-			w.check = checkNotRun
-		}
-		w.cfg.ClickHouse.URL = u
-		return nil
-	}
-}
-
-func (w *wizard) stepAuth() error {
-	user, err := w.p.askValid("ClickHouse username", w.cfg.ClickHouse.Username, func(s string) error {
-		if s == "" {
-			return errors.New("a username is required")
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	w.cfg.ClickHouse.Username = user
-	if w.pwFromEnv {
-		w.printf("Using the password from $%s for this setup; it is not saved.\n\n", config.EnvPassword)
-		return nil
-	}
-	if w.pwStored != "" || w.pwAction == pwSet {
-		where := "is already stored in " + config.DisplayPath(w.pwStored)
-		if w.pwAction == pwSet {
-			where = "was entered"
-		}
-		c, err := w.p.choose("A ClickHouse password "+where+".", []string{"Keep it", "Enter a different password", "Use no password"}, 0)
-		if err != nil {
-			return err
-		}
-		switch c {
-		case 0:
-			w.printf("\n")
-			return nil
-		case 2:
-			w.pwAction, w.pwValue = pwClear, ""
-			w.printf("\n")
-			return nil
-		}
-	}
-	pw, err := w.p.secret("ClickHouse password (input hidden; leave empty for none)")
-	if err != nil {
-		return err
-	}
-	switch {
-	case pw != "":
-		w.pwAction, w.pwValue = pwSet, pw
-	case w.pwStored != "":
-		w.pwAction, w.pwValue = pwClear, ""
-	default:
-		w.pwAction, w.pwValue = pwKeep, ""
-	}
-	w.printf("\n")
-	return nil
-}
-
-func (w *wizard) stepDatabase() error {
-	db, err := w.p.askValid("Database name", w.cfg.ClickHouse.Database, func(s string) error {
-		if err := config.CheckDatabaseName(s); err != nil {
-			return fmt.Errorf("the database name %v", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	w.cfg.ClickHouse.Database = db
-	def := 0
-	if w.cfg.ClickHouse.CreateDatabase {
-		def = 1
-	}
-	w.printf("\n")
-	c, err := w.p.choose("Database management", []string{
-		"Use an existing database (Vario never creates or removes databases)",
-		"Allow Vario to create the database if it is missing",
-	}, def)
-	if err != nil {
-		return err
-	}
-	w.cfg.ClickHouse.CreateDatabase = c == 1
-	w.printf("\n")
-	return nil
-}
-
-type nextStep int
-
-const (
-	nextContinue nextStep = iota
-	nextConnection
-	nextDatabase
-)
-
-func (w *wizard) stepValidate() (nextStep, error) {
-	ok, err := w.p.confirm("Test the connection to ClickHouse now? (read-only; nothing is created)", true)
-	if err != nil {
-		return 0, err
-	}
-	if !ok {
-		w.check, w.checkNote, w.report = checkNotRun, "not tested", nil
-		w.printf("\n")
-		return nextContinue, nil
-	}
-	for {
-		w.printf("\n")
-		rep, err := w.runCheck()
-		if err != nil {
-			c, cerr := w.p.choose("\nThe connection could not be verified. What would you like to do?", []string{
-				"Retry",
-				"Change the connection settings",
-				"Continue without verifying (the settings are kept and can be saved)",
-			}, 0)
-			if cerr != nil {
-				return 0, cerr
-			}
-			w.printf("\n")
-			switch c {
-			case 0:
-				continue
-			case 1:
-				return nextConnection, nil
-			}
-			return nextContinue, nil
-		}
-		if rep.Ready() {
-			w.printf("\n")
-			return nextContinue, nil
-		}
-		var missingDB bool
-		for _, is := range rep.Issues {
-			missingDB = missingDB || is.Kind == clickhouse.KindDatabaseMissing
-		}
-		if missingDB {
-			c, err := w.p.choose(fmt.Sprintf("\nDatabase %s does not exist (or %s cannot see it).", w.cfg.ClickHouse.Database, w.cfg.ClickHouse.Username), []string{
-				"Allow Vario to create it when it first delivers data",
-				"Use a different database",
-				"Keep these settings (I will create the database myself)",
-			}, 0)
-			if err != nil {
-				return 0, err
-			}
-			w.printf("\n")
-			switch c {
-			case 0:
-				w.cfg.ClickHouse.CreateDatabase = true
-				w.printf("Checking again with database creation enabled:\n")
-				continue
-			case 1:
-				return nextDatabase, nil
-			}
-			return nextContinue, nil
-		}
-		c, err := w.p.choose("\nVario may not be able to deliver data with these settings.", []string{
-			"Continue (fix the problems in ClickHouse later)",
-			"Change the connection settings",
-			"Retry the check",
-		}, 0)
-		if err != nil {
-			return 0, err
-		}
-		w.printf("\n")
-		switch c {
-		case 1:
-			return nextConnection, nil
-		case 2:
-			continue
-		}
-		return nextContinue, nil
-	}
-}
-
-// password returns the password to use for checks before it is saved.
-func (w *wizard) password() (string, error) {
-	if p, ok := os.LookupEnv(config.EnvPassword); ok {
-		return p, nil
-	}
-	switch w.pwAction {
-	case pwSet:
-		return w.pwValue, nil
-	case pwClear:
-		return "", nil
-	}
-	if w.pwStored == "" {
-		return "", nil
-	}
-	b, err := os.ReadFile(w.pwStored)
-	if err != nil {
-		return "", fmt.Errorf("read password file: %w", err)
-	}
-	return strings.TrimRight(string(b), "\r\n"), nil
-}
-
-func (w *wizard) client() (*clickhouse.Client, error) {
-	pw, err := w.password()
-	if err != nil {
-		return nil, err
-	}
-	return clickhouse.New(w.cfg.ClickHouse, pw)
-}
-
-// runCheck tests the connection and prints the findings.
-func (w *wizard) runCheck() (*clickhouse.Report, error) {
-	w.report = nil
-	client, err := w.client()
-	if err != nil {
-		w.check, w.checkNote = checkFailed, err.Error()
-		w.printf("  ✗ %v\n", err)
-		return nil, err
-	}
-	timeout := w.cfg.ClickHouse.Timeout.Duration
-	if timeout <= 0 || timeout > 15*time.Second {
-		timeout = 15 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(w.ctx, timeout)
-	defer cancel()
-	rep, err := client.CheckConnection(ctx)
-	if err != nil {
-		var ce *clickhouse.CheckError
-		kind := clickhouse.Classify(err)
-		if errors.As(err, &ce) {
-			kind = ce.Kind
-			if ce.Stage != "reach" {
-				w.printf("  ✓ endpoint reachable (%s)\n", w.cfg.ClickHouse.URL)
-			}
-		}
-		w.check, w.checkNote = checkFailed, fmt.Sprintf("%s failure", kind)
-		w.printf("  ✗ %s failure: %v\n    %s\n", kind, err, clickhouse.Hint(kind))
-		return nil, err
-	}
-	w.report = rep
-	printReport(w.out, rep)
-	if rep.Ready() {
-		w.check, w.checkNote = checkVerified, "verified (ClickHouse "+rep.Version+")"
-	} else {
-		w.check, w.checkNote = checkVerified, "connected, with problems (see above)"
-	}
-	return rep, nil
-}
-
-// printReport prints a connection report as check lines.
-func printReport(out io.Writer, r *clickhouse.Report) {
-	fmt.Fprintf(out, "  ✓ endpoint reachable\n  ✓ authenticated as %s (ClickHouse %s)\n", r.User, r.Version)
-	st := r.Schema
-	switch {
-	case st.DatabaseExists:
-		fmt.Fprintf(out, "  ✓ database %s exists\n", r.Database)
-	case r.CreateDatabase:
-		fmt.Fprintf(out, "  · database %s does not exist yet; Vario will create it on first delivery (create_database = true)\n", r.Database)
-	default:
-		fmt.Fprintf(out, "  ✗ database %s does not exist or %s has no access to it\n", r.Database, r.User)
-	}
-	if st.DatabaseExists {
-		switch {
-		case len(st.Problems) > 0:
-			for _, p := range st.Problems {
-				fmt.Fprintf(out, "  ✗ incompatible schema: %s\n", p)
-			}
-		case len(st.MissingTables) == len(model.Tables):
-			fmt.Fprintf(out, "  · no Vario tables yet; they are created on first delivery\n")
-		case len(st.MissingTables) > 0 || len(st.MissingViews) > 0:
-			fmt.Fprintf(out, "  · Vario schema incomplete (missing: %s); completed on first delivery\n", strings.Join(append(append([]string{}, st.MissingTables...), st.MissingViews...), ", "))
-		default:
-			fmt.Fprintf(out, "  ✓ Vario tables present and compatible\n")
-		}
-		if len(st.OutdatedViews) > 0 {
-			fmt.Fprintf(out, "  · outdated views (updated on next delivery): %s\n", strings.Join(st.OutdatedViews, ", "))
-		}
-	}
-	if r.PrivilegesUnknown != "" {
-		fmt.Fprintf(out, "  ! %s\n", r.PrivilegesUnknown)
-	}
-	var granted, missing, optional []string
-	for _, p := range r.Privileges {
-		switch {
-		case p.Granted:
-			granted = append(granted, p.Grant)
-		case p.Required:
-			missing = append(missing, p.Grant)
-		default:
-			optional = append(optional, p.Grant)
-		}
-	}
-	if len(granted) > 0 {
-		fmt.Fprintf(out, "  ✓ privileges: %s\n", strings.Join(granted, ", "))
-	}
-	for _, g := range missing {
-		fmt.Fprintf(out, "  ✗ missing privilege: %s\n", g)
-	}
-	for _, g := range optional {
-		fmt.Fprintf(out, "  ! missing optional privilege: %s (needed to update outdated views)\n", g)
-	}
-	kinds := map[clickhouse.Kind]bool{}
-	for _, is := range r.Issues {
-		if !kinds[is.Kind] {
-			kinds[is.Kind] = true
-			fmt.Fprintf(out, "    %s\n", clickhouse.Hint(is.Kind))
 		}
 	}
 }
@@ -778,56 +566,6 @@ func (w *wizard) stepSources() error {
 	}
 }
 
-func (w *wizard) passwordSummary() string {
-	switch {
-	case w.pwFromEnv:
-		return "from $" + config.EnvPassword + " (not saved)"
-	case w.pwAction == pwSet:
-		return "new password, saved to " + config.DisplayPath(w.cfg.PasswordPath())
-	case w.pwAction == pwClear && w.pwStored != "":
-		return "none (the stored password will be removed)"
-	case w.pwStored != "":
-		return "stored in " + config.DisplayPath(w.pwStored) + " (unchanged)"
-	}
-	return "none"
-}
-
-func (w *wizard) summary() {
-	c := w.cfg
-	dbMode := "existing database (Vario will not create it)"
-	if c.ClickHouse.CreateDatabase {
-		dbMode = "created by Vario if missing"
-	}
-	if w.check == checkNotRun && w.checkNote == "" {
-		w.checkNote = "not tested"
-	}
-	srcs := "none"
-	var parts []string
-	for _, s := range c.Sources {
-		if s.Enabled {
-			parts = append(parts, fmt.Sprintf("%s (%s)", s.Kind, config.DisplayPath(sourcePath(s))))
-		}
-	}
-	if len(parts) > 0 {
-		srcs = strings.Join(parts, ", ")
-	}
-	w.printf("Summary\n\n")
-	rows := [][2]string{
-		{"ClickHouse endpoint", c.ClickHouse.URL},
-		{"Username", c.ClickHouse.Username},
-		{"Password", w.passwordSummary()},
-		{"Database", c.ClickHouse.Database + " — " + dbMode},
-		{"Connection", w.checkNote},
-		{"Collection mode", c.Privacy.Mode},
-		{"Sources", srcs},
-		{"Configuration file", config.DisplayPath(w.path)},
-	}
-	for _, r := range rows {
-		w.printf("  %-20s %s\n", r[0], r[1])
-	}
-	w.printf("\n")
-}
-
 // ---- non-interactive flow ---------------------------------------------------
 
 func (w *wizard) runNonInteractive() error {
@@ -853,7 +591,7 @@ func (w *wizard) runNonInteractive() error {
 		c.ClickHouse.Database = o.database
 	}
 	if o.set("create-database") {
-		c.ClickHouse.CreateDatabase = o.createDatabase
+		fmt.Fprintln(w.a.stderr, "warning: --create-database is deprecated and ignored; create the database and schema with `vario migrate`")
 	}
 	if o.set("username") {
 		c.ClickHouse.Username = o.username
@@ -901,8 +639,9 @@ func (w *wizard) runNonInteractive() error {
 	if err := c.Validate(); err != nil {
 		return withCode(ExitUsage, fmt.Errorf("invalid settings:\n  %s", strings.ReplaceAll(err.Error(), "\n", "\n  ")))
 	}
+	w.setup = "manual"
 	if !o.skipCheck {
-		fmt.Fprintf(w.out, "Checking ClickHouse at %s...\n", c.ClickHouse.URL)
+		fmt.Fprintf(w.out, "Checking ClickHouse at %s as %s...\n", c.ClickHouse.URL, c.ClickHouse.Username)
 		_, _ = w.runCheck()
 	} else {
 		w.checkNote = "not tested (--skip-connection-check)"
@@ -947,41 +686,6 @@ func (w *wizard) changes() []config.Change {
 	return config.Diff(w.orig, w.cfg)
 }
 
-func (w *wizard) saveAndFinish() error {
-	saved, err := w.save()
-	if err != nil {
-		return err
-	}
-	if saved {
-		w.printf("✓ Configuration saved\n  %s\n", config.DisplayPath(w.path))
-	} else {
-		w.printf("✓ No configuration changes; %s was left untouched\n", config.DisplayPath(w.path))
-	}
-	if w.pwAction == pwSet {
-		w.printf("✓ Password saved to %s (readable only by you)\n", config.DisplayPath(w.cfg.PasswordPath()))
-	} else if w.pwAction == pwClear && w.pwStored != "" {
-		w.printf("✓ Stored password removed\n")
-	}
-	if w.check != checkVerified {
-		w.printf("! ClickHouse connectivity is not verified (%s). Check it later with `vario doctor`.\n", w.checkNote)
-	}
-	if err := w.offerProvisioning(); err != nil {
-		return err
-	}
-	serviceActive := w.a.serviceNotice(w.path, saved || w.pwAction != pwKeep)
-	w.printf("\nNext steps:\n\n  vario doctor\n")
-	if _, ok := w.cfg.Source(config.SourceT3Code); ok {
-		w.printf("  vario backfill --source t3code\n")
-	} else {
-		w.printf("  vario sources detect\n")
-	}
-	w.printf("  vario run\n")
-	if !serviceActive {
-		w.printf("\nTo run in the background:\n  vario service install\n")
-	}
-	return nil
-}
-
 // save writes the configuration and password. It returns false when the
 // configuration file did not need to change.
 func (w *wizard) save() (bool, error) {
@@ -1019,68 +723,4 @@ func (w *wizard) save() (bool, error) {
 		}
 	}
 	return saved, nil
-}
-
-// offerProvisioning offers to create the database or tables now, after an
-// explicit confirmation. Delivery creates them automatically otherwise.
-func (w *wizard) offerProvisioning() error {
-	r := w.report
-	if !w.p.interactive || r == nil || len(r.Schema.Problems) > 0 {
-		return nil
-	}
-	for _, is := range r.Issues {
-		if is.Kind == clickhouse.KindPermission {
-			return nil
-		}
-	}
-	st := r.Schema
-	var q string
-	switch {
-	case !st.DatabaseExists && w.cfg.ClickHouse.CreateDatabase:
-		q = fmt.Sprintf("Create database %s and Vario's tables now?", w.cfg.ClickHouse.Database)
-	case st.DatabaseExists && (len(st.MissingTables) > 0 || len(st.MissingViews) > 0):
-		q = fmt.Sprintf("Create Vario's tables and views in database %s now?", w.cfg.ClickHouse.Database)
-	default:
-		return nil
-	}
-	w.printf("\nVario creates what it needs automatically when it first delivers data.\n")
-	ok, err := w.p.confirm(q+" (nothing existing is changed)", false)
-	if errors.Is(err, errInputEnded) {
-		return nil // the configuration is already saved; treat as "no"
-	}
-	if err != nil || !ok {
-		return err
-	}
-	client, err := w.client()
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(w.ctx, time.Minute)
-	defer cancel()
-	res, err := client.InitSchema(ctx)
-	if err != nil {
-		kind := clickhouse.Classify(err)
-		w.printf("✗ %v\n  %s\n  The configuration is saved; fix the problem and run `vario doctor --create-schema`.\n", err, clickhouse.Hint(kind))
-		return nil
-	}
-	printSchemaResult(w.out, w.cfg.ClickHouse.Database, res)
-	return nil
-}
-
-func printSchemaResult(out io.Writer, db string, res clickhouse.SchemaResult) {
-	if res.CreatedDatabase {
-		fmt.Fprintf(out, "✓ created database %s\n", db)
-	}
-	if n := len(res.CreatedTables) + len(res.CreatedViews); n > 0 {
-		fmt.Fprintf(out, "✓ created %d tables and %d views in %s\n", len(res.CreatedTables), len(res.CreatedViews), db)
-	}
-	if len(res.UpdatedViews) > 0 {
-		fmt.Fprintf(out, "✓ updated views: %s\n", strings.Join(res.UpdatedViews, ", "))
-	}
-	if !res.CreatedDatabase && len(res.CreatedTables)+len(res.CreatedViews)+len(res.UpdatedViews) == 0 {
-		fmt.Fprintf(out, "✓ schema in %s is already up to date\n", db)
-	}
-	for _, wn := range res.Warnings {
-		fmt.Fprintf(out, "! %s\n", wn)
-	}
 }

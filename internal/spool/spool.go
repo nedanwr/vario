@@ -33,7 +33,23 @@ var ErrFull = errors.New("spool is full; waiting for delivery to drain it")
 // ErrLeaseHeld is returned when another Vario process owns the collector lease.
 var ErrLeaseHeld = errors.New("another vario collector is running")
 
-const schema = `
+// Spool schema versions (PRAGMA user_version):
+//
+//	0: queue, cursors and fingerprints without a destination (Vario <= 0.1).
+//	1: every queue entry, cursor and fingerprint belongs to a destination.
+const schemaVersion = 1
+
+const schemaV1 = `
+CREATE TABLE IF NOT EXISTS destinations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  endpoint TEXT NOT NULL,
+  database TEXT NOT NULL,
+  server_id TEXT NOT NULL DEFAULT '',
+  retired_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS destinations_key ON destinations(endpoint, database) WHERE retired_at = 0;
 CREATE TABLE IF NOT EXISTS queue (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   dest_table TEXT NOT NULL,
@@ -44,19 +60,24 @@ CREATE TABLE IF NOT EXISTS queue (
   created_at INTEGER NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT NOT NULL DEFAULT ''
+  last_error TEXT NOT NULL DEFAULT '',
+  destination_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS queue_due ON queue(next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS queue_destination ON queue(destination_id, next_attempt_at, id);
 CREATE TABLE IF NOT EXISTS cursors (
-  source_id TEXT PRIMARY KEY,
+  destination_id INTEGER NOT NULL,
+  source_id TEXT NOT NULL,
   cursor TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (destination_id, source_id)
 );
 CREATE TABLE IF NOT EXISTS fingerprints (
+  destination_id INTEGER NOT NULL,
   source_id TEXT NOT NULL,
   record_key TEXT NOT NULL,
   hash TEXT NOT NULL,
-  PRIMARY KEY (source_id, record_key)
+  PRIMARY KEY (destination_id, source_id, record_key)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
@@ -65,13 +86,24 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 `
 
+// ErrNoDestination is returned by operations that need a destination before
+// SelectDestination was called.
+var ErrNoDestination = errors.New("spool: no destination selected")
+
 type Store struct {
 	db       *sql.DB
 	path     string
 	maxBytes int64
+	// dest is the destination that cursors, fingerprints, commits and
+	// delivery apply to (see SelectDestination).
+	dest int64
+	// legacy is set for read-only views of a version 0 spool that has not
+	// been upgraded yet; it has a single, implicit destination.
+	legacy bool
 }
 
-// Open opens or creates the spool database at path.
+// Open opens or creates the spool database at path, upgrading the files of
+// earlier Vario versions in place (see upgrade).
 func Open(path string, maxBytes int64) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -96,7 +128,7 @@ func Open(path string, maxBytes int64) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(4)
-	if _, err := db.Exec(schema); err != nil {
+	if err := upgrade(context.Background(), db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize spool %s: %w", path, err)
 	}
@@ -107,7 +139,94 @@ func Open(path string, maxBytes int64) (*Store, error) {
 	return &Store{db: db, path: path, maxBytes: maxBytes}, nil
 }
 
-// OpenReadOnly opens an existing spool for inspection without creating it.
+// ErrUpgradeBlocked is returned when the spool of an earlier Vario version
+// cannot be upgraded because a collector of that version is still running.
+var ErrUpgradeBlocked = errors.New("the local state was created by an earlier Vario version whose collector is still running")
+
+// upgrade creates the current schema, or converts a version 0 spool. The
+// conversion keeps every queued entry, cursor and fingerprint: they are
+// assigned to a "legacy" destination (empty endpoint), which the collector
+// adopts as the configured destination on its next start (see Resolve).
+func upgrade(ctx context.Context, db *sql.DB) error {
+	var version int
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version >= schemaVersion {
+		return nil
+	}
+	var legacyTables int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cursors'`).Scan(&legacyTables); err != nil {
+		return err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if legacyTables == 0 {
+		if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
+			return err
+		}
+	} else {
+		// A collector of the earlier version would keep writing rows without a
+		// destination, and its cursor statements would fail against the new
+		// tables. Refuse while it holds a live lease.
+		var raw string
+		if err := tx.QueryRowContext(ctx, `SELECT value FROM kv WHERE key = ?`, leaseKey).Scan(&raw); err == nil {
+			var l Lease
+			if json.Unmarshal([]byte(raw), &l) == nil && l.live() && l.PID != os.Getpid() {
+				return fmt.Errorf("%w (%s, pid %d); restart it with the new version (`vario service restart`) or stop it, then try again", ErrUpgradeBlocked, l.Command, l.PID)
+			}
+		}
+		var rows int
+		if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM queue) + (SELECT COUNT(*) FROM cursors) + (SELECT COUNT(*) FROM fingerprints)`).Scan(&rows); err != nil {
+			return err
+		}
+		stmts := []string{
+			`ALTER TABLE queue ADD COLUMN destination_id INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE cursors RENAME TO cursors_v0`,
+			`ALTER TABLE fingerprints RENAME TO fingerprints_v0`,
+		}
+		for _, q := range stmts {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("upgrade spool: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
+			return err
+		}
+		if rows > 0 {
+			now := nowMs()
+			res, err := tx.ExecContext(ctx, `INSERT INTO destinations (endpoint, database, created_at, updated_at) VALUES ('', '', ?, ?)`, now, now)
+			if err != nil {
+				return err
+			}
+			legacy, _ := res.LastInsertId()
+			for _, q := range []string{
+				`UPDATE queue SET destination_id = ?`,
+				`INSERT INTO cursors (destination_id, source_id, cursor, updated_at) SELECT ?, source_id, cursor, updated_at FROM cursors_v0`,
+				`INSERT INTO fingerprints (destination_id, source_id, record_key, hash) SELECT ?, source_id, record_key, hash FROM fingerprints_v0`,
+			} {
+				if _, err := tx.ExecContext(ctx, q, legacy); err != nil {
+					return fmt.Errorf("upgrade spool: %w", err)
+				}
+			}
+		}
+		for _, q := range []string{`DROP TABLE cursors_v0`, `DROP TABLE fingerprints_v0`} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// OpenReadOnly opens an existing spool for inspection without creating or
+// upgrading it.
 func OpenReadOnly(path string) (*Store, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
@@ -119,19 +238,48 @@ func OpenReadOnly(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db, path: path}, nil
+	s := &Store{db: db, path: path}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		db.Close()
+		return nil, err
+	}
+	s.legacy = version == 0
+	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Path() string { return s.path }
 
+// Legacy reports whether this is a read-only view of a spool written by an
+// earlier Vario version that has not been upgraded yet.
+func (s *Store) Legacy() bool { return s.legacy }
+
+// SelectDestination sets the destination that cursors, fingerprints,
+// commits, delivery and statistics apply to.
+func (s *Store) SelectDestination(id int64) { s.dest = id }
+
+// Selected returns the selected destination id (0 if none).
+func (s *Store) Selected() int64 { return s.dest }
+
 func nowMs() int64 { return time.Now().UnixMilli() }
 
 // Cursor returns the stored cursor for a source.
+// Cursors belong to the selected destination: a source that was delivered to
+// one destination has no cursor for another, so switching destinations
+// re-reads the source for the new one.
 func (s *Store) Cursor(ctx context.Context, sourceID string) (string, bool, error) {
 	var c string
-	err := s.db.QueryRowContext(ctx, `SELECT cursor FROM cursors WHERE source_id = ?`, sourceID).Scan(&c)
+	var err error
+	if s.legacy {
+		err = s.db.QueryRowContext(ctx, `SELECT cursor FROM cursors WHERE source_id = ?`, sourceID).Scan(&c)
+	} else {
+		if s.dest == 0 {
+			return "", false, ErrNoDestination
+		}
+		err = s.db.QueryRowContext(ctx, `SELECT cursor FROM cursors WHERE destination_id = ? AND source_id = ?`, s.dest, sourceID).Scan(&c)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -153,11 +301,15 @@ type CommitResult struct {
 	Skipped  int
 }
 
-// Commit durably enqueues records and, when cursor is non-nil, advances the
-// source cursor in the same transaction. Records whose content is identical to
-// the last enqueued version are skipped unless opts.Force is set.
+// Commit durably enqueues records for the selected destination and, when
+// cursor is non-nil, advances the source cursor in the same transaction.
+// Records whose content is identical to the last version enqueued for the
+// same destination are skipped unless opts.Force is set.
 func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record, cursor *string, opts CommitOptions) (CommitResult, error) {
 	var res CommitResult
+	if s.dest == 0 {
+		return res, ErrNoDestination
+	}
 	if len(recs) > 0 && s.maxBytes > 0 {
 		used, err := s.queuedBytes(ctx)
 		if err != nil {
@@ -200,13 +352,13 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 	}
 	defer tx.Rollback()
 
-	getFP, err := tx.PrepareContext(ctx, `SELECT hash FROM fingerprints WHERE source_id = ? AND record_key = ?`)
+	getFP, err := tx.PrepareContext(ctx, `SELECT hash FROM fingerprints WHERE destination_id = ? AND source_id = ? AND record_key = ?`)
 	if err != nil {
 		return res, err
 	}
 	defer getFP.Close()
-	putFP, err := tx.PrepareContext(ctx, `INSERT INTO fingerprints (source_id, record_key, hash) VALUES (?, ?, ?)
-		ON CONFLICT (source_id, record_key) DO UPDATE SET hash = excluded.hash`)
+	putFP, err := tx.PrepareContext(ctx, `INSERT INTO fingerprints (destination_id, source_id, record_key, hash) VALUES (?, ?, ?, ?)
+		ON CONFLICT (destination_id, source_id, record_key) DO UPDATE SET hash = excluded.hash`)
 	if err != nil {
 		return res, err
 	}
@@ -226,7 +378,7 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 		for _, p := range byTable[table] {
 			if !opts.Force && table != model.TableRawEvents {
 				var old string
-				err := getFP.QueryRowContext(ctx, sourceID, p.key).Scan(&old)
+				err := getFP.QueryRowContext(ctx, s.dest, sourceID, p.key).Scan(&old)
 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return res, err
 				}
@@ -236,7 +388,7 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 				}
 			}
 			if table != model.TableRawEvents {
-				if _, err := putFP.ExecContext(ctx, sourceID, p.key, p.hash); err != nil {
+				if _, err := putFP.ExecContext(ctx, s.dest, sourceID, p.key, p.hash); err != nil {
 					return res, err
 				}
 			}
@@ -244,23 +396,23 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 		}
 		for start := 0; start < len(lines); start += maxRows {
 			end := min(start+maxRows, len(lines))
-			if err := insertEntry(ctx, tx, table, lines[start:end]); err != nil {
+			if err := insertEntry(ctx, tx, s.dest, table, lines[start:end]); err != nil {
 				return res, err
 			}
 			res.Enqueued += end - start
 		}
 	}
 	if cursor != nil {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO cursors (source_id, cursor, updated_at) VALUES (?, ?, ?)
-			ON CONFLICT (source_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
-			sourceID, *cursor, nowMs()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cursors (destination_id, source_id, cursor, updated_at) VALUES (?, ?, ?, ?)
+			ON CONFLICT (destination_id, source_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at`,
+			s.dest, sourceID, *cursor, nowMs()); err != nil {
 			return res, err
 		}
 	}
 	return res, tx.Commit()
 }
 
-func insertEntry(ctx context.Context, tx *sql.Tx, table string, lines [][]byte) error {
+func insertEntry(ctx context.Context, tx *sql.Tx, dest int64, table string, lines [][]byte) error {
 	var raw bytes.Buffer
 	for _, l := range lines {
 		raw.Write(l)
@@ -275,8 +427,8 @@ func insertEntry(ctx context.Context, tx *sql.Tx, table string, lines [][]byte) 
 	if err := zw.Close(); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO queue (dest_table, token, row_count, raw_bytes, body, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		table, hex.EncodeToString(sum[:16]), len(lines), raw.Len(), gz.Bytes(), nowMs())
+	_, err := tx.ExecContext(ctx, `INSERT INTO queue (destination_id, dest_table, token, row_count, raw_bytes, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		dest, table, hex.EncodeToString(sum[:16]), len(lines), raw.Len(), gz.Bytes(), nowMs())
 	return err
 }
 
@@ -306,10 +458,15 @@ func (e Entry) Body() ([]byte, error) {
 	return io.ReadAll(zr)
 }
 
-// Due returns entries ready for delivery, oldest first, up to maxRows rows in total.
+// Due returns entries of the selected destination that are ready for
+// delivery, oldest first, up to maxRows rows in total. Entries queued for
+// other destinations are never returned.
 func (s *Store) Due(ctx context.Context, now time.Time, maxRows int) ([]Entry, error) {
+	if s.dest == 0 {
+		return nil, ErrNoDestination
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, dest_table, token, row_count, attempts, body FROM queue
-		WHERE next_attempt_at <= ? ORDER BY id LIMIT 200`, now.UnixMilli())
+		WHERE destination_id = ? AND next_attempt_at <= ? ORDER BY id LIMIT 200`, s.dest, now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -361,10 +518,11 @@ func (s *Store) Fail(ctx context.Context, ids []int64, next time.Time, msg strin
 	return tx.Commit()
 }
 
-// NextDue returns when the earliest pending entry becomes due, or false if the queue is empty.
+// NextDue returns when the selected destination's earliest pending entry
+// becomes due, or false if it has none.
 func (s *Store) NextDue(ctx context.Context) (time.Time, bool, error) {
 	var ms sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MIN(next_attempt_at) FROM queue`).Scan(&ms); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(next_attempt_at) FROM queue WHERE destination_id = ?`, s.dest).Scan(&ms); err != nil {
 		return time.Time{}, false, err
 	}
 	if !ms.Valid {
@@ -373,6 +531,9 @@ func (s *Store) NextDue(ctx context.Context) (time.Time, bool, error) {
 	return time.UnixMilli(ms.Int64), true, nil
 }
 
+// Stats describes the queue. Entries, Rows, Oldest, FailingEntries,
+// LastError and ByTable cover the selected destination (every destination if
+// none is selected); TotalBytes and OtherRows cover the rest of the spool.
 type Stats struct {
 	Entries        int
 	Rows           int64
@@ -382,12 +543,24 @@ type Stats struct {
 	FailingEntries int
 	LastError      string
 	ByTable        map[string]int64
+	// TotalBytes is the size of every queued entry, which the spool limit applies to.
+	TotalBytes int64
+	// OtherRows are queued for destinations other than the selected one.
+	OtherRows int64
+}
+
+func (s *Store) destFilter() (string, []any) {
+	if s.legacy || s.dest == 0 {
+		return "1 = 1", nil
+	}
+	return "destination_id = ?", []any{s.dest}
 }
 
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	st := Stats{MaxBytes: s.maxBytes, ByTable: map[string]int64{}}
+	where, args := s.destFilter()
 	var rows, bytes, oldest sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(row_count), SUM(length(body)), MIN(created_at) FROM queue`).
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), SUM(row_count), SUM(length(body)), MIN(created_at) FROM queue WHERE `+where, args...).
 		Scan(&st.Entries, &rows, &bytes, &oldest); err != nil {
 		return st, err
 	}
@@ -395,11 +568,16 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	if oldest.Valid {
 		st.Oldest = time.UnixMilli(oldest.Int64)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue WHERE attempts > 0`).Scan(&st.FailingEntries); err != nil {
+	var total, all sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT SUM(length(body)), SUM(row_count) FROM queue`).Scan(&total, &all); err != nil {
 		return st, err
 	}
-	_ = s.db.QueryRowContext(ctx, `SELECT last_error FROM queue WHERE attempts > 0 ORDER BY id LIMIT 1`).Scan(&st.LastError)
-	r, err := s.db.QueryContext(ctx, `SELECT dest_table, SUM(row_count) FROM queue GROUP BY dest_table`)
+	st.TotalBytes, st.OtherRows = total.Int64, all.Int64-st.Rows
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue WHERE attempts > 0 AND `+where, args...).Scan(&st.FailingEntries); err != nil {
+		return st, err
+	}
+	_ = s.db.QueryRowContext(ctx, `SELECT last_error FROM queue WHERE attempts > 0 AND `+where+` ORDER BY id LIMIT 1`, args...).Scan(&st.LastError)
+	r, err := s.db.QueryContext(ctx, `SELECT dest_table, SUM(row_count) FROM queue WHERE `+where+` GROUP BY dest_table`, args...)
 	if err != nil {
 		return st, err
 	}
@@ -415,17 +593,21 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	return st, r.Err()
 }
 
-// ResetSource clears a source's cursor and fingerprints so the next sync re-reads everything.
+// ResetSource clears a source's cursor and fingerprints for the selected
+// destination so the next sync re-reads everything.
 func (s *Store) ResetSource(ctx context.Context, sourceID string) error {
+	if s.dest == 0 {
+		return ErrNoDestination
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cursors WHERE source_id = ?`, sourceID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cursors WHERE destination_id = ? AND source_id = ?`, s.dest, sourceID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM fingerprints WHERE source_id = ?`, sourceID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fingerprints WHERE destination_id = ? AND source_id = ?`, s.dest, sourceID); err != nil {
 		return err
 	}
 	return tx.Commit()

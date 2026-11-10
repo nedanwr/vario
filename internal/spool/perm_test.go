@@ -27,6 +27,7 @@ func TestSpoolFilesArePrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	use(t, s, testEndpoint, "vario")
 	if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "secret text", 1)}, ptr("c"), CommitOptions{}); err != nil {
 		t.Fatal(err)
 	}

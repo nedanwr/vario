@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/term"
@@ -22,6 +23,13 @@ type prompter struct {
 	w           io.Writer
 	in          io.Reader
 	interactive bool
+
+	// Interrupt handling (see trapInterrupts).
+	mu       sync.Mutex
+	trapped  bool
+	notice   string
+	hidden   *term.State // terminal state to restore while echo is off
+	hiddenFd int
 }
 
 func newPrompter(in io.Reader, w io.Writer, interactive bool) *prompter {
@@ -145,7 +153,7 @@ func (p *prompter) secret(label string) (string, error) {
 	}
 	fmt.Fprintf(p.w, "%s: ", label)
 	if f, ok := p.in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
-		return readHidden(f, p.w)
+		return p.readHidden(f)
 	}
 	line, err := p.r.ReadString('\n')
 	if err != nil && !(errors.Is(err, io.EOF) && line != "") {
@@ -157,27 +165,86 @@ func (p *prompter) secret(label string) (string, error) {
 	return strings.TrimRight(line, "\r\n"), nil
 }
 
-// readHidden reads a password from the terminal with echo disabled. If the
-// user presses Ctrl-C, the terminal state is restored before exiting, since
-// it would otherwise be left without echo. Nothing has been saved at that point.
-func readHidden(f *os.File, w io.Writer) (string, error) {
-	if st, err := term.GetState(int(f.Fd())); err == nil {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		done := make(chan struct{})
-		defer func() { signal.Stop(sig); close(done) }()
-		go func() {
-			select {
-			case <-sig:
-				_ = term.Restore(int(f.Fd()), st)
-				fmt.Fprintln(w, "\nCancelled; nothing was saved.")
-				os.Exit(130)
-			case <-done:
-			}
+// exitProcess ends the process after an interrupt; tests replace it.
+var exitProcess = os.Exit
+
+// trapInterrupts handles Ctrl-C (SIGINT) and SIGTERM while a command prompts:
+// the terminal is restored if a hidden prompt disabled echo, the notice set
+// with setNotice explains what was (and was not) saved, and the process exits
+// with status 130. The returned function removes the handler. A process
+// killed with SIGKILL, or a crash, runs no handler: anything that must
+// survive an interruption has to be on disk before the step that needs it
+// (see pendingCredentials).
+func (p *prompter) trapInterrupts(notice string) (stop func()) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	p.mu.Lock()
+	p.trapped, p.notice = true, notice
+	p.mu.Unlock()
+	go func() {
+		select {
+		case <-sig:
+			p.interrupted()
+		case <-done:
+		}
+	}()
+	return func() {
+		signal.Stop(sig)
+		close(done)
+		p.mu.Lock()
+		p.trapped, p.notice = false, ""
+		p.mu.Unlock()
+	}
+}
+
+// interrupted restores the terminal, explains the state and exits.
+func (p *prompter) interrupted() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.hidden != nil {
+		_ = term.Restore(p.hiddenFd, p.hidden)
+		p.hidden = nil
+	}
+	fmt.Fprintln(p.w)
+	if p.notice != "" {
+		fmt.Fprint(p.w, p.notice)
+	} else {
+		fmt.Fprintln(p.w, "Cancelled; nothing was saved.")
+	}
+	exitProcess(130)
+}
+
+// setNotice replaces the text printed if the command is interrupted. The
+// text is prepared in advance because the interrupt arrives on another
+// goroutine while the command waits for input.
+func (p *prompter) setNotice(s string) {
+	p.mu.Lock()
+	p.notice = s
+	p.mu.Unlock()
+}
+
+// readHidden reads a password from the terminal with echo disabled. The
+// terminal state is recorded so that an interrupt restores echo before the
+// process exits.
+func (p *prompter) readHidden(f *os.File) (string, error) {
+	fd := int(f.Fd())
+	if st, err := term.GetState(fd); err == nil {
+		p.mu.Lock()
+		p.hidden, p.hiddenFd = st, fd
+		trapped := p.trapped
+		p.mu.Unlock()
+		if !trapped {
+			defer p.trapInterrupts("")()
+		}
+		defer func() {
+			p.mu.Lock()
+			p.hidden = nil
+			p.mu.Unlock()
 		}()
 	}
-	b, err := term.ReadPassword(int(f.Fd()))
-	fmt.Fprintln(w)
+	b, err := term.ReadPassword(fd)
+	fmt.Fprintln(p.w)
 	return string(b), err
 }
 

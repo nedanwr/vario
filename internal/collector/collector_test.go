@@ -31,17 +31,22 @@ type fakeSink struct {
 	failNext    int
 	failErr     error
 	schemaCalls int
+	schemaErr   error  // returned by CheckDestination
+	serverID    string // destination id reported by CheckDestination
 }
 
 func newSink() *fakeSink {
 	return &fakeSink{rows: map[string][]map[string]any{}, tokens: map[string]bool{}}
 }
 
-func (s *fakeSink) EnsureSchema(context.Context) error {
+func (s *fakeSink) CheckDestination(context.Context) (clickhouse.DestinationInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.schemaCalls++
-	return nil
+	if s.schemaErr != nil {
+		return clickhouse.DestinationInfo{}, s.schemaErr
+	}
+	return clickhouse.DestinationInfo{ServerID: s.serverID, Version: 2}, nil
 }
 
 func (s *fakeSink) Insert(_ context.Context, table string, body []byte, token string) error {
@@ -98,6 +103,7 @@ type harness struct {
 	sink  *fakeSink
 	src   *t3code.Source
 	c     *Collector
+	opts  Options
 }
 
 func setup(t *testing.T) *harness {
@@ -119,12 +125,24 @@ func setup(t *testing.T) *harness {
 	src := t3code.New(fix.Path, pol, 3)
 	t.Cleanup(func() { src.Close() })
 	sink := newSink()
-	c := New(store, sink, []sources.Source{src}, Options{
+	h := &harness{fix: fix, store: store, sink: sink, src: src, opts: Options{
 		PollInterval: 20 * time.Millisecond, ReconcileInterval: time.Hour, BatchSize: 4,
 		FlushInterval: 20 * time.Millisecond, MaxInsertRows: 7, RetryInitial: 10 * time.Millisecond, RetryMax: 50 * time.Millisecond,
-		PolicyFingerprint: pol.Fingerprint(),
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return &harness{fix: fix, store: store, sink: sink, src: src, c: c}
+		PolicyFingerprint: pol.Fingerprint(), Endpoint: "http://127.0.0.1:8123", Database: "vario",
+	}}
+	h.c = h.collector(t, h.opts)
+	return h
+}
+
+// collector builds a collector for opts on the harness's store, source and
+// sink and prepares its destination.
+func (h *harness) collector(t *testing.T, opts Options) *Collector {
+	t.Helper()
+	c := New(h.store, h.sink, []sources.Source{h.src}, opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := c.Prepare(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 var ctx = context.Background()
@@ -189,7 +207,7 @@ func TestDeliveryRetriesWithoutLoss(t *testing.T) {
 	}
 }
 
-func TestUnknownTableTriggersSchemaRecreation(t *testing.T) {
+func TestUnknownTableTriggersDestinationRecheck(t *testing.T) {
 	h := setup(t)
 	if _, err := h.c.Snapshot(ctx, h.src, false, false); err != nil {
 		t.Fatal(err)
@@ -201,7 +219,7 @@ func TestUnknownTableTriggersSchemaRecreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if h.sink.schemaCalls < 2 {
-		t.Fatalf("schema should be re-ensured after an unknown-table error (calls=%d)", h.sink.schemaCalls)
+		t.Fatalf("the destination should be checked again after an unknown-table error (calls=%d)", h.sink.schemaCalls)
 	}
 }
 

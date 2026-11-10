@@ -27,9 +27,10 @@ func (a *app) backfillCmd() *cobra.Command {
 event history into the local spool, records the snapshot boundary as the
 incremental cursor, and then delivers the spool to ClickHouse.
 
-Backfill is idempotent. Records already queued with identical content are
-skipped; --force re-sends everything (for example after recreating the
-ClickHouse database). If ClickHouse is unreachable, data stays spooled and is
+Backfill is idempotent. Records already queued for the configured destination
+with identical content are skipped; --force re-sends everything. Cursors and
+fingerprints are kept per destination, so a new destination always receives
+a full backfill. If ClickHouse is unreachable, data stays spooled and is
 delivered later by 'vario run' (exit code 3).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -73,9 +74,15 @@ delivered later by 'vario run' (exit code 3).`,
 				return withCode(ExitUsage, err)
 			}
 			log := a.logger(a.stderr, cfg.Collector.LogLevel)
+			for _, w := range legacyWarnings(cfg) {
+				log.Warn(w)
+			}
 			c := newCollector(cfg, store, client, srcs, policy, log)
+			if err := prepareDestination(ctx, c, !noDeliver); err != nil {
+				return err
+			}
 
-			fmt.Fprintf(a.stdout, "Backfilling %s from %s (mode: %s)\n", src.ID(), src.Location(), policy.Mode())
+			fmt.Fprintf(a.stdout, "Backfilling %s from %s (mode: %s) for %s\n", src.ID(), src.Location(), policy.Mode(), c.Destination())
 			res, err := c.Snapshot(ctx, src, force, force)
 			if err != nil {
 				return fmt.Errorf("backfill: %w", err)

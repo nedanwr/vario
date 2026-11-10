@@ -15,12 +15,19 @@ import (
 	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
 
-func (c *Collector) deliverLoop(ctx context.Context) {
+// deliverLoop delivers until ctx is cancelled. It returns an error only for
+// failures that must stop the collector (a replaced destination).
+func (c *Collector) deliverLoop(ctx context.Context) error {
 	failures := 0
 	for {
 		n, err := c.deliverRound(ctx, time.Now())
 		if ctx.Err() != nil {
-			return
+			return nil
+		}
+		var fe *fatalError
+		if errors.As(err, &fe) {
+			c.log.Error("delivery stopped", "error", fe.err.Error())
+			return err
 		}
 		wait := c.opts.FlushInterval
 		if err != nil {
@@ -47,14 +54,14 @@ func (c *Collector) deliverLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return
+			return nil
 		case <-timer.C:
 		case <-c.wake:
 			timer.Stop()
 			// Coalesce bursts of small commits into fewer inserts.
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			case <-time.After(min(c.opts.FlushInterval, 2*time.Second)):
 			}
 		}
@@ -64,10 +71,13 @@ func (c *Collector) deliverLoop(ctx context.Context) {
 // deliverRound sends every entry due at now, grouped by table. It returns the
 // number of rows delivered and the first error encountered.
 func (c *Collector) deliverRound(ctx context.Context, now time.Time) (int, error) {
+	if c.dest.ID == 0 {
+		return 0, errors.New("collector: destination not prepared")
+	}
 	if !c.schemaReady {
-		if err := c.sink.EnsureSchema(ctx); err != nil {
-			_ = c.store.SetKV(ctx, "delivery.last_error", "schema: "+err.Error())
-			return 0, fmt.Errorf("ensure schema: %w", err)
+		// Read-only: the collector never creates or migrates the schema.
+		if err := c.checkDestination(ctx); err != nil {
+			return 0, err
 		}
 		c.schemaReady = true
 	}
@@ -102,7 +112,8 @@ func (c *Collector) deliverRound(ctx context.Context, now time.Time) (int, error
 			if !chErr.Transient {
 				wait = c.opts.RetryMax
 			}
-			// Unknown table or database: recreate the schema before the next attempt.
+			// Unknown table or database: check the destination again before the
+			// next attempt (it may have been dropped or recreated).
 			if chErr.Code == 60 || chErr.Code == 81 {
 				c.schemaReady = false
 			}

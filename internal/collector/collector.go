@@ -16,11 +16,16 @@ import (
 	"github.com/nedanwr/vario/internal/model"
 	"github.com/nedanwr/vario/internal/sources"
 	"github.com/nedanwr/vario/internal/spool"
+	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
 
-// Sink is the delivery destination. *clickhouse.Client implements it.
+// Sink is the delivery destination. *clickhouse.Client implements it with
+// the operational user. The collector never changes the destination's
+// schema, users or privileges: CheckDestination only reads, and a missing or
+// incompatible schema stops delivery (data stays spooled) until it is fixed
+// with `vario migrate`.
 type Sink interface {
-	EnsureSchema(ctx context.Context) error
+	CheckDestination(ctx context.Context) (clickhouse.DestinationInfo, error)
 	Insert(ctx context.Context, table string, gzBody []byte, token string) error
 }
 
@@ -33,6 +38,10 @@ type Options struct {
 	RetryInitial      time.Duration
 	RetryMax          time.Duration
 	PolicyFingerprint string
+	// Endpoint (normalized, see config.ClickHouseConfig.Endpoint) and
+	// Database identify the configured destination.
+	Endpoint string
+	Database string
 }
 
 type Collector struct {
@@ -44,10 +53,13 @@ type Collector struct {
 
 	wake        chan struct{}
 	schemaReady bool
+	// dest is the destination selected by Prepare.
+	dest   spool.Destination
+	warned map[string]bool
 }
 
 func New(store *spool.Store, sink Sink, srcs []sources.Source, opts Options, log *slog.Logger) *Collector {
-	return &Collector{store: store, sink: sink, sources: srcs, opts: opts, log: log, wake: make(chan struct{}, 1)}
+	return &Collector{store: store, sink: sink, sources: srcs, opts: opts, log: log, wake: make(chan struct{}, 1), warned: map[string]bool{}}
 }
 
 // leaseTTL bounds how long a collector that stopped renewing (crashed on
@@ -110,15 +122,23 @@ func Lease(ctx context.Context, store *spool.Store, command string, wait time.Du
 	}, nil
 }
 
-// Run synchronizes all sources and delivers to the sink until ctx is cancelled.
+// Run synchronizes all sources and delivers to the sink until ctx is
+// cancelled. Prepare must have succeeded first.
 func (c *Collector) Run(ctx context.Context) error {
+	if c.dest.ID == 0 {
+		return errors.New("collector: destination not prepared")
+	}
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
 	_ = c.store.SetKV(ctx, "collector.started_at", time.Now().UTC().Format(time.RFC3339))
 	_ = c.store.SetKV(ctx, "collector.pid", strconv.Itoa(os.Getpid()))
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		c.deliverLoop(ctx)
+		if err := c.deliverLoop(ctx); err != nil {
+			stop(err)
+		}
 	}()
 	for _, src := range c.sources {
 		wg.Add(1)
@@ -129,6 +149,10 @@ func (c *Collector) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 	_ = c.store.SetKV(context.Background(), "collector.stopped_at", time.Now().UTC().Format(time.RFC3339))
+	var fe *fatalError
+	if cause := context.Cause(ctx); errors.As(cause, &fe) {
+		return fe.err
+	}
 	return nil
 }
 

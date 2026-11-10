@@ -103,6 +103,9 @@ func (a *app) sourcesListCmd() *cobra.Command {
 			store, _ := spool.OpenReadOnly(statePath(cfg))
 			if store != nil {
 				defer store.Close()
+				if !selectConfigured(cmd.Context(), store, cfg) {
+					store = nil // no state for the configured destination yet
+				}
 			}
 			tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(tw, "KIND\tENABLED\tPATH\tCURSOR\tLAST SYNC")

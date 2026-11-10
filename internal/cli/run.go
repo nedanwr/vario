@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,7 +28,13 @@ func (a *app) runCmd() *cobra.Command {
 		Long: `Run continuously synchronizes every enabled source into the local spool and
 delivers spooled data to ClickHouse. Sources without a cursor are backfilled
 first. Stop with Ctrl-C (SIGINT) or SIGTERM; pending data stays spooled and is
-delivered on the next start. The background service runs this same command.`,
+delivered on the next start. The background service runs this same command.
+
+The collector uses only the operational ClickHouse user and never creates
+databases, users, privileges, tables or views. If Vario's schema is missing or
+incompatible, data stays spooled and the problem is reported; run
+'vario migrate' to fix it. Data is only delivered to the destination it was
+collected for (see 'vario destination').`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := a.loadConfig()
@@ -77,15 +84,32 @@ delivered on the next start. The background service runs this same command.`,
 			defer release()
 
 			log.Info("vario collector starting", "version", buildinfo.Version, "mode", policy.Mode(), "sources", len(srcs),
-				"clickhouse", cfg.ClickHouse.URL, "database", cfg.ClickHouse.Database)
+				"clickhouse", cfg.ClickHouse.URL, "database", cfg.ClickHouse.Database, "user", cfg.ClickHouse.Username)
+			for _, w := range legacyWarnings(cfg) {
+				log.Warn(w)
+			}
 			c := newCollector(cfg, store, client, srcs, policy, log)
+			if err := prepareDestination(lctx, c, true); err != nil {
+				log.Error("collector not started", "error", err.Error())
+				return err
+			}
+			pctx, cancel := context.WithTimeout(lctx, 10*time.Second)
+			if excess, err := client.ExcessPrivileges(pctx); err == nil && len(excess) > 0 {
+				log.Warn("the operational ClickHouse user holds administrative privileges it does not need; run `vario init` and choose \"Create a dedicated Vario user\" for a restricted account",
+					"user", cfg.ClickHouse.Username, "privileges", strings.Join(excess, ", "))
+			}
+			cancel()
 			err = c.Run(lctx)
 			if cause := context.Cause(lctx); errors.Is(cause, collector.ErrLeaseLost) {
 				log.Error("collector stopped", "error", cause.Error())
 				return cause
 			}
+			if err != nil {
+				log.Error("collector stopped", "error", err.Error())
+				return err
+			}
 			log.Info("vario collector stopped")
-			return err
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&logFile, "log-file", "", "write logs to this file (rotated at 10 MiB) instead of stderr")

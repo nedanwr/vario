@@ -250,3 +250,32 @@ func TestCheckHelpers(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeEndpoint(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://CH.Example.com":         "https://ch.example.com:443",
+		"https://ch.example.com:443/":    "https://ch.example.com:443",
+		"http://localhost:8123":          "http://localhost:8123",
+		"HTTP://LOCALHOST:8123/":         "http://localhost:8123",
+		"http://[::1]:8123":              "http://[::1]:8123",
+		"https://proxy.example.com/ch/":  "https://proxy.example.com:443/ch",
+		"https://proxy.example.com:8443": "https://proxy.example.com:8443",
+	} {
+		if got := NormalizeEndpoint(in); got != want {
+			t.Errorf("NormalizeEndpoint(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if NormalizeEndpoint("http://localhost:8123") == NormalizeEndpoint("http://127.0.0.1:8123") {
+		t.Error("different host names are different endpoints (they are linked by the destination id instead)")
+	}
+}
+
+func TestExampleConfigParses(t *testing.T) {
+	cfg, err := Load("../../config.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClickHouse.CreateDatabase || cfg.ClickHouse.Username != "vario" {
+		t.Fatalf("example: %+v", cfg.ClickHouse)
+	}
+}

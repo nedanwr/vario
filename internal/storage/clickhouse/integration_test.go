@@ -26,14 +26,29 @@ func integrationClient(t *testing.T) *Client {
 	cfg := config.Default().ClickHouse
 	cfg.URL = url
 	cfg.Username = envOr("VARIO_TEST_CLICKHOUSE_USER", "default")
-	cfg.Database = fmt.Sprintf("vario_test_%d", time.Now().UnixNano())
-	cfg.CreateDatabase = true // throwaway database
+	cfg.Database = fmt.Sprintf("vario_test_%d", time.Now().UnixNano()) // throwaway database
 	c, err := New(cfg, os.Getenv("VARIO_TEST_CLICKHOUSE_PASSWORD"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+quoteIdent(cfg.Database)) })
 	return c
+}
+
+// migrateAll applies a full schema plan as the client's user (the
+// integration user has administrative privileges).
+func migrateAll(t *testing.T, c *Client) ApplyResult {
+	t.Helper()
+	a := &Admin{c}
+	p, err := a.PlanSchema(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := a.Apply(context.Background(), p, nil)
+	if !res.OK() {
+		t.Fatal(res.Err)
+	}
+	return res
 }
 
 func envOr(k, d string) string {
@@ -71,14 +86,12 @@ func turn(version uint64, input *uint64, status string) model.ProviderTurnRow {
 func TestIntegrationSchemaAndDeduplication(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
-	if err := c.EnsureSchema(ctx); err != nil {
-		t.Fatal(err)
+	migrateAll(t, c)
+	if res := migrateAll(t, c); len(res.Applied) != 0 {
+		t.Fatalf("a repeated migration must be a no-op: %+v", res)
 	}
-	if err := c.EnsureSchema(ctx); err != nil {
-		t.Fatalf("schema setup must be idempotent: %v", err)
-	}
-	if missing, err := c.MissingTables(ctx); err != nil || len(missing) != 0 {
-		t.Fatalf("missing tables: %v %v", missing, err)
+	if st, err := c.VerifyMigrated(ctx); err != nil || !st.Complete() {
+		t.Fatalf("verify: %+v %v", st, err)
 	}
 
 	// The provider turn is updated several times and a batch is retried.
@@ -156,9 +169,7 @@ func queryOne[T any](t *testing.T, c *Client, q string) []T {
 func TestIntegrationAggregationSemantics(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
-	if err := c.EnsureSchema(ctx); err != nil {
-		t.Fatal(err)
-	}
+	migrateAll(t, c)
 	ins := func(table, token string, rows ...any) {
 		t.Helper()
 		if err := c.Insert(ctx, table, rowsBody(t, rows...), token); err != nil {

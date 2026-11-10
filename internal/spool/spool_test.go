@@ -23,7 +23,24 @@ func open(t *testing.T, maxBytes int64) (*Store, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
+	use(t, s, testEndpoint, "vario")
 	return s, path
+}
+
+const testEndpoint = "http://127.0.0.1:8123"
+
+// use resolves, activates and selects a destination.
+func use(t *testing.T, s *Store, endpoint, db string) Resolution {
+	t.Helper()
+	res, err := s.Resolve(ctx, endpoint, db, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Activate(ctx, res.Configured.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.SelectDestination(res.Configured.ID)
+	return res
 }
 
 func msg(id, text string, version uint64) model.Record {
@@ -56,6 +73,7 @@ func TestCommitIsAtomicWithCursorAndPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
+	use(t, s2, testEndpoint, "vario")
 	cur, ok, _ := s2.Cursor(ctx, "src")
 	if !ok || cur != "c1" {
 		t.Fatalf("cursor after reopen: %q %t", cur, ok)

@@ -65,6 +65,15 @@ switching to a different configuration file.`,
 			if len(cfg.Sources) == 0 {
 				return withCode(ExitUsage, errors.New("no sources configured; run `vario sources add t3code` first"))
 			}
+			if d := serviceDataDir(cfg); d != cfg.Collector.DataDir {
+				return withCode(ExitUsage, fmt.Errorf("the configuration leaves collector.data_dir empty, so the background service, which does not inherit $%s, "+
+					"would keep its spool, cursors and lease in %s while this shell uses %s.\nSet the directory explicitly first:\n  vario config set collector.data_dir %s",
+					config.EnvHome, d, cfg.Collector.DataDir, cfg.Collector.DataDir))
+			}
+			if _, ok := os.LookupEnv(config.EnvPassword); ok && !cfg.HasStoredPassword() {
+				fmt.Fprintf(a.stderr, "warning: $%s is set in this shell, but the background service does not inherit it and no password file exists;\n"+
+					"  store the password with `vario config set-password` so that the service can authenticate\n", config.EnvPassword)
+			}
 			exe, err := executable()
 			if err != nil {
 				return err
@@ -208,4 +217,19 @@ func (a *app) serviceStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// serviceDataDir returns the data directory the background service resolves
+// for cfg. The service runs with --config and without this shell's
+// environment, so an empty collector.data_dir resolves to ~/.vario/data
+// there even if $VARIO_HOME points elsewhere here.
+func serviceDataDir(cfg *config.Config) string {
+	if !cfg.DataDirImplicit() {
+		return cfg.Collector.DataDir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".vario", "data")
 }

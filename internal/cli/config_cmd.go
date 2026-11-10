@@ -94,6 +94,9 @@ password is never shown.`,
 			fmt.Fprintf(w, "# %s\n", cfg.Path())
 			section := ""
 			for _, k := range config.Keys() {
+				if k.Deprecated && !cfg.IsSet(k.Name) {
+					continue
+				}
 				sec := k.Name[:strings.LastIndex(k.Name, ".")]
 				if sec != section {
 					section = sec
@@ -104,8 +107,12 @@ password is never shown.`,
 					line += "  # default"
 				}
 				fmt.Fprintln(w, line)
+				if k.Deprecated {
+					line += "  # deprecated, ignored"
+				}
 				if k.Name == "clickhouse.username" {
 					fmt.Fprintf(w, "# password: %s\n", passwordStatus(cfg))
+					fmt.Fprintln(w, "# administrative credentials: never stored (asked for by `vario init` and `vario migrate`)")
 				}
 			}
 			if err := cfg.Validate(); err != nil {
@@ -156,11 +163,14 @@ file's comments. Examples:
   vario config set clickhouse.url https://clickhouse.example.com:8443
   vario config set clickhouse.username vario
   vario config set clickhouse.database vario
-  vario config set clickhouse.create_database false
   vario config set sources.t3code.path ~/.t3/userdata/statev2.sqlite
 
 The password cannot be set here (shell arguments end up in history and
-process lists); use 'vario config set-password'.`,
+process lists); use 'vario config set-password'.
+
+Changing clickhouse.url or clickhouse.database changes the destination: data
+already queued is never sent to the new destination, and the new destination
+receives a full backfill (see 'vario destination').`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, raw := args[0], args[1]
@@ -201,9 +211,13 @@ process lists); use 'vario config set-password'.`,
 				return nil
 			}
 			fmt.Fprintf(a.stdout, "Set %s = %s (was %s) in %s\n", name, after, orDash(before), config.DisplayPath(cfg.Path()))
+			if k.Deprecated {
+				fmt.Fprintf(a.stdout, "Note: %s is deprecated and has no effect (%s).\n", name, k.Help)
+			}
 			if strings.HasPrefix(name, "clickhouse.") {
 				fmt.Fprintln(a.stdout, "Run `vario doctor` to check the connection with the new settings.")
 			}
+			destinationNotice(a.stdout, cfg, updated)
 			a.serviceNotice(cfg.Path(), true)
 			return nil
 		},
@@ -338,9 +352,12 @@ can edit again, or the copy is kept so that your changes are not lost.`,
 					fmt.Fprintln(a.stdout, "No changes.")
 					return nil
 				}
-				_, err = config.Replace(path, config.FingerprintBytes(orig), edited)
+				updated, err := config.Replace(path, config.FingerprintBytes(orig), edited)
 				if err == nil {
 					fmt.Fprintf(a.stdout, "Saved %s\n", config.DisplayPath(path))
+					if prev, perr := config.Parse(path, orig); perr == nil {
+						destinationNotice(a.stdout, prev, updated)
+					}
 					a.serviceNotice(path, true)
 					return nil
 				}

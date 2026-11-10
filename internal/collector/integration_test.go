@@ -48,12 +48,23 @@ func TestIntegrationRedeliveryDoesNotInflateResults(t *testing.T) {
 	cfg.URL = url
 	cfg.Username = os.Getenv("VARIO_TEST_CLICKHOUSE_USER")
 	cfg.Database = fmt.Sprintf("vario_e2e_%d", time.Now().UnixNano())
-	cfg.CreateDatabase = true // throwaway database
 	ch, err := clickhouse.New(cfg, os.Getenv("VARIO_TEST_CLICKHOUSE_PASSWORD"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ch.Exec(context.Background(), "DROP DATABASE IF EXISTS `"+cfg.Database+"`") })
+	// The schema is created by an explicit migration, never by the collector.
+	admin, err := clickhouse.NewAdmin(cfg, cfg.Username, os.Getenv("VARIO_TEST_CLICKHOUSE_PASSWORD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := admin.PlanSchema(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := admin.Apply(ctx, plan, nil); !res.OK() {
+		t.Fatal(res.Err)
+	}
 
 	fix := t3codetest.New(t)
 	fix.Standard()
@@ -67,7 +78,14 @@ func TestIntegrationRedeliveryDoesNotInflateResults(t *testing.T) {
 	defer src.Close()
 	sink := &ambiguousSink{Client: ch}
 	c := New(store, sink, []sources.Source{src}, Options{BatchSize: 2, MaxInsertRows: 3, RetryInitial: time.Millisecond,
-		RetryMax: time.Millisecond, PolicyFingerprint: pol.Fingerprint()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		RetryMax: time.Millisecond, PolicyFingerprint: pol.Fingerprint(), Endpoint: cfg.Endpoint(), Database: cfg.Database},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := c.Prepare(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if c.Destination().ServerID == "" {
+		t.Fatal("the destination id should be learned from the migrated schema")
+	}
 
 	drain := func() {
 		t.Helper()

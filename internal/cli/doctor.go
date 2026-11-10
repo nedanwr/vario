@@ -48,10 +48,13 @@ func (a *app) doctorCmd() *cobra.Command {
 source (read-only), the local spool, and the ClickHouse connection,
 authentication and schema. It exits with status 1 if any check fails.
 
-Doctor only reads from ClickHouse. With --create-schema, missing Vario tables
-and views are created in the configured database (and the database itself if
-it is missing and clickhouse.create_database = true). Existing objects are
-never dropped or altered; incompatible ones are reported.`,
+Doctor only reads: it checks the operational login (authentication, database
+access, read-only settings, privileges via CHECK GRANT and an insert probe
+that writes no rows), the schema version, and which destination queued data
+belongs to. It never changes ClickHouse.
+
+--create-schema is deprecated: it runs 'vario migrate', which asks for
+administrative credentials and confirmation.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c := &checker{w: &strings.Builder{}}
@@ -77,11 +80,22 @@ never dropped or altered; incompatible ones are reported.`,
 				return withCode(ExitFailure, errors.New("doctor found problems"))
 			}
 			c.ok("configuration is valid")
+			for _, l := range legacyWarnings(cfg) {
+				c.warn("%s", l)
+			}
 			checkPrivate(c, path, "configuration file")
 			if dir := filepath.Dir(path); filepath.Base(dir) == ".vario" {
 				checkPrivate(c, dir, "configuration directory")
 			}
-			a.checkServiceConfig(c, path)
+			a.checkServiceConfig(c, cfg)
+			if st, err := loadPendingStore(pendingPath(path)); err != nil {
+				c.warn("%v", err)
+			} else {
+				for _, e := range st.Users {
+					c.warn("an unfinished `vario init` created ClickHouse %s; its password is kept in %s until a configuration uses it (run `vario init`)",
+						e, config.DisplayPath(pendingPath(path)))
+				}
+			}
 			c.ok("collection mode: %s (secret redaction %s)", cfg.Privacy.Mode, onOff(cfg.Privacy.RedactSecrets))
 			if !cfg.Privacy.RedactSecrets && cfg.Privacy.Mode != config.ModeMetrics {
 				c.warn("secret redaction is disabled while collecting conversation content")
@@ -113,16 +127,17 @@ never dropped or altered; incompatible ones are reported.`,
 			if err := os.MkdirAll(cfg.Collector.DataDir, 0o700); err != nil {
 				c.fail("data directory %s is not writable: %v", cfg.Collector.DataDir, err)
 			} else if store, err := spool.OpenReadOnly(statePath(cfg)); err == nil {
+				checkDestinations(ctx, c, cfg, store)
 				st, err := store.Stats(ctx)
 				store.Close()
 				if err != nil {
 					c.fail("cannot read spool: %v", err)
 				} else {
-					c.ok("spool: %d rows pending (%s of %d MiB)", st.Rows, human(st.StoredBytes), cfg.Spool.MaxSizeMB)
+					c.ok("spool: %d rows pending (%s of %d MiB)", st.Rows+st.OtherRows, human(st.TotalBytes), cfg.Spool.MaxSizeMB)
 					if st.FailingEntries > 0 {
 						c.warn("%d batches are being retried; last error: %s", st.FailingEntries, st.LastError)
 					}
-					if float64(st.StoredBytes) > 0.8*float64(int64(cfg.Spool.MaxSizeMB)<<20) {
+					if float64(st.TotalBytes) > 0.8*float64(int64(cfg.Spool.MaxSizeMB)<<20) {
 						c.warn("spool is over 80%% full; collection pauses when it is full")
 					}
 				}
@@ -131,7 +146,16 @@ never dropped or altered; incompatible ones are reported.`,
 			}
 
 			fmt.Fprintln(c.w, "\nClickHouse")
-			a.checkClickHouse(ctx, c, cfg, fixSchema)
+			if fixSchema {
+				fmt.Fprintln(a.stderr, "Note: `vario doctor --create-schema` is deprecated; running `vario migrate`.")
+				fmt.Fprint(a.stdout, c.w.String())
+				c.w.Reset()
+				if err := a.runMigrate(ctx, migrateOptions{}); err != nil {
+					c.fail("migration: %v", err)
+				}
+				fmt.Fprintln(c.w)
+			}
+			a.checkClickHouse(ctx, c, cfg)
 
 			if c.failures > 0 {
 				fmt.Fprintf(c.w, "\n%d check(s) failed, %d warning(s)\n", c.failures, c.warnings)
@@ -141,7 +165,8 @@ never dropped or altered; incompatible ones are reported.`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&fixSchema, "create-schema", false, "create missing Vario tables and views (and the database if create_database = true)")
+	cmd.Flags().BoolVar(&fixSchema, "create-schema", false, "deprecated: run `vario migrate` instead")
+	_ = cmd.Flags().MarkDeprecated("create-schema", "use `vario migrate` (this flag runs it)")
 	return cmd
 }
 
@@ -163,7 +188,8 @@ func checkPrivate(c *checker, path, what string) {
 
 // checkServiceConfig warns when the installed background service reads a
 // different configuration file than this command.
-func (a *app) checkServiceConfig(c *checker, path string) {
+func (a *app) checkServiceConfig(c *checker, cfg *config.Config) {
+	path := cfg.Path()
 	mgr, err := serviceManager()
 	if err != nil {
 		return
@@ -174,10 +200,45 @@ func (a *app) checkServiceConfig(c *checker, path string) {
 	}
 	if p := service.ConfigPath(args); p != "" && p != path {
 		c.warn("the background service reads %s, not this configuration; run `vario service install` to switch it", p)
+		return
+	}
+	if d := serviceDataDir(cfg); d != cfg.Collector.DataDir {
+		c.fail("collector.data_dir is empty: the background service (without $%s) uses %s, this shell %s; set it with `vario config set collector.data_dir %s`",
+			config.EnvHome, d, cfg.Collector.DataDir, cfg.Collector.DataDir)
 	}
 }
 
-func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Config, fixSchema bool) {
+// checkDestinations reports which destination queued data belongs to.
+func checkDestinations(ctx context.Context, c *checker, cfg *config.Config, store *spool.Store) {
+	if store.Legacy() {
+		c.info("local state from an earlier Vario version; the next `vario run` assigns it to the configured destination")
+		return
+	}
+	active, hasActive, err := store.Active(ctx)
+	if err != nil {
+		c.fail("cannot read destinations: %v", err)
+		return
+	}
+	configured, hasConfigured, _ := store.Lookup(ctx, cfg.ClickHouse.Endpoint(), cfg.ClickHouse.Database)
+	switch {
+	case !hasActive:
+	case hasConfigured && configured.ID == active.ID:
+		c.ok("destination: %s", active)
+	case active.Pending > 0:
+		c.fail("the configured destination differs from %s, which still has %d queued rows; the collector will not start", active, active.Pending)
+		c.hint("Choose with `vario destination switch` (see `vario destination`).")
+	default:
+		c.info("the configured destination is new; the collector switches to it and reads every source again in full")
+	}
+	dests, _ := store.Destinations(ctx)
+	for _, d := range dests {
+		if d.Pending > 0 && (!hasActive || d.ID != active.ID) && (!hasConfigured || d.ID != configured.ID) {
+			c.warn("%d rows are queued for %s, which is not configured (see `vario destination`)", d.Pending, d)
+		}
+	}
+}
+
+func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Config) {
 	u, _ := url.Parse(cfg.ClickHouse.URL)
 	switch {
 	case u.Scheme == "https":
@@ -191,17 +252,13 @@ func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Confi
 		c.warn("unencrypted HTTP to remote host %s", u.Host)
 	}
 	if _, ok := os.LookupEnv(config.EnvPassword); ok {
-		c.ok("password supplied via $%s", config.EnvPassword)
+		c.ok("operational password supplied via $%s", config.EnvPassword)
 	} else if fileExists(cfg.PasswordPath()) {
 		checkPrivate(c, cfg.PasswordPath(), "password file")
 	} else {
-		c.warn("no password configured (%s or $%s)", cfg.PasswordPath(), config.EnvPassword)
+		c.warn("no operational password configured (%s or $%s)", cfg.PasswordPath(), config.EnvPassword)
 	}
-	if cfg.ClickHouse.CreateDatabase {
-		c.ok("database %s: Vario may create it if missing (create_database = true)", cfg.ClickHouse.Database)
-	} else {
-		c.ok("database %s: existing database only (create_database = false)", cfg.ClickHouse.Database)
-	}
+	c.ok("operational user %s, database %s (the collector never changes the schema)", cfg.ClickHouse.Username, cfg.ClickHouse.Database)
 	client, err := newClient(cfg)
 	if err != nil {
 		c.fail("client setup: %v", err)
@@ -209,24 +266,6 @@ func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Confi
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if fixSchema {
-		res, err := client.InitSchema(cctx)
-		if err != nil {
-			kind := clickhouse.Classify(err)
-			c.fail("schema creation failed (%s): %v", kind, err)
-			c.hint(clickhouse.Hint(kind))
-			return
-		}
-		var b strings.Builder
-		printSchemaResult(&b, cfg.ClickHouse.Database, res)
-		for _, line := range strings.Split(strings.TrimSpace(b.String()), "\n") {
-			if strings.HasPrefix(line, "!") {
-				c.warn("%s", strings.TrimSpace(strings.TrimPrefix(line, "!")))
-			} else {
-				c.ok("%s", strings.TrimSpace(strings.TrimPrefix(line, "✓")))
-			}
-		}
-	}
 	rep, err := client.CheckConnection(cctx)
 	if err != nil {
 		var ce *clickhouse.CheckError
@@ -265,7 +304,10 @@ func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Confi
 			c.hint(t)
 		}
 	}
-	if !fixSchema && rep.Ready() && !rep.Schema.Complete() {
-		c.info("run `vario doctor --create-schema` to create the schema now")
+	if rep.Schema.DatabaseExists && rep.Schema.Usable() && !rep.Schema.Complete() && !rep.Schema.Newer() {
+		c.info("run `vario migrate` to update the schema")
+	}
+	if rep.Schema.DestinationID != "" {
+		c.ok("destination id %s", rep.Schema.DestinationID)
 	}
 }

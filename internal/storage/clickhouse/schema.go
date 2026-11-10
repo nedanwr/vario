@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/nedanwr/vario/internal/model"
@@ -326,8 +327,25 @@ func expectedColumns(ddl string) []column {
 	return out
 }
 
+// MetaTable records Vario's schema version and the destination id. It is
+// append-only; readers take the first destination id and the highest
+// version, so a concurrent or repeated migration cannot change the identity.
+const MetaTable = "vario_meta"
+
+const metaTag = "vario:meta"
+
+func metaDDL(db string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
+  key String,
+  value String,
+  updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
+) ENGINE = MergeTree
+ORDER BY (key, updated_at)
+COMMENT '%s'`, quoteIdent(db), quoteIdent(MetaTable), metaTag)
+}
+
 // ErrDatabaseMissing is returned when the configured database does not exist
-// (or is not visible to the user) and database creation is not enabled.
+// or is not visible to the user.
 var ErrDatabaseMissing = errors.New("database does not exist")
 
 // SchemaError reports existing objects in the target database that are not
@@ -342,7 +360,26 @@ func (e *SchemaError) Error() string {
 		e.Database, strings.Join(e.Problems, "; "))
 }
 
-// SchemaStatus describes Vario's objects in the target database.
+// MigrationRequiredError reports that Vario's schema is missing or
+// incomplete. The collector never creates it; `vario migrate` does.
+type MigrationRequiredError struct {
+	Database string
+	Missing  []string
+}
+
+func (e *MigrationRequiredError) Error() string {
+	if len(e.Missing) == len(model.Tables) {
+		return fmt.Sprintf("database %s has no Vario schema yet; run `vario migrate` to create it", e.Database)
+	}
+	return fmt.Sprintf("Vario schema in database %s is incomplete (missing: %s); run `vario migrate`", e.Database, strings.Join(e.Missing, ", "))
+}
+
+// ErrSchemaNewer is returned when the schema was migrated by a newer Vario.
+var ErrSchemaNewer = errors.New("the schema was created by a newer Vario version")
+
+// SchemaStatus describes Vario's objects in the target database as visible
+// to the inspecting user. ClickHouse lists only objects the user has some
+// privilege on, so a restricted user may see less than an administrator.
 type SchemaStatus struct {
 	DatabaseExists bool
 	MissingTables  []string
@@ -351,12 +388,40 @@ type SchemaStatus struct {
 	OutdatedViews []string
 	// Problems lists incompatible existing objects (see SchemaError).
 	Problems []string
+	// MetaExists reports whether the vario_meta table is present (schema 2+).
+	MetaExists bool
+	// Recorded is the schema version recorded in vario_meta (0 if none).
+	Recorded int
+	// DestinationID is the destination id recorded in vario_meta.
+	DestinationID string
 }
 
-// Complete reports whether every table and view exists and is up to date.
-func (s SchemaStatus) Complete() bool {
-	return s.DatabaseExists && len(s.MissingTables) == 0 && len(s.MissingViews) == 0 && len(s.OutdatedViews) == 0 && len(s.Problems) == 0
+// Version returns the effective schema version: the recorded one, 1 for a
+// complete schema created before versions were recorded, or 0.
+func (s SchemaStatus) Version() int {
+	switch {
+	case s.Recorded > 0:
+		return s.Recorded
+	case s.DatabaseExists && len(s.MissingTables) == 0 && len(s.Problems) == 0:
+		return 1
+	}
+	return 0
 }
+
+// Usable reports whether the collector can deliver: every table exists and
+// is compatible. Views and metadata are not needed for inserts.
+func (s SchemaStatus) Usable() bool {
+	return s.DatabaseExists && len(s.MissingTables) == 0 && len(s.Problems) == 0
+}
+
+// Complete reports whether the schema is fully migrated to SchemaVersion.
+func (s SchemaStatus) Complete() bool {
+	return s.Usable() && len(s.MissingViews) == 0 && len(s.OutdatedViews) == 0 && s.MetaExists &&
+		s.DestinationID != "" && s.Recorded >= SchemaVersion
+}
+
+// Newer reports whether a newer Vario version migrated the schema.
+func (s SchemaStatus) Newer() bool { return s.Recorded > SchemaVersion }
 
 // DatabaseExists reports whether the configured database exists and is
 // visible to the user. ClickHouse hides databases the user has no grants on.
@@ -371,7 +436,7 @@ func (c *Client) DatabaseExists(ctx context.Context) (bool, error) {
 }
 
 // InspectSchema compares the objects in the target database with the schema
-// Vario expects. It only reads system tables.
+// Vario expects. It only reads (system tables and vario_meta).
 func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 	var st SchemaStatus
 	exists, err := c.DatabaseExists(ctx)
@@ -416,6 +481,19 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 		}
 		colTypes[col.Table][col.Name] = col.Type
 	}
+	checkColumns := func(name, ddl string) []string {
+		var bad []string
+		for _, want := range expectedColumns(ddl) {
+			got, ok := colTypes[name][want.name]
+			switch {
+			case !ok:
+				bad = append(bad, "missing column "+want.name)
+			case got != want.typ:
+				bad = append(bad, fmt.Sprintf("column %s is %s, expected %s", want.name, got, want.typ))
+			}
+		}
+		return bad
+	}
 	ddl := tableDDL(c.database)
 	for _, name := range model.Tables {
 		o, ok := have[name]
@@ -427,17 +505,7 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 			st.Problems = append(st.Problems, fmt.Sprintf("%s has engine %s, expected ReplacingMergeTree", name, o.engine))
 			continue
 		}
-		var bad []string
-		for _, want := range expectedColumns(ddl[name]) {
-			got, ok := colTypes[name][want.name]
-			switch {
-			case !ok:
-				bad = append(bad, "missing column "+want.name)
-			case got != want.typ:
-				bad = append(bad, fmt.Sprintf("column %s is %s, expected %s", want.name, got, want.typ))
-			}
-		}
-		if len(bad) > 0 {
+		if bad := checkColumns(name, ddl[name]); len(bad) > 0 {
 			st.Problems = append(st.Problems, fmt.Sprintf("table %s: %s", name, strings.Join(bad, ", ")))
 		}
 	}
@@ -455,109 +523,46 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 			st.Problems = append(st.Problems, fmt.Sprintf("view %s exists but was not created by Vario", v.name))
 		}
 	}
+	if o, ok := have[MetaTable]; ok {
+		bad := checkColumns(MetaTable, metaDDL(c.database))
+		switch {
+		case o.comment != metaTag:
+			st.Problems = append(st.Problems, fmt.Sprintf("table %s exists but was not created by Vario", MetaTable))
+		case len(bad) > 0:
+			st.Problems = append(st.Problems, fmt.Sprintf("table %s: %s", MetaTable, strings.Join(bad, ", ")))
+		default:
+			st.MetaExists = true
+			if err := c.readMeta(ctx, &st); err != nil {
+				return st, fmt.Errorf("read %s.%s: %w", c.database, MetaTable, err)
+			}
+		}
+	}
 	return st, nil
 }
 
-// SchemaResult reports what InitSchema changed.
-type SchemaResult struct {
-	CreatedDatabase bool
-	CreatedTables   []string
-	CreatedViews    []string
-	UpdatedViews    []string
-	// Warnings are problems that do not prevent delivery.
-	Warnings []string
-}
-
-// InitSchema prepares the target database for delivery. It is idempotent and
-// confined to the configured database:
-//
-//   - The database is created only if it is missing and creation is enabled
-//     (clickhouse.create_database); otherwise a missing database is an error
-//     wrapping ErrDatabaseMissing.
-//   - Existing objects with Vario's names are checked first; incompatible ones
-//     yield a *SchemaError and nothing is created or changed.
-//   - Only missing tables are created, so users without CREATE TABLE can use a
-//     schema provisioned by an administrator.
-//   - Missing views are created; outdated Vario views (recognized by their
-//     tag or, for earlier versions, their definition) are replaced, which
-//     needs DROP VIEW. Without it the existing view is kept with a warning.
-//
-// Databases and tables are never dropped, truncated or altered.
-func (c *Client) InitSchema(ctx context.Context) (SchemaResult, error) {
-	var res SchemaResult
-	exists, err := c.DatabaseExists(ctx)
-	if err != nil {
-		return res, fmt.Errorf("check database %s: %w", c.database, err)
+func (c *Client) readMeta(ctx context.Context, st *SchemaStatus) error {
+	var rows []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
 	}
-	if !exists {
-		if !c.createDatabase {
-			return res, fmt.Errorf("%w: %s (or user %s has no access to it); create it, grant access, or set clickhouse.create_database = true",
-				ErrDatabaseMissing, c.database, c.user)
-		}
-		if err := c.Exec(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdent(c.database)); err != nil {
-			if Classify(err) == KindPermission {
-				return res, fmt.Errorf("create database %s: user %s lacks the CREATE DATABASE privilege; ask an administrator to create it: %w", c.database, c.user, err)
+	q := fmt.Sprintf("SELECT key, value FROM %s.%s WHERE key IN ('destination_id', 'schema_version') ORDER BY updated_at, value",
+		quoteIdent(c.database), quoteIdent(MetaTable))
+	if err := c.Query(ctx, q, &rows); err != nil {
+		return err
+	}
+	for _, r := range rows {
+		switch r.Key {
+		case "destination_id":
+			if st.DestinationID == "" {
+				st.DestinationID = r.Value
 			}
-			return res, fmt.Errorf("create database %s: %w", c.database, err)
-		}
-		res.CreatedDatabase = true
-	}
-	st, err := c.InspectSchema(ctx)
-	if err != nil {
-		return res, fmt.Errorf("inspect database %s: %w", c.database, err)
-	}
-	if len(st.Problems) > 0 {
-		return res, &SchemaError{Database: c.database, Problems: st.Problems}
-	}
-	ddl := tableDDL(c.database)
-	for _, name := range st.MissingTables {
-		if err := c.Exec(ctx, ddl[name]); err != nil {
-			return res, fmt.Errorf("create table %s.%s: %w", c.database, name, err)
-		}
-		res.CreatedTables = append(res.CreatedTables, name)
-	}
-	views := map[string]viewDef{}
-	for _, v := range viewDefs(c.database) {
-		views[v.name] = v
-	}
-	for _, name := range st.MissingViews {
-		if err := c.Exec(ctx, views[name].ddl(c.database, false)); err != nil {
-			return res, fmt.Errorf("create view %s.%s: %w", c.database, name, err)
-		}
-		res.CreatedViews = append(res.CreatedViews, name)
-	}
-	for _, name := range st.OutdatedViews {
-		// CREATE OR REPLACE is atomic but needs DROP TABLE as well (ClickHouse
-		// swaps in a temporary table). Without it, fall back to dropping and
-		// recreating the view, which needs only DROP VIEW. Only views
-		// recognized as Vario's own reach this point.
-		err := c.Exec(ctx, views[name].ddl(c.database, true))
-		if err != nil && Classify(err) == KindPermission {
-			if err = c.Exec(ctx, fmt.Sprintf("DROP VIEW IF EXISTS %s.%s", quoteIdent(c.database), quoteIdent(name))); err == nil {
-				err = c.Exec(ctx, views[name].ddl(c.database, false))
-			} else if Classify(err) == KindPermission {
-				res.Warnings = append(res.Warnings, fmt.Sprintf("view %s is outdated and was kept: updating it needs DROP VIEW on %s.*", name, c.database))
-				continue
+		case "schema_version":
+			if v, err := strconv.Atoi(r.Value); err == nil && v > st.Recorded {
+				st.Recorded = v
 			}
 		}
-		if err != nil {
-			return res, fmt.Errorf("update view %s.%s: %w", c.database, name, err)
-		}
-		res.UpdatedViews = append(res.UpdatedViews, name)
 	}
-	return res, nil
-}
-
-// EnsureSchema runs InitSchema; it implements the collector's Sink.
-func (c *Client) EnsureSchema(ctx context.Context) error {
-	_, err := c.InitSchema(ctx)
-	return err
-}
-
-// MissingTables lists Vario tables absent from the configured database.
-func (c *Client) MissingTables(ctx context.Context) ([]string, error) {
-	st, err := c.InspectSchema(ctx)
-	return st.MissingTables, err
+	return nil
 }
 
 func escapeString(s string) string {

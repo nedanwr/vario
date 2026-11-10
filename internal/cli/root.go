@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -102,7 +103,7 @@ ClickHouse for analysis. Data goes only to the destination you configure.`,
 	}
 	root.PersistentFlags().StringVar(&a.configPath, "config", "", "configuration file (default: $VARIO_CONFIG, else $VARIO_HOME/config.toml, else ~/.vario/config.toml)")
 	root.PersistentFlags().BoolVarP(&a.verbose, "verbose", "v", false, "enable debug logging")
-	root.AddCommand(a.initCmd(), a.sourcesCmd(), a.backfillCmd(), a.runCmd(), a.statusCmd(), a.doctorCmd(), a.serviceCmd(), a.configCmd(), a.versionCmd())
+	root.AddCommand(a.initCmd(), a.sourcesCmd(), a.backfillCmd(), a.runCmd(), a.statusCmd(), a.doctorCmd(), a.migrateCmd(), a.destinationCmd(), a.serviceCmd(), a.configCmd(), a.versionCmd())
 	return root
 }
 
@@ -144,6 +145,21 @@ func (a *app) serviceNotice(cfgPath string, changed bool) bool {
 		fmt.Fprint(a.stdout, "\nThe background service is running with the previous settings. Apply the changes with:\n"+
 			"  vario service restart\n")
 	}
+	return true
+}
+
+// selectConfigured selects the configured destination in a read-only store
+// so that cursors are shown for it. It returns false if the destination has
+// no recorded state yet.
+func selectConfigured(ctx context.Context, store *spool.Store, cfg *config.Config) bool {
+	if store.Legacy() {
+		return true
+	}
+	d, ok, err := store.Lookup(ctx, cfg.ClickHouse.Endpoint(), cfg.ClickHouse.Database)
+	if err != nil || !ok {
+		return false
+	}
+	store.SelectDestination(d.ID)
 	return true
 }
 
@@ -217,7 +233,31 @@ func newCollector(cfg *config.Config, store *spool.Store, sink collector.Sink, s
 		RetryInitial:      cfg.ClickHouse.RetryInitialBackoff.Duration,
 		RetryMax:          cfg.ClickHouse.RetryMaxBackoff.Duration,
 		PolicyFingerprint: policy.Fingerprint(),
+		Endpoint:          cfg.ClickHouse.Endpoint(),
+		Database:          cfg.ClickHouse.Database,
 	}, log)
+}
+
+// prepareDestination selects the configured destination for the collector
+// and turns a refused destination change into a usage error.
+func prepareDestination(ctx context.Context, c *collector.Collector, probe bool) error {
+	if _, err := c.Prepare(ctx, probe); err != nil {
+		var de *collector.DestinationError
+		if errors.As(err, &de) {
+			return withCode(ExitUsage, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// legacyWarnings returns notices about settings of earlier versions.
+func legacyWarnings(cfg *config.Config) []string {
+	var out []string
+	if cfg.ClickHouse.CreateDatabase {
+		out = append(out, "clickhouse.create_database is deprecated and ignored: the collector never creates databases or tables. Create them with `vario migrate` (or `vario init`), then remove the setting with `vario config set clickhouse.create_database false`.")
+	}
+	return out
 }
 
 func (a *app) logger(w io.Writer, level string) *slog.Logger {

@@ -48,9 +48,10 @@ type Config struct {
 	Spool      SpoolConfig      `toml:"spool"`
 	Sources    []SourceConfig   `toml:"sources"`
 
-	path        string
-	fingerprint string
-	defined     map[string]bool
+	path            string
+	fingerprint     string
+	defined         map[string]bool
+	dataDirImplicit bool
 }
 
 type CollectorConfig struct {
@@ -70,11 +71,17 @@ type PrivacyConfig struct {
 	MaxFieldBytes         int      `toml:"max_field_bytes"`
 }
 
+// ClickHouseConfig is the persistent, operational connection: the endpoint,
+// database and the restricted user that `vario run`, `vario backfill` and the
+// background service use. Administrative credentials (for provisioning and
+// migrations) are never stored; they are requested when needed.
 type ClickHouseConfig struct {
 	URL      string `toml:"url"`
 	Database string `toml:"database"`
-	// CreateDatabase allows Vario to run CREATE DATABASE when the database is
-	// missing. When false (the default) Vario only uses an existing database.
+	// CreateDatabase is deprecated and ignored. Earlier versions let the
+	// collector run CREATE DATABASE; databases are now created only by
+	// `vario init` (guided setup) or `vario migrate`, with administrative
+	// credentials and explicit confirmation. Kept so that existing files parse.
 	CreateDatabase        bool     `toml:"create_database"`
 	Username              string   `toml:"username"`
 	PasswordFile          string   `toml:"password_file"`
@@ -185,11 +192,17 @@ func (c *Config) IsSet(key string) bool { return c.defined[key] }
 
 func (c *Config) Path() string { return c.path }
 
+// DataDirImplicit reports whether the file leaves collector.data_dir empty,
+// so that the data directory depends on $VARIO_HOME of the process that
+// reads it. The background service does not inherit $VARIO_HOME.
+func (c *Config) DataDirImplicit() bool { return c.dataDirImplicit }
+
 func (c *Config) SetPath(p string) { c.path = p }
 
 func (c *Config) resolvePaths() error {
 	var err error
 	if c.Collector.DataDir == "" {
+		c.dataDirImplicit = true
 		if c.Collector.DataDir, err = DefaultDataDir(); err != nil {
 			return err
 		}
@@ -323,6 +336,31 @@ func CheckURL(raw string) error {
 		return errors.New("must not contain a query string or fragment")
 	}
 	return nil
+}
+
+// Endpoint returns the normalized form of the ClickHouse URL that identifies
+// a destination together with the database: lower-case scheme and host, an
+// explicit port, and no trailing slash. Credentials are never part of it.
+// Different spellings of the same address (https://CH.example.com and
+// https://ch.example.com:443/) yield the same endpoint; different host names
+// for the same server do not (they are recognized by the destination id
+// stored in the database instead).
+func (c ClickHouseConfig) Endpoint() string { return NormalizeEndpoint(c.URL) }
+
+// NormalizeEndpoint normalizes a ClickHouse URL (see ClickHouseConfig.Endpoint).
+func NormalizeEndpoint(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(raw)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[scheme]
+	}
+	host := strings.ToLower(u.Hostname())
+	path := strings.TrimRight(u.EscapedPath(), "/")
+	return scheme + "://" + net.JoinHostPort(host, port) + path
 }
 
 // InsecureRemote reports whether raw is a plain http:// URL for a non-loopback host.
@@ -552,8 +590,9 @@ var fileTemplate = template.Must(template.New("config").Funcs(template.FuncMap{
 		return "[" + strings.Join(parts, ", ") + "]"
 	},
 }).Parse(`# Vario configuration. See README.md for every option.
-# This file is readable only by its owner. The ClickHouse password is stored
-# separately (clickhouse.password_file) or supplied via VARIO_CLICKHOUSE_PASSWORD.
+# This file is readable only by its owner. The operational ClickHouse password
+# is stored separately (clickhouse.password_file) or supplied via
+# VARIO_CLICKHOUSE_PASSWORD. Administrative passwords are never stored.
 # Change settings with: vario config set <key> <value>  (or: vario config edit)
 
 [collector]
@@ -577,9 +616,8 @@ max_field_bytes = {{.Privacy.MaxFieldBytes}}
 [clickhouse]
 url = {{q .ClickHouse.URL}}
 database = {{q .ClickHouse.Database}}
-# false: use an existing database (Vario never runs CREATE DATABASE).
-# true:  create the database if it is missing (requires CREATE DATABASE).
-create_database = {{.ClickHouse.CreateDatabase}}
+# The restricted (operational) user Vario collects with. Administrative
+# credentials are never stored; vario init and vario migrate ask for them.
 username = {{q .ClickHouse.Username}}
 {{- if .ClickHouse.PasswordFile}}
 password_file = {{q .ClickHouse.PasswordFile}}
@@ -603,3 +641,7 @@ kind = {{q .Kind}}
 enabled = {{.Enabled}}
 path = {{q .Path}}
 {{end}}`))
+
+// WritePrivateFile atomically writes data to path with mode 0600, creating
+// the parent directory with mode 0700 if needed.
+func WritePrivateFile(path string, data []byte) error { return writePrivate(path, data) }

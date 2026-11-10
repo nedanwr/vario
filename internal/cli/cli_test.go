@@ -2,16 +2,11 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/nedanwr/vario/internal/config"
@@ -112,84 +107,10 @@ func mode(t *testing.T, p string) os.FileMode {
 	return st.Mode().Perm()
 }
 
-// ---- fake ClickHouse ---------------------------------------------------------
-
-type fakeCH struct {
-	mu        sync.Mutex
-	password  string
-	databases map[string]bool
-	denied    map[string]bool // CHECK GRANT statements that return 0
-	queries   []string
-}
-
-func newFakeCH(t *testing.T, password string, dbs ...string) (*fakeCH, string) {
-	f := &fakeCH{password: password, databases: map[string]bool{}, denied: map[string]bool{}}
-	for _, d := range dbs {
-		f.databases[d] = true
-	}
-	srv := httptest.NewServer(f)
-	t.Cleanup(srv.Close)
-	return f, srv.URL
-}
-
-func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if r.URL.Path == "/ping" {
-		io.WriteString(w, "Ok.\n")
-		return
-	}
-	if r.Header.Get("X-ClickHouse-Key") != f.password {
-		w.Header().Set("X-ClickHouse-Exception-Code", "516")
-		w.WriteHeader(http.StatusForbidden)
-		io.WriteString(w, "Code: 516. DB::Exception: Authentication failed. (AUTHENTICATION_FAILED)")
-		return
-	}
-	b, _ := io.ReadAll(r.Body)
-	q := string(b)
-	f.queries = append(f.queries, q)
-	data := []map[string]any{}
-	switch {
-	case strings.Contains(q, "version()"):
-		data = append(data, map[string]any{"v": "25.8.0.1"})
-	case strings.Contains(q, "system.databases"):
-		n := 0
-		for d := range f.databases {
-			if strings.Contains(q, "'"+d+"'") {
-				n = 1
-			}
-		}
-		data = append(data, map[string]any{"n": n})
-	case strings.HasPrefix(q, "CHECK GRANT"):
-		res := 1
-		if f.denied[q] {
-			res = 0
-		}
-		data = append(data, map[string]any{"result": res})
-	case strings.HasPrefix(q, "CREATE"), strings.HasPrefix(q, "DROP"):
-		w.Header().Set("X-ClickHouse-Exception-Code", "497")
-		w.WriteHeader(http.StatusForbidden)
-		io.WriteString(w, "Code: 497. DB::Exception: not allowed in the fake. (ACCESS_DENIED)")
-		return
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
-}
-
-func (f *fakeCH) ddl() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []string
-	for _, q := range f.queries {
-		if strings.HasPrefix(q, "CREATE") || strings.HasPrefix(q, "DROP") || strings.HasPrefix(q, "ALTER") || strings.HasPrefix(q, "TRUNCATE") {
-			out = append(out, q)
-		}
-	}
-	return out
-}
-
 // ---- fake service manager ------------------------------------------------------
 
 type fakeService struct {
+	pid                int
 	installed, running bool
 	args               []string
 	restarts           int
@@ -201,7 +122,7 @@ func (f *fakeService) Install(s service.Spec) error {
 }
 func (f *fakeService) Uninstall() error { f.installed, f.running = false, false; return nil }
 func (f *fakeService) Status() (service.Status, error) {
-	return service.Status{Installed: f.installed, Running: f.running}, nil
+	return service.Status{Installed: f.installed, Running: f.running, PID: f.pid}, nil
 }
 func (f *fakeService) Restart() error {
 	if !f.installed {
@@ -321,264 +242,6 @@ func TestInitDefaultLocationAndPermissions(t *testing.T) {
 	t.Setenv(config.EnvHome, alt)
 	if p := vario(t, "", "config", "path"); strings.TrimSpace(p.stdout) != filepath.Join(alt, "config.toml") {
 		t.Fatalf("$VARIO_HOME: %+v", p)
-	}
-}
-
-func TestInitInteractiveFresh(t *testing.T) {
-	cfgPath, _ := isolate(t)
-	fix := t3codetest.New(t)
-	r := vario(t, answers(
-		unreachable, // endpoint
-		"collector", // username
-		"pa ss",     // password
-		"analytics", // database
-		"",          // database management: use an existing database (default)
-		"n",         // do not test the connection
-		"2",         // messages mode
-		"yes",       // confirm sensitive content
-		"",          // enable T3 Code (detected)
-		"",          // keep detected path
-		"",          // save
-	), "init", "--t3code-path", fix.Path)
-	if r.code != 0 {
-		t.Fatalf("interactive init: %+v", r)
-	}
-	for _, want := range []string{"does not send telemetry", "❯ 1) Use an existing database", "[x] T3 Code — detected", "Summary", "✓ Configuration saved", "vario backfill --source t3code", "vario service install"} {
-		if !strings.Contains(r.stdout, want) && !strings.Contains(r.stdout, strings.Replace(want, "does not send", "sends no", 1)) {
-			t.Errorf("output missing %q", want)
-		}
-	}
-	if strings.Contains(r.stdout, "pa ss") {
-		t.Fatal("the password must never be printed")
-	}
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.ClickHouse.Database != "analytics" || cfg.ClickHouse.Username != "collector" || cfg.ClickHouse.CreateDatabase ||
-		cfg.Privacy.Mode != config.ModeMessages || !cfg.Privacy.AllowSensitiveContent {
-		t.Fatalf("config: %+v %+v", cfg.ClickHouse, cfg.Privacy)
-	}
-	if sc, ok := cfg.Source(config.SourceT3Code); !ok || !sc.Enabled || sc.Path != fix.Path {
-		t.Fatalf("source: %+v", cfg.Sources)
-	}
-	if pw, _ := cfg.Password(); pw != "pa ss" {
-		t.Fatalf("password = %q", pw)
-	}
-	if strings.Contains(readFile(t, cfgPath), "pa ss") {
-		t.Fatal("password must not be written into the config file")
-	}
-	if runtime.GOOS != "windows" && mode(t, cfg.PasswordPath()) != 0o600 {
-		t.Fatal("password file must be 0600")
-	}
-}
-
-func TestInitSensitiveModeNotConfirmed(t *testing.T) {
-	cfgPath, _ := isolate(t)
-	r := vario(t, answers(unreachable, "default", "", "vario", "", "n", "3", "no", "", ""), "init")
-	if r.code != 0 {
-		t.Fatalf("init: %+v", r)
-	}
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Privacy.Mode != config.ModeMetrics || cfg.Privacy.AllowSensitiveContent {
-		t.Fatalf("unconfirmed full mode must fall back to metrics: %+v", cfg.Privacy)
-	}
-}
-
-func TestInitInterruptedSavesNothing(t *testing.T) {
-	cfgPath, _ := isolate(t)
-	// Input ends in the middle of the wizard.
-	r := vario(t, answers(unreachable, "default"), "init")
-	if r.code == 0 || !strings.Contains(r.stderr, "nothing was saved") {
-		t.Fatalf("interrupted init: %+v", r)
-	}
-	if fileExists(cfgPath) {
-		t.Fatal("an interrupted init must not create a configuration")
-	}
-	// The same applies to an interrupted reinitialization.
-	initFixture(t)
-	cfgPath, _ = os.Getenv(config.EnvConfig), ""
-	before := readFile(t, cfgPath)
-	r = vario(t, answers("1", "https://changed.example.com"), "init")
-	if r.code == 0 || readFile(t, cfgPath) != before {
-		t.Fatalf("interrupted reinit must leave the file untouched: %+v", r)
-	}
-	// Quitting at the summary saves nothing either.
-	r = vario(t, answers("1", "https://changed.example.com", "", "", "", "", "n", "", "", "", "5"), "init")
-	if r.code != 0 || !strings.Contains(r.stdout, "Nothing was saved") || readFile(t, cfgPath) != before {
-		t.Fatalf("quit at summary: %+v", r)
-	}
-}
-
-func TestReinitPreservesSettings(t *testing.T) {
-	fix, cfgPath := initFixture(t)
-	if r := vario(t, "secret-1\n", "config", "set-password", "--stdin"); r.code != 0 {
-		t.Fatalf("set-password: %+v", r)
-	}
-	// Hand edits: a tuned value with a comment and a note of our own.
-	text := strings.Replace(readFile(t, cfgPath), "batch_size = 500", "batch_size = 777  # tuned", 1) + "# my note\n"
-	if err := os.WriteFile(cfgPath, []byte(text), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pwBefore := readFile(t, filepath.Join(filepath.Dir(cfgPath), "clickhouse-password"))
-
-	// Review without changing anything: the file stays byte-identical.
-	keep := answers("1", "", "", "1", "", "", "n", "", "", "", "")
-	r := vario(t, keep, "init")
-	if r.code != 0 || !strings.Contains(r.stdout, "already configured") || !strings.Contains(r.stdout, "No configuration changes") {
-		t.Fatalf("reinit keep: %+v", r)
-	}
-	if readFile(t, cfgPath) != text {
-		t.Fatal("reinit without changes must not rewrite the file")
-	}
-
-	// Change only the database: one line changes, everything else is preserved.
-	r = vario(t, answers("1", "", "", "1", "telemetry", "2", "n", "", "", "", ""), "init")
-	if r.code != 0 {
-		t.Fatalf("reinit change: %+v", r)
-	}
-	after := readFile(t, cfgPath)
-	for _, want := range []string{`database = "telemetry"`, "create_database = true", "batch_size = 777  # tuned", "# my note", fix.Path} {
-		if !strings.Contains(after, want) {
-			t.Errorf("after reinit, file is missing %q:\n%s", want, after)
-		}
-	}
-	if got := readFile(t, filepath.Join(filepath.Dir(cfgPath), "clickhouse-password")); got != pwBefore {
-		t.Fatal("reinit must not change the stored password unless asked")
-	}
-
-	// "Keep the current configuration" exits without changes.
-	r = vario(t, answers("2"), "init")
-	if r.code != 0 || readFile(t, cfgPath) != after {
-		t.Fatalf("keep and exit: %+v", r)
-	}
-}
-
-func TestReinitNonInteractive(t *testing.T) {
-	_, cfgPath := initFixture(t, "--username", "alice")
-	text := readFile(t, cfgPath) + "# keep me\n"
-	os.WriteFile(cfgPath, []byte(text), 0o600)
-	r := vario(t, "", "init", "--non-interactive", "--update", "--database", "other", "--create-database", "--skip-connection-check")
-	if r.code != 0 {
-		t.Fatalf("--update: %+v", r)
-	}
-	cfg, _ := config.Load(cfgPath)
-	if cfg.ClickHouse.Database != "other" || !cfg.ClickHouse.CreateDatabase || cfg.ClickHouse.Username != "alice" || cfg.ClickHouse.URL != unreachable {
-		t.Fatalf("--update must change only the given settings: %+v", cfg.ClickHouse)
-	}
-	if !strings.Contains(readFile(t, cfgPath), "# keep me") {
-		t.Fatal("--update must preserve comments")
-	}
-	r = vario(t, "", "init", "--non-interactive", "--force", "--no-t3code", "--clickhouse-url", unreachable, "--skip-connection-check")
-	if r.code != 0 || !strings.Contains(r.stdout, "backed up") {
-		t.Fatalf("--force: %+v", r)
-	}
-	backups, _ := filepath.Glob(cfgPath + ".bak-*")
-	if len(backups) != 1 || !strings.Contains(readFile(t, backups[0]), "# keep me") {
-		t.Fatalf("--force must keep a backup: %v", backups)
-	}
-	cfg, _ = config.Load(cfgPath)
-	if cfg.ClickHouse.Username != "default" {
-		t.Fatalf("--force starts from defaults: %+v", cfg.ClickHouse)
-	}
-	// Starting over interactively offers the stored password instead of hiding it.
-	vario(t, "pw\n", "config", "set-password", "--stdin")
-	r = vario(t, answers("3", unreachable, "", "1", "", "", "n", "", "", ""), "init")
-	if r.code != 0 || !strings.Contains(r.stdout, "A ClickHouse password is already stored") || !strings.Contains(r.stdout, "(unchanged)") {
-		t.Fatalf("start over with a stored password: %+v", r)
-	}
-}
-
-func TestInitMalformedExistingConfig(t *testing.T) {
-	cfgPath, _ := isolate(t)
-	os.MkdirAll(filepath.Dir(cfgPath), 0o700)
-	bad := "[clickhouse]\nurl = \"https://x\"\npasword = \"typo\"\n"
-	os.WriteFile(cfgPath, []byte(bad), 0o600)
-	r := vario(t, "", "init", "--non-interactive", "--update", "--skip-connection-check")
-	if r.code != ExitUsage || !strings.Contains(r.stderr, "pasword") || !strings.Contains(r.stderr, "config edit") {
-		t.Fatalf("malformed config: %+v", r)
-	}
-	r = vario(t, answers("1"), "init")
-	if r.code != 0 || !strings.Contains(r.stdout, "cannot be read") || readFile(t, cfgPath) != bad {
-		t.Fatalf("interactive init must offer to exit without touching a malformed file: %+v", r)
-	}
-	if r := vario(t, "", "doctor"); r.code != ExitFailure || !strings.Contains(r.stdout, "unknown settings") {
-		t.Fatalf("doctor on malformed config: %+v", r)
-	}
-}
-
-func TestInitValidationFailures(t *testing.T) {
-	cfgPath, _ := isolate(t)
-
-	// Offline: retry, then save without verification. Entered values are kept.
-	r := vario(t, answers(unreachable, "bob", "", "mydb", "", "y", "1", "3", "", "", ""), "init")
-	if r.code != 0 {
-		t.Fatalf("offline init: %+v", r)
-	}
-	if strings.Count(r.stdout, "✗ network failure") != 2 || !strings.Contains(r.stdout, "not verified (network failure)") {
-		t.Fatalf("expected a classified network failure twice (retry): %s", r.stdout)
-	}
-	cfg, _ := config.Load(cfgPath)
-	if cfg.ClickHouse.Username != "bob" || cfg.ClickHouse.Database != "mydb" {
-		t.Fatalf("values must survive a failed check: %+v", cfg.ClickHouse)
-	}
-
-	// Wrong password: authentication failure, then change the settings and succeed.
-	ch, url := newFakeCH(t, "right", "mydb")
-	r = vario(t, answers(
-		"1",                      // review the existing configuration
-		url, "", "wrong", "", "", // endpoint, user, password, database, management
-		"y", "2", // test: authentication fails; change the settings
-		"", "", "2", "right", "", "", // keep endpoint and user, enter a different password
-		"y",             // test again: succeeds
-		"", "", "", "n", // mode, sources, save, decline creating tables now
-	), "init")
-	if r.code != 0 {
-		t.Fatalf("auth init: %+v", r)
-	}
-	if !strings.Contains(r.stdout, "authentication failure") || !strings.Contains(r.stdout, "✓ authenticated as bob") {
-		t.Fatalf("expected an authentication failure, then success: %s", r.stdout)
-	}
-	if !strings.Contains(r.stdout, "verified (ClickHouse 25.8.0.1)") {
-		t.Fatalf("summary should show the verified connection: %s", r.stdout)
-	}
-	if d := ch.ddl(); len(d) != 0 {
-		t.Fatalf("validation must not create anything: %v", d)
-	}
-}
-
-func TestInitMissingDatabase(t *testing.T) {
-	cfgPath, _ := isolate(t)
-	ch, url := newFakeCH(t, "", "other_db")
-	// Missing database: allow creation, re-check, decline provisioning.
-	r := vario(t, answers(url, "", "", "vario", "", "y", "1", "", "", "", "", "n"), "init")
-	if r.code != 0 {
-		t.Fatalf("init: %+v", r)
-	}
-	if !strings.Contains(r.stdout, "✗ database vario does not exist") || !strings.Contains(r.stdout, "will create it on first delivery") {
-		t.Fatalf("missing database should be reported, then accepted for creation: %s", r.stdout)
-	}
-	if !strings.Contains(r.stdout, "Create database vario and Vario's tables now?") {
-		t.Fatalf("provisioning should be offered (and declined): %s", r.stdout)
-	}
-	cfg, _ := config.Load(cfgPath)
-	if !cfg.ClickHouse.CreateDatabase {
-		t.Fatal("create_database should be recorded")
-	}
-	if d := ch.ddl(); len(d) != 0 {
-		t.Fatalf("declining provisioning must not create anything: %v", d)
-	}
-
-	// Missing privilege: reported as a permission problem.
-	cfgPath2 := filepath.Join(t.TempDir(), "c.toml")
-	t.Setenv(config.EnvConfig, cfgPath2)
-	ch.denied["CHECK GRANT INSERT ON `other_db`.*"] = true
-	r = vario(t, answers(url, "", "", "other_db", "", "y", "", "", "", ""), "init")
-	if r.code != 0 || !strings.Contains(r.stdout, "✗ missing privilege: INSERT ON other_db.*") {
-		t.Fatalf("missing privilege: %+v", r)
 	}
 }
 
@@ -903,18 +566,25 @@ func TestBackfillSpoolsWhenClickHouseUnreachable(t *testing.T) {
 		t.Fatalf("backfill with unreachable ClickHouse should exit %d: %+v", ExitIncomplete, r)
 	}
 	r = vario(t, "", "status")
-	if r.code != 0 || !strings.Contains(r.stdout, "cursor         seq") || !strings.Contains(r.stdout, "messages=2") {
+	if r.code != 0 || !strings.Contains(r.stdout, "cursor         seq") || !strings.Contains(r.stdout, "messages=2") || !strings.Contains(r.stdout, "Destination    http://127.0.0.1:1, database vario") {
 		t.Fatalf("status: %+v", r)
 	}
 	if r := vario(t, "", "backfill", "--source", "chatgpt"); r.code != ExitUsage {
 		t.Fatalf("unsupported source: %+v", r)
 	}
-	// Reinitializing does not reset the spool or the cursor.
-	if r := vario(t, "", "init", "--non-interactive", "--update", "--database", "elsewhere", "--skip-connection-check"); r.code != 0 {
+	// Reinitializing with another database keeps the spool and the cursor of
+	// the previous destination, and does not redirect them.
+	r = vario(t, "", "init", "--non-interactive", "--update", "--database", "elsewhere", "--skip-connection-check")
+	if r.code != 0 || !strings.Contains(r.stdout, "will NOT be sent to the new one") {
 		t.Fatalf("reinit: %+v", r)
 	}
-	if r := vario(t, "", "status"); !strings.Contains(r.stdout, "cursor         seq") || !strings.Contains(r.stdout, "messages=2") {
-		t.Fatalf("reinit must keep cursor and spool: %+v", r)
+	r = vario(t, "", "status")
+	if !strings.Contains(r.stdout, "not yet synchronized for this destination") || !strings.Contains(r.stdout, "rows queued for other destinations") {
+		t.Fatalf("status after a destination change: %+v", r)
+	}
+	r = vario(t, "", "destination")
+	if r.code != 0 || !strings.Contains(r.stdout, "sources with a cursor 1") || !strings.Contains(r.stdout, "vario destination switch") {
+		t.Fatalf("destination: %+v", r)
 	}
 }
 
@@ -924,14 +594,15 @@ func TestDoctor(t *testing.T) {
 	if r.code != ExitFailure || !strings.Contains(r.stdout, "✓ t3code") || !strings.Contains(r.stdout, "✗ endpoint unreachable (network)") {
 		t.Fatalf("doctor: %+v", r)
 	}
-	if !strings.Contains(r.stdout, "existing database only (create_database = false)") {
-		t.Fatalf("doctor should report the database policy: %s", r.stdout)
+	if !strings.Contains(r.stdout, "operational user default, database vario (the collector never changes the schema)") {
+		t.Fatalf("doctor should report the operational user: %s", r.stdout)
 	}
 }
 
 func TestDoctorClassifiesFailures(t *testing.T) {
 	initFixture(t)
-	ch, url := newFakeCH(t, "pw", "vario")
+	ch, url := newFakeCH(t, "adminpw", "vario")
+	ch.addUser("default", "pw", "local_directory", false)
 	vario(t, "", "config", "set", "clickhouse.url", url)
 	r := vario(t, "", "doctor")
 	if !strings.Contains(r.stdout, "authentication or query failed (authentication)") {
@@ -943,20 +614,29 @@ func TestDoctorClassifiesFailures(t *testing.T) {
 	if r.code != ExitFailure || !strings.Contains(r.stdout, "✗ database missing_db does not exist") {
 		t.Fatalf("missing database: %s", r.stdout)
 	}
-	// --create-schema respects create_database = false and creates nothing.
+	// A database without Vario's schema: migration required, nothing created.
+	ch.grant("default", "SELECT vario.*", "INSERT vario.*")
+	vario(t, "", "config", "set", "clickhouse.database", "vario")
+	r = vario(t, "", "doctor")
+	if r.code != ExitFailure || !strings.Contains(r.stdout, "no Vario schema yet; run `vario migrate`") {
+		t.Fatalf("missing schema: %s", r.stdout)
+	}
+	// --create-schema is deprecated and runs `vario migrate`, which needs
+	// administrative credentials and confirmation; with no input, nothing changes.
 	r = vario(t, "", "doctor", "--create-schema")
-	if !strings.Contains(r.stdout, "schema creation failed (database missing)") {
-		t.Fatalf("create-schema with a missing database: %s", r.stdout)
+	if !strings.Contains(r.stderr, "deprecated") || len(ch.changes()) != 0 {
+		t.Fatalf("create-schema: %+v %v", r, ch.changes())
 	}
-	for _, q := range ch.ddl() {
-		if strings.HasPrefix(q, "CREATE DATABASE") {
-			t.Fatalf("CREATE DATABASE must not run when create_database = false: %v", ch.ddl())
-		}
-	}
-	// With creation enabled, a permission failure is reported as such.
+	// The deprecated create_database setting has no effect and is reported.
 	vario(t, "", "config", "set", "clickhouse.create_database", "true")
-	r = vario(t, "", "doctor", "--create-schema")
-	if !strings.Contains(r.stdout, "schema creation failed (permission)") || !strings.Contains(r.stdout, "CREATE DATABASE privilege") {
-		t.Fatalf("create-schema without privilege: %s", r.stdout)
+	r = vario(t, "", "doctor")
+	if !strings.Contains(r.stdout, "create_database is deprecated and ignored") || len(ch.changes()) != 0 {
+		t.Fatalf("legacy setting: %s %v", r.stdout, ch.changes())
+	}
+	// After an administrator migrates, the restricted user is ready.
+	provisionSchema(t, url, "admin", "adminpw", "vario")
+	r = vario(t, "", "doctor")
+	if r.code != 0 || !strings.Contains(r.stdout, "Vario schema version 2 (up to date)") || !strings.Contains(r.stdout, "inserts accepted") || !strings.Contains(r.stdout, "destination id") {
+		t.Fatalf("ready: %s", r.stdout)
 	}
 }

@@ -27,17 +27,20 @@ import (
 	"github.com/nedanwr/vario/internal/config"
 )
 
+// Client is a connection to one database as one ClickHouse user. The
+// operational client (New) is what the collector uses: it only inspects the
+// schema and inserts rows. Operations that change databases, users,
+// privileges or the schema are methods of Admin.
 type Client struct {
 	base     *url.URL
 	database string
-	// createDatabase permits CREATE DATABASE when the database is missing.
-	createDatabase bool
-	user           string
-	password       string
-	http           *http.Client
+	user     string
+	password string
+	http     *http.Client
 }
 
-// New creates a client. The password is sent only in request headers.
+// New creates a client for the configured (operational) user. The password
+// is sent only in request headers.
 func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
 	u, err := url.Parse(cfg.URL)
 	if err != nil {
@@ -66,11 +69,10 @@ func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
 		ForceAttemptHTTP2:     true,
 	}
 	return &Client{
-		base:           u,
-		database:       cfg.Database,
-		createDatabase: cfg.CreateDatabase,
-		user:           cfg.Username,
-		password:       password,
+		base:     u,
+		database: cfg.Database,
+		user:     cfg.Username,
+		password: password,
 		http: &http.Client{
 			Transport: transport,
 			Timeout:   cfg.Timeout.Duration,
@@ -83,6 +85,14 @@ func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
 }
 
 func (c *Client) Database() string { return c.database }
+
+// WithDatabase returns a client for another database on the same connection
+// and user (used while choosing a database during setup).
+func (c *Client) WithDatabase(db string) *Client {
+	n := *c
+	n.database = db
+	return &n
+}
 
 // User returns the ClickHouse user the client authenticates as.
 func (c *Client) User() string { return c.user }
@@ -256,6 +266,14 @@ func (c *Client) ServerVersion(ctx context.Context) (string, error) {
 // a retried insert of the same batch idempotent at the block level; row-level
 // correctness additionally relies on ReplacingMergeTree versions.
 func (c *Client) Insert(ctx context.Context, table string, gzBody []byte, token string) error {
+	_, err := c.do(ctx, http.MethodPost, c.insertParams(table, token), bytes.NewReader(gzBody), true)
+	return err
+}
+
+// insertParams are the query and settings of every delivery. The access
+// probe uses the same ones, so that a settings profile or constraint that
+// forbids one of these settings fails the probe as it would fail delivery.
+func (c *Client) insertParams(table, token string) url.Values {
 	params := url.Values{}
 	params.Set("query", fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", quoteIdent(c.database), quoteIdent(table)))
 	params.Set("input_format_skip_unknown_fields", "1")
@@ -265,8 +283,23 @@ func (c *Client) Insert(ctx context.Context, table string, gzBody []byte, token 
 	if token != "" {
 		params.Set("insert_deduplication_token", token)
 	}
-	_, err := c.do(ctx, http.MethodPost, params, bytes.NewReader(gzBody), true)
+	return params
+}
+
+// probeInsert sends an INSERT without rows, with the same settings as a
+// delivery. ClickHouse authenticates the user, applies the session's
+// settings profile and constraints, checks the INSERT privilege and the
+// readonly setting, and rejects an exhausted quota before it reads any
+// data, so this verifies that the user may insert into the table without
+// writing anything. Limits that depend on the data itself (quotas on
+// written bytes, disk space, memory) are not exercised.
+func (c *Client) probeInsert(ctx context.Context, table string) error {
+	_, err := c.do(ctx, http.MethodPost, c.insertParams(table, "vario-access-probe"), strings.NewReader(""), false)
 	return err
 }
 
-func quoteIdent(s string) string { return "`" + strings.ReplaceAll(s, "`", "``") + "`" }
+// quoteIdent quotes an identifier for use in SQL. Every identifier Vario puts
+// into a statement (databases, tables, users) goes through it.
+func quoteIdent(s string) string {
+	return "`" + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), "`", "``") + "`"
+}

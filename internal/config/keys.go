@@ -18,6 +18,8 @@ type Key struct {
 	Help string
 	// ReadOnly keys can be shown but must be changed with `vario config edit`.
 	ReadOnly bool
+	// Deprecated keys are still accepted but have no effect.
+	Deprecated bool
 
 	get func(*Config) any
 	set func(*Config, string) error
@@ -67,6 +69,8 @@ func (k Key) Default() string { return k.Value(Default()) }
 
 // Change returns the update that stores c's value of k.
 func (k Key) Change(c *Config) Change { return Change{Key: k.Name, Literal: k.Literal(c)} }
+
+func deprecated(k Key) Key { k.Deprecated = true; return k }
 
 func strKey(name, help string, f func(*Config) *string) Key {
 	return Key{Name: name, Help: help,
@@ -186,8 +190,8 @@ var keys = append([]Key{
 
 	strKey("clickhouse.url", "ClickHouse HTTP(S) endpoint", func(c *Config) *string { return &c.ClickHouse.URL }),
 	strKey("clickhouse.database", "target database", func(c *Config) *string { return &c.ClickHouse.Database }),
-	boolKey("clickhouse.create_database", "allow Vario to create the database if missing", func(c *Config) *bool { return &c.ClickHouse.CreateDatabase }),
-	strKey("clickhouse.username", "ClickHouse user", func(c *Config) *string { return &c.ClickHouse.Username }),
+	deprecated(boolKey("clickhouse.create_database", "deprecated and ignored: databases are created by `vario init` or `vario migrate`", func(c *Config) *bool { return &c.ClickHouse.CreateDatabase })),
+	strKey("clickhouse.username", "operational (restricted) ClickHouse user", func(c *Config) *string { return &c.ClickHouse.Username }),
 	pathKey("clickhouse.password_file", "password file (empty: clickhouse-password next to the config)", func(c *Config) *string { return &c.ClickHouse.PasswordFile }),
 	durKey("clickhouse.timeout", "request timeout", func(c *Config) *Duration { return &c.ClickHouse.Timeout }),
 	durKey("clickhouse.flush_interval", "minimum interval between delivery rounds", func(c *Config) *Duration { return &c.ClickHouse.FlushInterval }),
