@@ -3,7 +3,8 @@
 #
 # Default location: ~/.vario/config.toml (on every platform).
 # Precedence: --config, then $VARIO_CONFIG, then $VARIO_HOME/config.toml, then
-# ~/.vario/config.toml. Keep this file mode 0600. It never contains passwords.
+# ~/.vario/config.toml. Keep this file mode 0600. It never contains passwords,
+# and administrative credentials are never stored anywhere.
 
 [collector]
 # How often sources are checked for new events.
@@ -14,6 +15,8 @@ reconcile_interval = "6h"
 # Source records read per batch.
 batch_size = 500
 # Spool, cursors and lease. Default: ~/.vario/data ($VARIO_HOME/data).
+# `vario init` writes the resolved absolute path, so the background service
+# (which does not inherit $VARIO_HOME) uses the same directory as the CLI.
 # data_dir = "~/.vario/data"
 log_level = "info"
 
@@ -40,17 +43,22 @@ max_field_bytes = 65536
 # localhost unless allow_insecure_http = true.
 url = "https://clickhouse.example.com:8443"
 # The database Vario writes to. A dedicated database is recommended; the
-# server may host any number of unrelated databases.
+# server may host any number of unrelated databases. Changing url or database
+# changes the destination: data queued for the previous one is never sent to
+# the new one (see `vario destination`).
 database = "vario"
-# false (default): use an existing database; Vario never runs CREATE DATABASE.
-# true: create the database if it is missing (needs CREATE DATABASE).
-# Either way, Vario creates its own tables and views inside the database.
-create_database = false
+# The operational (restricted) user that `vario run`, `vario backfill` and the
+# background service use. It needs SELECT and INSERT on Vario's tables and
+# SELECT on its views and vario_meta, nothing else. Administrative credentials
+# (to create databases, users, grants and the schema) are never stored here;
+# `vario init` and `vario migrate` ask for them when needed.
 username = "vario"
-# Password file (mode 0600). Default: clickhouse-password next to this file.
-# Set it with `vario config set-password`. $VARIO_CLICKHOUSE_PASSWORD takes
-# precedence when set.
+# Operational password file (mode 0600). Default: clickhouse-password next to
+# this file. Set it with `vario config set-password`.
+# $VARIO_CLICKHOUSE_PASSWORD takes precedence when set.
 # password_file = "~/.vario/clickhouse-password"
+# create_database is deprecated and ignored: the collector never creates
+# databases or tables. Use `vario migrate`.
 timeout = "30s"
 # Minimum interval between delivery rounds; small updates are batched.
 flush_interval = "10s"
