@@ -51,8 +51,12 @@ type Collector struct {
 	opts    Options
 	log     *slog.Logger
 
-	wake        chan struct{}
+	wake chan struct{}
+	// schemaReady is set once the destination passed its check; checkedAt is
+	// when it last did (see identityCheckInterval).
 	schemaReady bool
+	checkedAt   time.Time
+	checkFailed bool
 	// dest is the destination selected by Prepare.
 	dest   spool.Destination
 	warned map[string]bool

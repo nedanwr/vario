@@ -48,6 +48,12 @@ func (e *DestinationError) Error() string {
 	return b.String()
 }
 
+// identityCheckInterval bounds how long a running collector trusts its last
+// destination check. Rows delivered within one interval after a database was
+// recreated are not lost: the collector then stops, and the recreated
+// database is a new destination that receives a full backfill.
+var identityCheckInterval = time.Minute
+
 // probeTimeout bounds the destination identity lookup at startup, so that an
 // unreachable ClickHouse delays an offline start only briefly.
 var probeTimeout = 5 * time.Second
@@ -74,7 +80,7 @@ func (c *Collector) Prepare(ctx context.Context, probe bool) (spool.Resolution, 
 		if err == nil {
 			serverID = info.ServerID
 			c.noteWarnings(info.Warnings)
-			c.schemaReady = true
+			c.schemaReady, c.checkedAt = true, time.Now()
 		} else if ctx.Err() == nil {
 			c.log.Warn("destination check failed; data is collected into the spool and delivered once it succeeds", "error", err.Error())
 		}
@@ -122,8 +128,11 @@ func (c *Collector) noteWarnings(ws []string) {
 }
 
 // checkDestination runs the read-only destination check before delivery and
-// binds the destination id. It returns errFatal-wrapped errors for an
-// identity mismatch, which stops the collector.
+// binds the destination id. An identity mismatch (the database was recreated
+// or replaced) is returned as a *fatalError, which stops the collector before
+// anything else is delivered or collected; the next start refuses the
+// destination until `vario destination switch` records it as a new one, which
+// has no cursors and is therefore backfilled in full.
 func (c *Collector) checkDestination(ctx context.Context) error {
 	info, err := c.sink.CheckDestination(ctx)
 	if err != nil {

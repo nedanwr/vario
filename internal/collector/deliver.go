@@ -74,12 +74,24 @@ func (c *Collector) deliverRound(ctx context.Context, now time.Time) (int, error
 	if c.dest.ID == 0 {
 		return 0, errors.New("collector: destination not prepared")
 	}
-	if !c.schemaReady {
-		// Read-only: the collector never creates or migrates the schema.
+	// The destination is checked before the first delivery and again at least
+	// every identityCheckInterval, whether or not anything is queued: a
+	// database that is dropped and recreated while the collector runs accepts
+	// inserts without any error, so only its destination id reveals that it no
+	// longer holds what was delivered before. Read-only: the collector never
+	// creates or migrates the schema.
+	if !c.schemaReady || time.Since(c.checkedAt) >= identityCheckInterval {
+		c.schemaReady = false
 		if err := c.checkDestination(ctx); err != nil {
+			c.checkFailed = true
 			return 0, err
 		}
-		c.schemaReady = true
+		c.schemaReady, c.checkedAt = true, time.Now()
+		if c.checkFailed {
+			// Nothing may be queued to report a success, so clear the failure here.
+			c.checkFailed = false
+			_ = c.store.SetKV(ctx, "delivery.last_error", "")
+		}
 	}
 	entries, err := c.store.Due(ctx, now, c.opts.MaxInsertRows)
 	if err != nil || len(entries) == 0 {

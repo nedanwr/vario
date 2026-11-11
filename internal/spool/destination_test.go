@@ -176,10 +176,92 @@ func TestPendingIsBoundToDestination(t *testing.T) {
 	if n, err := s.DiscardPending(ctx, b); err != nil || n != 3 {
 		t.Fatalf("discard: %d %v", n, err)
 	}
-	// The previous destination keeps its cursor for switching back.
+}
+
+// C-1: rows moved to, or discarded for, another destination were never
+// delivered to the previous one, although its cursor and fingerprints say
+// so. Switching back must therefore not resume from that state, or the rows
+// are missing there for good.
+func TestTakingPendingInvalidatesSyncState(t *testing.T) {
+	for _, mode := range []string{"move", "discard"} {
+		t.Run(mode, func(t *testing.T) {
+			s, _ := open(t, 0)
+			a := s.Selected()
+			// m1 was delivered to A; m2 and a raw event are queued but undelivered.
+			if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1)}, ptr("c1"), CommitOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			due, _ := s.Due(ctx, time.Now(), 100)
+			if err := s.Ack(ctx, []int64{due[0].ID}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Commit(ctx, "src", []model.Record{msg("m2", "b", 1), raw(7)}, ptr("c2"), CommitOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			b := use(t, s, testEndpoint, "other").Configured.ID
+			if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1)}, ptr("cb"), CommitOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			var n int64
+			var err error
+			if mode == "move" {
+				n, err = s.MovePending(ctx, a, b)
+			} else {
+				n, err = s.DiscardPending(ctx, a)
+			}
+			if err != nil || n != 2 {
+				t.Fatalf("%s: %d %v", mode, n, err)
+			}
+			// The policy is honoured: moved rows are due for B, discarded rows are gone.
+			want := map[string]int{"move": 3, "discard": 1}[mode]
+			if due, _ := s.Due(ctx, time.Now(), 100); len(due) != want {
+				t.Fatalf("%s: %d entries due for the new destination, want %d", mode, len(due), want)
+			}
+			// B's own state is untouched.
+			if cur, ok, _ := s.Cursor(ctx, "src"); !ok || cur != "cb" {
+				t.Fatalf("the new destination keeps its cursor: %q %v", cur, ok)
+			}
+			// Back on A: no cursor (full re-read), and every record is queued again,
+			// including the one that was delivered before.
+			if back := use(t, s, testEndpoint, "vario"); back.Configured.ID != a || back.Configured.Cursors != 0 {
+				t.Fatalf("switching back: %+v", back.Configured)
+			}
+			if _, ok, _ := s.Cursor(ctx, "src"); ok {
+				t.Fatal("a destination that lost queued rows must not keep its cursor")
+			}
+			r, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1), msg("m2", "b", 1)}, ptr("c3"), CommitOptions{})
+			if err != nil || r.Enqueued != 2 || r.Skipped != 0 {
+				t.Fatalf("stale fingerprints suppressed the re-read: %+v %v", r, err)
+			}
+		})
+	}
+}
+
+// Without undelivered rows the destination's state is accurate and is kept,
+// so that switching back resumes where it left off.
+func TestTakingNothingKeepsSyncState(t *testing.T) {
+	s, _ := open(t, 0)
+	a := s.Selected()
+	if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1)}, ptr("ca"), CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	due, _ := s.Due(ctx, time.Now(), 100)
+	if err := s.Ack(ctx, []int64{due[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	b := use(t, s, testEndpoint, "other").Configured.ID
+	if n, err := s.MovePending(ctx, a, b); err != nil || n != 0 {
+		t.Fatalf("move: %d %v", n, err)
+	}
+	if n, err := s.DiscardPending(ctx, a); err != nil || n != 0 {
+		t.Fatalf("discard: %d %v", n, err)
+	}
 	use(t, s, testEndpoint, "vario")
 	if cur, ok, _ := s.Cursor(ctx, "src"); !ok || cur != "ca" {
 		t.Fatalf("switching back restores the cursor: %q %v", cur, ok)
+	}
+	if r, _ := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1)}, nil, CommitOptions{}); r.Enqueued != 0 {
+		t.Fatalf("delivered records must not be re-sent: %+v", r)
 	}
 }
 

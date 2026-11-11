@@ -157,6 +157,11 @@ Choose what happens to the rows queued for the previous destination:
 The configured destination keeps its own cursors: if it has none, every source
 is read again in full for it.
 
+Moving or deleting queued rows means the previous destination never receives
+them, so its cursors and fingerprints are reset as well: if you configure it
+again later, every source is read again in full for it and nothing is missing.
+With --keep-pending its state is kept and it resumes where it left off.
+
 Switch needs the collector to be stopped, so that nothing is collected or
 delivered while queued rows are reassigned. If a collector is running, switch
 changes nothing and exits immediately, naming the process. For the
@@ -295,12 +300,14 @@ func (a *app) destinationSwitch(ctx context.Context, action pendingAction, yes b
 			return err
 		}
 		fmt.Fprintf(w, "✓ %d queued rows will be delivered to %s\n", n, target)
+		resyncNotice(w, n, *prev)
 	case pendingDiscard:
 		n, err := store.DiscardPending(ctx, prev.ID)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(w, "✓ deleted %d queued rows for %s\n", n, prev)
+		resyncNotice(w, n, *prev)
 	default:
 		if prev.Pending > 0 {
 			fmt.Fprintf(w, "✓ %d queued rows stay with %s\n", prev.Pending, prev)
@@ -315,6 +322,14 @@ func (a *app) destinationSwitch(ctx context.Context, action pendingAction, yes b
 	}
 	a.serviceNotice(cfg.Path(), true)
 	return nil
+}
+
+// resyncNotice says that a destination whose queued rows were moved or
+// deleted lost its synchronization state (see spool.MovePending).
+func resyncNotice(w io.Writer, rows int64, prev spool.Destination) {
+	if rows > 0 && prev.Retired.IsZero() {
+		fmt.Fprintf(w, "  %s did not receive them: its cursors were reset, so every source is read again in full if you configure it again.\n", prev)
+	}
 }
 
 // destinationNotice explains, after a configuration change, what happens to

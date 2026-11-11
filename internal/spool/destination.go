@@ -381,28 +381,69 @@ func (s *Store) Replace(ctx context.Context, id int64, serverID string) (Destina
 }
 
 // MovePending re-binds every entry queued for destination from to
-// destination to, so it is delivered there. Cursors and fingerprints are not
-// moved: to keeps its own synchronization state.
+// destination to, so it is delivered there, and returns the number of rows
+// moved. Cursors and fingerprints are not moved: to keeps its own
+// synchronization state.
+//
+// The cursors and fingerprints of from describe those rows as sent to from,
+// which they now never will be. They are therefore deleted in the same
+// transaction (see invalidateSync), so that from receives a full backfill if
+// it is ever used again instead of resuming past the rows it did not get.
 func (s *Store) MovePending(ctx context.Context, from, to int64) (int64, error) {
-	var n sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT SUM(row_count) FROM queue WHERE destination_id = ?`, from).Scan(&n); err != nil {
-		return 0, err
+	if from == to {
+		return 0, nil
 	}
 	// Reset the retry schedule: earlier failures concerned the old destination.
-	_, err := s.db.ExecContext(ctx, `UPDATE queue SET destination_id = ?, attempts = 0, next_attempt_at = 0, last_error = '' WHERE destination_id = ?`, to, from)
-	return n.Int64, err
+	return s.takePending(ctx, from, `UPDATE queue SET destination_id = ?, attempts = 0, next_attempt_at = 0, last_error = '' WHERE destination_id = ?`, to, from)
 }
 
 // DiscardPending deletes every entry queued for a destination and returns
-// the number of rows removed. Cursors and fingerprints are kept, so the
-// destination remains marked as synchronized up to its cursor.
+// the number of rows removed. The destination's cursors and fingerprints are
+// deleted with them (see MovePending): the discarded rows were never
+// delivered, so the destination is no longer synchronized up to its cursor
+// and receives a full backfill if it is used again.
 func (s *Store) DiscardPending(ctx context.Context, id int64) (int64, error) {
-	var n sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT SUM(row_count) FROM queue WHERE destination_id = ?`, id).Scan(&n); err != nil {
+	return s.takePending(ctx, id, `DELETE FROM queue WHERE destination_id = ?`, id)
+}
+
+// takePending removes the queue entries of destination id with stmt and, if
+// there were any, invalidates the destination's synchronization state, in
+// one transaction. It returns the number of rows the entries held.
+func (s *Store) takePending(ctx context.Context, id int64, stmt string, args ...any) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return 0, err
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM queue WHERE destination_id = ?`, id)
-	return n.Int64, err
+	defer tx.Rollback()
+	var entries int
+	var n sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), SUM(row_count) FROM queue WHERE destination_id = ?`, id).Scan(&entries, &n); err != nil {
+		return 0, err
+	}
+	if entries == 0 {
+		// Nothing undelivered: the destination's state stays accurate.
+		return 0, nil
+	}
+	if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		return 0, err
+	}
+	if err := invalidateSync(ctx, tx, id); err != nil {
+		return 0, err
+	}
+	return n.Int64, tx.Commit()
+}
+
+// invalidateSync deletes the cursors and fingerprints of a destination. A
+// source without a cursor is read again in full, and without fingerprints
+// every record is queued again; records the destination already has carry the
+// same keys and versions, so ReplacingMergeTree keeps one row per record.
+func invalidateSync(ctx context.Context, q querier, id int64) error {
+	for _, stmt := range []string{`DELETE FROM cursors WHERE destination_id = ?`, `DELETE FROM fingerprints WHERE destination_id = ?`} {
+		if _, err := q.ExecContext(ctx, stmt, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // LabelLegacy assigns state of an earlier Vario version (which recorded no

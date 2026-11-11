@@ -91,3 +91,24 @@ func TestDestinationSwitchFailsFastWhileCollectorRuns(t *testing.T) {
 		t.Fatalf("a stale lease must not block: %+v", r)
 	}
 }
+
+// C-1: moving or deleting queued rows resets the previous destination's
+// cursors, and the command says so; keeping them keeps its state.
+func TestDestinationSwitchResetsPreviousStateWhenRowsLeaveIt(t *testing.T) {
+	for flag, reset := range map[string]bool{"--move-pending": true, "--discard-pending": true, "--keep-pending": false} {
+		t.Run(flag, func(t *testing.T) {
+			switchFixture(t)
+			useFakeService(t, &fakeService{})
+			if out := vario(t, "", "destination").stdout; !strings.Contains(out, "sources with a cursor 1") {
+				t.Fatalf("the previous destination should have a cursor: %s", out)
+			}
+			r := vario(t, "", "destination", "switch", flag, "--yes")
+			if r.code != 0 || strings.Contains(r.stdout, "its cursors were reset") != reset {
+				t.Fatalf("switch %s: %+v", flag, r)
+			}
+			if out := vario(t, "", "destination").stdout; strings.Contains(out, "sources with a cursor 1") == reset {
+				t.Fatalf("after %s: %s", flag, out)
+			}
+		})
+	}
+}

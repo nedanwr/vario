@@ -328,3 +328,117 @@ func TestInterruptedSwitchLosesNothing(t *testing.T) {
 		t.Fatalf("moved rows after an interrupted switch: %+v %v (queued %d)", dr, err, queued)
 	}
 }
+
+// C-2: a database that is dropped and recreated (and migrated again) while
+// the collector runs accepts inserts without any error. Only its destination
+// id reveals the change, so it is checked periodically during operation, not
+// just at startup: the collector stops instead of delivering new changes on
+// top of an archive that lost its history.
+func TestRecreatedDatabaseIsDetectedWhileRunning(t *testing.T) {
+	old := identityCheckInterval
+	identityCheckInterval = 30 * time.Millisecond
+	t.Cleanup(func() { identityCheckInterval = old })
+
+	h := setup(t)
+	h.sink.serverID = "id-A"
+	c := h.collector(t, h.opts)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	// The initial backfill is delivered and the collector goes idle.
+	waitFor(t, func() bool { return h.sink.count(model.TableMessages) == 2 && pending(t, h) == 0 })
+	select {
+	case err := <-done:
+		t.Fatalf("the collector stopped although the destination is unchanged: %v", err)
+	case <-time.After(4 * identityCheckInterval):
+	}
+
+	// The database is recreated while nothing is queued; no insert ever fails.
+	h.sink.mu.Lock()
+	h.sink.serverID = "id-B"
+	delivered := len(h.sink.rows[model.TableMessages])
+	h.sink.mu.Unlock()
+	var de *DestinationError
+	select {
+	case err := <-done:
+		if !errors.As(err, &de) || !de.Replaced {
+			t.Fatalf("Run should stop with a replaced-destination error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an idle collector did not notice the recreated database")
+	}
+	if v, _, _, _ := h.store.KV(ctx, "delivery.last_error"); !strings.Contains(v, "id-A") || !strings.Contains(v, "id-B") {
+		t.Fatalf("status should name both destination ids: %q", v)
+	}
+
+	// Later changes stay spooled; the recorded identity is not overwritten, so
+	// a restart is refused until `vario destination switch`.
+	h.fix.Message("msg-after", "thread-1", "run-1", "assistant", "after", false)
+	restarted := New(h.store, h.sink, []sources.Source{h.src}, h.opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := restarted.Prepare(ctx, true); !errors.As(err, &de) || !de.Replaced {
+		t.Fatalf("a restart must be refused: %v", err)
+	}
+	if _, err := restarted.Drain(ctx); err == nil {
+		t.Fatal("a refused collector must not deliver")
+	}
+	if n := h.sink.count(model.TableMessages); n != delivered {
+		t.Fatalf("rows were delivered to the recreated database: %d, had %d", n, delivered)
+	}
+
+	// The explicit switch records a new destination without cursors or
+	// fingerprints: the recreated database receives the complete history.
+	res, err := h.store.Resolve(ctx, h.opts.Endpoint, h.opts.Database, "id-B")
+	if err != nil || !res.Replaced {
+		t.Fatalf("resolve: %+v %v", res, err)
+	}
+	repl, err := h.store.Replace(ctx, res.Configured.ID, "id-B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.Activate(ctx, repl.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.sink.mu.Lock()
+	h.sink.rows, h.sink.tokens = map[string][]map[string]any{}, map[string]bool{} // the recreated database is empty
+	h.sink.mu.Unlock()
+	fresh := h.collector(t, h.opts)
+	if _, ok, _ := h.store.Cursor(ctx, h.src.ID()); ok {
+		t.Fatal("the recreated database must not inherit a cursor")
+	}
+	if err := fresh.syncOnce(ctx, h.src, fresh.log); err != nil {
+		t.Fatal(err)
+	}
+	if dr, err := fresh.Drain(ctx); err != nil || dr.Remaining != 0 {
+		t.Fatalf("drain: %+v %v", dr, err)
+	}
+	if got := len(h.sink.latest(model.TableMessages, "message_id")); got != 3 {
+		t.Fatalf("the recreated database must hold every message, got %d of 3", got)
+	}
+}
+
+// The identity check is periodic, not per insert.
+func TestIdentityCheckIsBounded(t *testing.T) {
+	h := setup(t) // Prepare checked once
+	if _, err := h.c.Snapshot(ctx, h.src, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if dr, err := h.c.Drain(ctx); err != nil || dr.Delivered == 0 {
+		t.Fatalf("drain: %+v %v", dr, err)
+	}
+	h.sink.mu.Lock()
+	calls := h.sink.schemaCalls
+	h.sink.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected the startup check only within one interval, got %d checks", calls)
+	}
+	// Once the interval has passed, the next round checks again, even when idle.
+	h.c.checkedAt = time.Now().Add(-2 * identityCheckInterval)
+	if _, err := h.c.deliverRound(ctx, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.sink.mu.Lock()
+	calls = h.sink.schemaCalls
+	h.sink.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("expected one periodic check, got %d", calls-1)
+	}
+}
