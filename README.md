@@ -19,10 +19,10 @@ It runs as a single process, either in the foreground or as a per-user backgroun
 
 ## Supported integrations
 
-| Source | Status |
-| --- | --- |
+| Source                                    | Status                                            |
+| ----------------------------------------- | ------------------------------------------------- |
 | T3 Code (`~/.t3/userdata/statev2.sqlite`) | Supported: backfill, continuous sync, token usage |
-| ChatGPT, Claude web/mobile, Codex CLI, Claude Code, browser extensions | Not implemented |
+| Codex CLI, Claude Code, OpenCode          | Not implemented                                   |
 
 ## Install and build
 
@@ -55,12 +55,12 @@ vario status                    # cursor, spool, delivery and service state
 
 Vario uses two kinds of ClickHouse credentials:
 
-| | Administrative | Operational |
-| --- | --- | --- |
-| Used by | `vario init` (guided setup), `vario migrate` | `vario run`, `vario backfill`, the background service, `vario doctor` |
-| Used for | listing databases and users, creating the database and a dedicated user, granting privileges, creating or migrating Vario's schema | inserting collected data, reading Vario's schema and destination id |
-| Stored | **never**: asked for when needed (hidden prompt or `--admin-password-stdin`), kept in memory for that command only | user name in `clickhouse.username`; password in `~/.vario/clickhouse-password` (mode `0600`) or `$VARIO_CLICKHOUSE_PASSWORD` |
-| Privileges | whatever your administrative account has | `SELECT, INSERT` on Vario's eight tables, `SELECT` on its views and `vario_meta`; nothing global, no DDL, no `GRANT OPTION` |
+|            | Administrative                                                                                                                     | Operational                                                                                                                  |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Used by    | `vario init` (guided setup), `vario migrate`                                                                                       | `vario run`, `vario backfill`, the background service, `vario doctor`                                                        |
+| Used for   | listing databases and users, creating the database and a dedicated user, granting privileges, creating or migrating Vario's schema | inserting collected data, reading Vario's schema and destination id                                                          |
+| Stored     | **never**: asked for when needed (hidden prompt or `--admin-password-stdin`), kept in memory for that command only                 | user name in `clickhouse.username`; password in `~/.vario/clickhouse-password` (mode `0600`) or `$VARIO_CLICKHOUSE_PASSWORD` |
+| Privileges | whatever your administrative account has                                                                                           | `SELECT, INSERT` on Vario's eight tables, `SELECT` on its views and `vario_meta`; nothing global, no DDL, no `GRANT OPTION`  |
 
 The collector never creates or changes databases, users, privileges, tables or views. If its schema is missing or incompatible it keeps data spooled, reports the problem and points to `vario migrate`.
 
@@ -85,7 +85,7 @@ Both paths continue with the **collection mode** (metrics only by default; messa
 A user created by guided setup must never be left with a password nobody has. Before Vario sends `CREATE USER`, it writes the new user's password to `~/.vario/pending-credentials.json` (next to the configuration, mode `0600`; never administrative credentials). The entry is removed only after a configuration that uses the password has been saved. If the user certainly was not created (the statement failed and the user does not exist, or setup stopped before it), the entry is removed at once. If the file cannot be written, the user is not created.
 
 - **Quit, Ctrl-C, closed input, a failed step, a crash or `SIGKILL`**: the password stays in the file. Ctrl-C restores the terminal (also during a hidden password prompt) and prints what was applied and where the password is kept; a crash or `SIGKILL` prints nothing, but the file was written before the user existed.
-- **Next `vario init`**: it offers to *finish the setup with this user* (it verifies the login and continues with the remaining steps; if ClickHouse never created the user, guided setup creates it with the kept password), to continue without it (the file is kept), or to delete the saved password (confirmation required). When the same user is chosen again in guided setup, the kept password is offered. `vario doctor` reports unfinished setups.
+- **Next `vario init`**: it offers to _finish the setup with this user_ (it verifies the login and continues with the remaining steps; if ClickHouse never created the user, guided setup creates it with the kept password), to continue without it (the file is kept), or to delete the saved password (confirmation required). When the same user is chosen again in guided setup, the kept password is offered. `vario doctor` reports unfinished setups.
 - **If the password is lost anyway** (for example the file was deleted): Vario cannot recover it and never changes an existing user's credentials. An administrator can set a new one (`ALTER USER vario IDENTIFIED WITH sha256_password BY '...'`) and you then enter it with `vario init` (manually managed setup) or `vario config set-password`. Alternatively, drop the user (`DROP USER vario`) and run guided setup again.
 
 **Re-running init** is safe: existing databases, users and schema objects are discovered and reused, so nothing is duplicated, and only the settings you change are rewritten, preserving comments and formatting. The stored password is kept unless you change it. You can also keep the configuration unchanged or start over from defaults; the old file is kept as `config.toml.bak-<timestamp>`.
@@ -94,25 +94,25 @@ For scripts, init runs the manually managed path non-interactively: `vario init 
 
 ## Commands
 
-| Command | Description |
-| --- | --- |
-| `vario init` | Set up or update ClickHouse access and the configuration (see [above](#vario-init)): guided (administrative credentials, not saved) or manually managed. `--non-interactive` with `--update` or `--force` for existing configurations. Never installs the service. |
-| `vario migrate [--dry-run]` | Create or update Vario's schema after showing the plan and asking for confirmation; asks for administrative credentials only when something has to change (see [Schema migrations](#schema-migrations)). |
-| `vario destination` / `destination switch` | Show which destination queued data belongs to; switch to the configured destination after a change, keeping, moving or discarding queued rows (see [Destinations](#destinations-and-queued-data)). |
-| `vario config path` | Print the configuration file in use. |
-| `vario config show` | Show every setting with its effective value; defaults are marked, the password is never shown. |
-| `vario config get <key>` / `set <key> <value>` | Read or change one setting, validated and written in place. |
-| `vario config set-password [--stdin \| --clear]` | Store (hidden prompt) or remove the operational ClickHouse password. |
-| `vario config edit` | Edit the file in `$VISUAL`/`$EDITOR`; invalid edits are not applied. |
-| `vario sources detect` | Find supported sources in default and configured locations. Read-only. |
-| `vario sources list` | Show configured sources with their cursor and last sync time. |
-| `vario sources add t3code [--path P]` | Validate and enable a source. |
-| `vario backfill --source t3code` | Import current state and the event history, then deliver. `--force` re-sends everything; `--no-deliver` only fills the spool. |
-| `vario run [--log-file F]` | Run the collector in the foreground. Sources without a cursor are backfilled automatically. |
-| `vario status` | Configuration, service, collector, per-source sync and delivery status. Does not contact ClickHouse. |
-| `vario doctor` | Validate configuration and permissions, source access, spool and destinations, and the operational ClickHouse login: reachability, authentication, database, schema version and compatibility, read-only settings, privileges and an insert probe. Read-only. (`--create-schema` is deprecated and runs `vario migrate`.) |
-| `vario service install` / `restart` / `uninstall` / `status` | Manage the background service (macOS). `restart` applies configuration changes. |
-| `vario version` | Print version, commit, and build information. |
+| Command                                                      | Description                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vario init`                                                 | Set up or update ClickHouse access and the configuration (see [above](#vario-init)): guided (administrative credentials, not saved) or manually managed. `--non-interactive` with `--update` or `--force` for existing configurations. Never installs the service.                                                        |
+| `vario migrate [--dry-run]`                                  | Create or update Vario's schema after showing the plan and asking for confirmation; asks for administrative credentials only when something has to change (see [Schema migrations](#schema-migrations)).                                                                                                                  |
+| `vario destination` / `destination switch`                   | Show which destination queued data belongs to; switch to the configured destination after a change, keeping, moving or discarding queued rows (see [Destinations](#destinations-and-queued-data)).                                                                                                                        |
+| `vario config path`                                          | Print the configuration file in use.                                                                                                                                                                                                                                                                                      |
+| `vario config show`                                          | Show every setting with its effective value; defaults are marked, the password is never shown.                                                                                                                                                                                                                            |
+| `vario config get <key>` / `set <key> <value>`               | Read or change one setting, validated and written in place.                                                                                                                                                                                                                                                               |
+| `vario config set-password [--stdin \| --clear]`             | Store (hidden prompt) or remove the operational ClickHouse password.                                                                                                                                                                                                                                                      |
+| `vario config edit`                                          | Edit the file in `$VISUAL`/`$EDITOR`; invalid edits are not applied.                                                                                                                                                                                                                                                      |
+| `vario sources detect`                                       | Find supported sources in default and configured locations. Read-only.                                                                                                                                                                                                                                                    |
+| `vario sources list`                                         | Show configured sources with their cursor and last sync time.                                                                                                                                                                                                                                                             |
+| `vario sources add t3code [--path P]`                        | Validate and enable a source.                                                                                                                                                                                                                                                                                             |
+| `vario backfill --source t3code`                             | Import current state and the event history, then deliver. `--force` re-sends everything; `--no-deliver` only fills the spool.                                                                                                                                                                                             |
+| `vario run [--log-file F]`                                   | Run the collector in the foreground. Sources without a cursor are backfilled automatically.                                                                                                                                                                                                                               |
+| `vario status`                                               | Configuration, service, collector, per-source sync and delivery status. Does not contact ClickHouse.                                                                                                                                                                                                                      |
+| `vario doctor`                                               | Validate configuration and permissions, source access, spool and destinations, and the operational ClickHouse login: reachability, authentication, database, schema version and compatibility, read-only settings, privileges and an insert probe. Read-only. (`--create-schema` is deprecated and runs `vario migrate`.) |
+| `vario service install` / `restart` / `uninstall` / `status` | Manage the background service (macOS). `restart` applies configuration changes.                                                                                                                                                                                                                                           |
+| `vario version`                                              | Print version, commit, and build information.                                                                                                                                                                                                                                                                             |
 
 Global flags: `--config <path>` (or `$VARIO_CONFIG`), `-v/--verbose`.
 
@@ -122,11 +122,11 @@ Exit codes: `0` success, `1` failure (including failed `doctor` checks), `2` usa
 
 Vario keeps its configuration and local state in **`~/.vario/`** (mode `0700`) on every platform:
 
-| Path | Contents |
-| --- | --- |
-| `~/.vario/config.toml` | Configuration (mode `0600`). No secrets. |
+| Path                           | Contents                                                                                                                                      |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `~/.vario/config.toml`         | Configuration (mode `0600`). No secrets.                                                                                                      |
 | `~/.vario/clickhouse-password` | Operational ClickHouse password (mode `0600`), unless `clickhouse.password_file` points elsewhere. Administrative passwords are never stored. |
-| `~/.vario/data/` | Spool, cursors, destinations and lease (`collector.data_dir`). |
+| `~/.vario/data/`               | Spool, cursors, destinations and lease (`collector.data_dir`).                                                                                |
 
 **Which file is used.** Every command, the collector, `backfill` and the background service resolve the configuration the same way:
 
@@ -165,7 +165,7 @@ Changing `clickhouse.url` or `clickhouse.database` (with `config set`, `config e
 ### Managed services, external authentication and clusters
 
 - **ClickHouse Cloud and other managed services have not been validated.** User provisioning, privilege management and schema operations may differ there: discovery may be restricted (init then asks for names), and user-management rules (password policies, built-in roles, restricted `CREATE USER`) may reject Vario's statements; failures are reported step by step. A manually provisioned operational account (manually managed setup) is the expected path where guided setup does not work, provided the service exposes the HTTP(S) interface and accepts password authentication with the `X-ClickHouse-User`/`X-ClickHouse-Key` headers.
-- **External authentication**: Vario does not provision LDAP, Kerberos, certificate-authenticated, SSH-key or other externally managed users. Guided setup can *select* an existing account of that kind as the operational user (it is labelled and never offered grants), but Vario can only *authenticate* with a user name and password sent over HTTP(S). An LDAP user whose password ClickHouse checks against the directory may work that way (untested); Kerberos, certificate and SSH-key logins do not. The login check shows whether authentication works.
+- **External authentication**: Vario does not provision LDAP, Kerberos, certificate-authenticated, SSH-key or other externally managed users. Guided setup can _select_ an existing account of that kind as the operational user (it is labelled and never offered grants), but Vario can only _authenticate_ with a user name and password sent over HTTP(S). An LDAP user whose password ClickHouse checks against the directory may work that way (untested); Kerberos, certificate and SSH-key logins do not. The login check shows whether authentication works.
 - **Clusters**: Vario does not use `ON CLUSTER` and does not manage replicated schemas. Its tables are created as non-replicated `ReplacingMergeTree` on the server it connects to, and users and grants exist only there unless your access storage is replicated. For a cluster, create the database, replicated tables and grants yourself and let `vario migrate` add only what is missing. Cluster deployments are untested.
 
 ### Database selection and shared servers
@@ -183,20 +183,20 @@ The database is created only by guided `vario init` or `vario migrate`, after yo
 3. It asks for administrative credentials, re-plans with them and asks for confirmation. Creating a missing database, changing the schema, and granting the operational user access to new objects are confirmed separately; `--non-interactive` requires `--yes`.
 4. It applies the steps in order, verifies the result, and checks access as the operational user. A failure is reported with the steps that were and were not applied; running `vario migrate` again resumes.
 
-Migrations are versioned (current schema version: **2**; version 1 is the schema of Vario 0.1, which recorded no version), idempotent and additive: missing tables, views and metadata are created and Vario's own outdated views are replaced. Databases and tables are never dropped, truncated or altered. Objects with Vario's names that Vario did not create, or tables with a different engine or column types, are reported as an **incompatible schema** and stop the migration (extra columns are allowed). A schema migrated by a newer Vario is left alone. Version 2 adds `vario_meta`, which records the schema version and a random **destination id** (see [Destinations](#destinations-and-queued-data)).
+Migrations are versioned (current schema version: **2**; version 1 is the schema of Vario 0.1, which recorded no version), idempotent and additive: missing tables, views and metadata are created and Vario's own outdated views are replaced. Databases and tables are never dropped, truncated or altered. Objects with Vario's names that Vario did not create, or tables with a different engine, sorting key (`ORDER BY`), `ReplacingMergeTree` version column or column types, are reported as an **incompatible schema** and stop the migration (extra columns are allowed). The sorting key and the version column decide which rows count as the same record, so a table that differs there would silently merge or duplicate records; Vario refuses to deliver into it and never alters it. A schema migrated by a newer Vario is left alone. Version 2 adds `vario_meta`, which records the schema version and a random **destination id** (see [Destinations](#destinations-and-queued-data)).
 
 Administrative credentials are requested only for these authorized changes; routine collection (`vario run`, `vario backfill`, the background service) uses the restricted operational account and never needs them. When a new Vario version needs a newer schema, the collector keeps collecting into the spool and reports "migration required" until an administrator runs `vario migrate` (preview with `--dry-run`). The migration path from version 1 to 2 is tested against ClickHouse 24.8 and 25.8.
 
-Views carry a version tag in their comment. Updating an outdated view needs `DROP TABLE` (for `CREATE OR REPLACE`) or `DROP VIEW`; without either, the old view is kept with a warning.
+Views carry a version tag in their comment. A view is replaced only if it is Vario's own: it carries that tag, or it has no comment and its query is exactly one that Vario 0.1 created. Any other view with one of Vario's view names is yours: it is kept as it is and reported as a conflict (rename or drop it, or use another database, then run `vario migrate` again). Updating an outdated view needs `DROP TABLE` (for `CREATE OR REPLACE`) or `DROP VIEW`; without either, the old view is kept with a warning.
 
 ### ClickHouse permissions
 
 The **operational user** needs, on the target database only:
 
-| Privilege | Objects | Needed for |
-| --- | --- | --- |
+| Privilege        | Objects                                                                                                                   | Needed for                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
 | `SELECT, INSERT` | the tables `sources`, `projects`, `conversations`, `runs`, `messages`, `execution_events`, `provider_turns`, `raw_events` | inserting collected data; seeing the tables in the schema check |
-| `SELECT` | the `*_latest`, `token_usage_daily` and `tool_usage` views, and `vario_meta` | the schema check, the destination id, and querying Vario's data |
+| `SELECT`         | the `*_latest`, `token_usage_daily` and `tool_usage` views, and `vario_meta`                                              | the schema check, the destination id, and querying Vario's data |
 
 It needs no global privileges, no `CREATE`/`DROP`/`ALTER`, no access management and no `GRANT OPTION`. Its sessions must not be read-only (`readonly = 0`). The guided setup and `vario migrate` grant exactly this, one `GRANT` per object. To provision by hand:
 
@@ -220,43 +220,43 @@ Grant inspection during guided setup reads `system.grants` and `system.role_gran
 
 The stronger evidence is the **operational login check** (`vario init`, `vario migrate`, `vario doctor`), which runs as the actual operational user and password from this computer:
 
-| Check | How | Confirms |
-| --- | --- | --- |
-| authentication | a query as the operational user | the credentials and the host restrictions for this computer |
-| schema access | reads Vario's tables, columns and `vario_meta` | everything the collector reads at runtime |
-| read-only session | `getSetting('readonly')`, evaluated by the server | the settings profile allows writes |
-| privileges | `CHECK GRANT` for `INSERT` on each table and `SELECT` on `vario_meta` (ClickHouse 25.8; not available on 24.8) | explains a failure; not proof on its own |
-| inserts | an `INSERT` into every Vario table **with exactly the settings of a delivery** and no rows | privileges, revokes, roles, `readonly`, settings constraints on those settings, and already exhausted quotas, as ClickHouse applies them to the real insert |
+| Check             | How                                                                                                            | Confirms                                                                                                                                                    |
+| ----------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| authentication    | a query as the operational user                                                                                | the credentials and the host restrictions for this computer                                                                                                 |
+| schema access     | reads Vario's tables, columns and `vario_meta`                                                                 | everything the collector reads at runtime                                                                                                                   |
+| read-only session | `getSetting('readonly')`, evaluated by the server                                                              | the settings profile allows writes                                                                                                                          |
+| privileges        | `CHECK GRANT` for `INSERT` on each table and `SELECT` on `vario_meta` (ClickHouse 25.8; not available on 24.8) | explains a failure; not proof on its own                                                                                                                    |
+| inserts           | an `INSERT` into every Vario table **with exactly the settings of a delivery** and no rows                     | privileges, revokes, roles, `readonly`, settings constraints on those settings, and already exhausted quotas, as ClickHouse applies them to the real insert |
 
 Each result is reported as confirmed (✓), failed (✗) or **not verified** (!), for example when the read-only setting cannot be read or the schema does not exist yet, so inserts cannot be tried. The check needs no DDL or administrative privileges and writes nothing. Because it writes no rows, quotas on written bytes, disk space, memory limits and server-side insert limits are confirmed only by the first delivery (`vario status` shows it). Vario does not write test rows into the telemetry tables, and it does not create a separate probe table, which would need extra provisioning.
 
 ### Connection check results
 
-| Reported as | Meaning and fix |
-| --- | --- |
-| network | Server not reachable: check that it is running, the host and port, firewalls and proxies. |
-| tls | TLS failed: use `https://` with a TLS port; set `clickhouse.ca_file` for a private CA. |
-| authentication | Wrong username or password: `vario config set clickhouse.username ...`, `vario config set-password`. For administrative logins, re-enter the credentials. |
-| database missing | The database does not exist or the user has no access to it: create it with `vario init` (guided) or `vario migrate`, or grant access. |
-| permission | A privilege is missing (possibly through a revoke): rerun `vario init` to inspect and fix grants, or see the table above. |
+| Reported as         | Meaning and fix                                                                                                                                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| network             | Server not reachable: check that it is running, the host and port, firewalls and proxies.                                                                                                                          |
+| tls                 | TLS failed: use `https://` with a TLS port; set `clickhouse.ca_file` for a private CA.                                                                                                                             |
+| authentication      | Wrong username or password: `vario config set clickhouse.username ...`, `vario config set-password`. For administrative logins, re-enter the credentials.                                                          |
+| database missing    | The database does not exist or the user has no access to it: create it with `vario init` (guided) or `vario migrate`, or grant access.                                                                             |
+| permission          | A privilege is missing (possibly through a revoke): rerun `vario init` to inspect and fix grants, or see the table above.                                                                                          |
 | session restriction | The user's settings profile makes sessions read-only, a settings constraint forbids a setting Vario's inserts use, or a quota is exhausted. An administrator has to change the profile or quota; Vario never does. |
-| migration required | Vario's schema is missing or incomplete: run `vario migrate`. |
-| schema | Objects with Vario's names that Vario cannot use: choose a dedicated database or remove them. |
+| migration required  | Vario's schema is missing or incomplete: run `vario migrate`.                                                                                                                                                      |
+| schema              | Objects with Vario's names that Vario cannot use: choose a dedicated database or remove them.                                                                                                                      |
 
 None of these prevent saving the configuration. Without a reachable or ready ClickHouse, `vario run` and `vario backfill` keep collecting into the local spool and deliver once the problem is fixed.
 
 ### Schema
 
-| Table | Contents | Engine / key |
-| --- | --- | --- |
-| `sources` | One row per collected installation: host name, source database path, collection mode | `ReplacingMergeTree(version)` by `source_id` |
-| `projects` | Projects/workspaces; title and workspace path in messages+ mode | by `(source_id, project_id)` |
-| `conversations` | Threads: provider, model, mode, lineage, timestamps, title (messages+ mode) | by `(source_id, conversation_id)` |
-| `runs` | User requests and their model selection | by `(source_id, conversation_id, run_id)` |
-| `messages` | User/assistant messages; text in messages+ mode, token bloom-filter index | by `(source_id, conversation_id, message_id)` |
-| `execution_events` | Turn items: commands, tools, file changes, reasoning, errors; status, exit code, duration, sizes; payloads in full mode | by `(source_id, conversation_id, event_id)` |
-| `provider_turns` | Token usage and context snapshot per provider turn | by `(source_id, conversation_id, provider_turn_id)` |
-| `raw_events` | Source event log: type, ids, time, known metadata keys; payloads in full mode | by `(source_id, sequence, event_id)` |
+| Table              | Contents                                                                                                                | Engine / key                                        |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `sources`          | One row per collected installation: host name, source database path, collection mode                                    | `ReplacingMergeTree(version)` by `source_id`        |
+| `projects`         | Projects/workspaces; title and workspace path in messages+ mode                                                         | by `(source_id, project_id)`                        |
+| `conversations`    | Threads: provider, model, mode, lineage, timestamps, title (messages+ mode)                                             | by `(source_id, conversation_id)`                   |
+| `runs`             | User requests and their model selection                                                                                 | by `(source_id, conversation_id, run_id)`           |
+| `messages`         | User/assistant messages; text in messages+ mode, token bloom-filter index                                               | by `(source_id, conversation_id, message_id)`       |
+| `execution_events` | Turn items: commands, tools, file changes, reasoning, errors; status, exit code, duration, sizes; payloads in full mode | by `(source_id, conversation_id, event_id)`         |
+| `provider_turns`   | Token usage and context snapshot per provider turn                                                                      | by `(source_id, conversation_id, provider_turn_id)` |
+| `raw_events`       | Source event log: type, ids, time, known metadata keys; payloads in full mode                                           | by `(source_id, sequence, event_id)`                |
 
 Mutable tables keep every version until ClickHouse merges them; the highest `version` wins. Because merges are asynchronous, query the `*_latest` views (which use `FINAL`, including `raw_events_latest`) or use `argMax(..., version)`; plain `SELECT`s on the base tables can return several versions of a row. Two aggregate views are provided: `token_usage_daily` (per day, source, provider, model and usage scope) and `tool_usage`.
 
@@ -300,21 +300,24 @@ Token columns follow the source's reporting: `input_tokens` already includes cac
 - **Only one collector** runs per data directory (lease). `vario backfill` refuses to run while the collector is active, because the collector backfills new sources itself. A lease left by a collector that crashed on the same host is taken over immediately; otherwise it expires after 30 s. A collector that loses its lease (for example after the machine slept past the expiry and another collector started) stops with exit code 1.
 - **Source replacement**: the cursor records the id of the last processed event. If the T3 Code database is replaced or restored from a backup, the collector detects it, re-reads the full state, and starts a new version epoch so the replacement's state wins.
 - **Shutdown**: `SIGINT`/`SIGTERM` stop polling and delivery; pending data stays spooled and is delivered on the next start.
-- **No administrative operations**: at startup and after an "unknown table" error, the collector inspects the schema read-only. A missing or incompatible schema stops delivery (data stays spooled) and is reported in the log, `vario status` and `vario doctor`, pointing to `vario migrate`; outdated views are only a warning.
+- **No administrative operations**: at startup, about once a minute while running, and after an "unknown table" error, the collector inspects the schema and the destination id read-only. A missing or incompatible schema stops delivery (data stays spooled) and is reported in the log, `vario status` and `vario doctor`, pointing to `vario migrate`; outdated views are only a warning.
 
 ### Destinations and queued data
 
 Every queued record, every source cursor and every change fingerprint belongs to one **destination**. Data queued for one destination is never delivered to another, and a destination has its own cursors, so switching to a new database reads every source again in full for it. Vario does not assume that the new database already has what was delivered to the old one.
 
-**Identity.** A destination is identified by the destination id stored in its `vario_meta` table (schema version 2). Until that id is known (ClickHouse unreachable, or a version 1 schema), it is identified by the normalized endpoint (lower-case scheme and host, explicit port, no trailing slash) and the database name. Credentials are never part of it: changing the operational user or rotating its password keeps the destination. The same database reached through another URL is recognized by its id and keeps its state. A database that was dropped and recreated (and migrated again) has a new id, and is treated as a new destination that must be repopulated.
+**Identity.** A destination is identified by the destination id stored in its `vario_meta` table (schema version 2). Until that id is known (ClickHouse unreachable, or a version 1 schema), it is identified by the normalized endpoint (lower-case scheme and host, explicit port, no trailing slash) and the database name. Credentials are never part of it: changing the operational user or rotating its password keeps the destination. The same database reached through another URL is recognized by its id and keeps its state. A database that was dropped and recreated (and migrated again) has a new id, and is treated as a new destination that must be repopulated. The collector compares the id at every start and about once a minute while it runs, also when it is idle: if the database is recreated under a running collector, the collector stops with "not the one Vario delivered to before" instead of delivering only later changes, and `vario destination switch` then has the recreated database backfilled in full. (Rows delivered within that minute are simply sent again by the backfill.)
 
 **Changing the destination** (`vario config set clickhouse.url|database`, `vario config edit`, `vario init`, or editing the file directly; the collector itself checks at every start):
 
 - If nothing is queued for the previous destination, the collector switches automatically, logs it, and backfills the new destination in full. The previous destination's cursors are kept, so switching back resumes where it left off.
 - If rows are still queued for the previous destination, or the configured database was replaced, `vario run` and `vario backfill` refuse to start and explain why. Decide with `vario destination switch`:
+
   - `--keep-pending` keeps the rows for the previous destination; they are delivered if you configure it again.
   - `--move-pending` delivers them to the configured destination instead. Re-sent rows carry the same keys and versions, so the `*_latest` and aggregate views count each record once.
   - `--discard-pending` deletes them (asks for confirmation unless `--yes`). The new destination gets a full backfill anyway; only events that the source has already pruned are lost.
+
+  With `--move-pending` and `--discard-pending` the previous destination never receives those rows, so its cursors and fingerprints are reset together with them. If you configure it again later, every source is read again in full for it (no `backfill --force` needed); rows it already has are re-sent with the same keys and versions and count once.
 
   To deliver the queued rows to the previous destination first, restore its setting, let `vario run` drain the spool (`vario status`), then change the setting again.
 
@@ -482,11 +485,11 @@ The build for macOS and Windows is **cross-compiled** on Linux (Vario is pure Go
 
 Releases are published by the **Release** workflow (`.github/workflows/release.yml`) only when a maintainer pushes a version tag. Merging into `master` never publishes anything, and the workflow never creates tags.
 
-| OS | Architectures | Archive |
-| --- | --- | --- |
-| macOS | amd64, arm64 | `vario_<version>_darwin_<arch>.tar.gz` |
-| Linux | amd64, arm64 | `vario_<version>_linux_<arch>.tar.gz` |
-| Windows | amd64, arm64 | `vario_<version>_windows_<arch>.zip` |
+| OS      | Architectures | Archive                                |
+| ------- | ------------- | -------------------------------------- |
+| macOS   | amd64, arm64  | `vario_<version>_darwin_<arch>.tar.gz` |
+| Linux   | amd64, arm64  | `vario_<version>_linux_<arch>.tar.gz`  |
+| Windows | amd64, arm64  | `vario_<version>_windows_<arch>.zip`   |
 
 Each archive contains a single directory with the executable, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`. Tags follow [Semantic Versioning](https://semver.org) with a `v` prefix: `v0.1.0`, `v1.2.3`, or a prerelease like `v0.2.0-rc.1` (published as a GitHub prerelease). The tag is embedded in the binary, so `vario version` reports it along with the commit.
 

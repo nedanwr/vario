@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/nedanwr/vario/internal/model"
 )
 
 // fakeServer is a small ClickHouse HTTP endpoint for unit tests. It answers
@@ -22,7 +24,7 @@ type fakeServer struct {
 
 	dbExists bool
 	dbs      []string
-	tables   []string // existing objects: "name|engine|as_select|comment"
+	tables   []string // existing objects: "name|engine|as_select|comment[|sorting_key|engine_full]"
 	columns  []string // "table|name|type"
 	meta     []string // vario_meta rows: "key|value"
 
@@ -109,8 +111,8 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case strings.Contains(q, "system.tables"):
 		for _, t := range f.tables {
-			p := strings.Split(t, "|")
-			rows = append(rows, fmt.Sprintf(`{"name":%q,"engine":%q,"as_select":%q,"comment":%q}`, p[0], p[1], p[2], p[3]))
+			p := append(strings.Split(t, "|"), "", "")
+			rows = append(rows, fmt.Sprintf(`{"name":%q,"engine":%q,"as_select":%q,"comment":%q,"sorting_key":%q,"engine_full":%q}`, p[0], p[1], p[2], p[3], p[4], p[5]))
 		}
 	case strings.Contains(q, "system.columns"):
 		for _, c := range f.columns {
@@ -224,7 +226,7 @@ func completeSchema(db string) (tables, columns, meta []string) {
 func legacySchema(db string) (tables, columns []string) {
 	ddl := tableDDL(db)
 	for _, name := range requiredTables() {
-		tables = append(tables, name+"|ReplacingMergeTree||")
+		tables = append(tables, tableRow(name, "ReplacingMergeTree(version)", sortingKeys[name]))
 		for _, c := range expectedColumns(ddl[name]) {
 			columns = append(columns, name+"|"+c.name+"|"+c.typ)
 		}
@@ -233,6 +235,30 @@ func legacySchema(db string) (tables, columns []string) {
 		tables = append(tables, v.name+"|View|"+v.query+"|"+viewTag(v.name))
 	}
 	return tables, columns
+}
+
+// sortingKeys are the sorting keys of Vario's tables as ClickHouse reports
+// them in system.tables.sorting_key. They are written out here, not derived
+// from the DDL, so that a changed ORDER BY is noticed.
+var sortingKeys = map[string]string{
+	model.TableSources:         "source_id",
+	model.TableProjects:        "source_id, project_id",
+	model.TableConversations:   "source_id, conversation_id",
+	model.TableRuns:            "source_id, conversation_id, run_id",
+	model.TableMessages:        "source_id, conversation_id, message_id",
+	model.TableExecutionEvents: "source_id, conversation_id, event_id",
+	model.TableProviderTurns:   "source_id, conversation_id, provider_turn_id",
+	model.TableRawEvents:       "source_id, sequence, event_id",
+}
+
+// tableRow is the system.tables row of a ReplacingMergeTree table with the
+// given engine clause and sorting key, in the format ClickHouse reports.
+func tableRow(name, engine, sortingKey string) string {
+	order := sortingKey
+	if strings.Contains(order, ",") {
+		order = "(" + order + ")"
+	}
+	return name + "|ReplacingMergeTree||" + "|" + sortingKey + "|" + engine + " ORDER BY " + order + " SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 8192"
 }
 
 // mutations returns the recorded statements that change ClickHouse.

@@ -44,8 +44,9 @@ type fakeUser struct {
 }
 
 type fakeObj struct {
-	engine, comment string
-	cols            [][2]string
+	engine, comment        string
+	sortingKey, engineFull string
+	cols                   [][2]string
 }
 
 func newFakeCH(t *testing.T, password string, dbs ...string) (*fakeCH, string) {
@@ -99,6 +100,8 @@ var (
 	reTable     = regexp.MustCompile("(?s)^CREATE TABLE IF NOT EXISTS `([^`]+)`\\.`([^`]+)` \\((.*)\\) ENGINE = (\\w+)")
 	reView      = regexp.MustCompile("(?s)^CREATE (?:OR REPLACE )?VIEW (?:IF NOT EXISTS )?`([^`]+)`\\.`([^`]+)` AS .* COMMENT '([^']*)'$")
 	reComment   = regexp.MustCompile("COMMENT '([^']*)'$")
+	reEngine    = regexp.MustCompile(`(?m)^\) ENGINE = (.+)$`)
+	reOrderBy   = regexp.MustCompile(`(?m)^ORDER BY (.+)$`)
 	reCol       = regexp.MustCompile(`^  ([a-z_]+) (.+?),?$`)
 	reMeta      = regexp.MustCompile("^INSERT INTO `([^`]+)`\\.`vario_meta` \\(key, value\\) VALUES (.*)$")
 	rePair      = regexp.MustCompile(`\('([^']*)', '([^']*)'\)`)
@@ -190,7 +193,8 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		db := reWhereDB.FindStringSubmatch(q)[1]
 		for n, o := range f.objects[db] {
 			if u.sees(db, n) {
-				data = append(data, map[string]any{"name": n, "engine": o.engine, "as_select": "", "comment": o.comment})
+				data = append(data, map[string]any{"name": n, "engine": o.engine, "as_select": "", "comment": o.comment,
+					"sorting_key": o.sortingKey, "engine_full": o.engineFull})
 			}
 		}
 	case strings.Contains(q, "FROM system.columns"):
@@ -331,6 +335,11 @@ func (f *fakeCH) apply(q string) error {
 		}
 		if c := reComment.FindStringSubmatch(q); c != nil {
 			o.comment = c[1]
+		}
+		// As ClickHouse reports them: "a, b" and "Engine(args) ORDER BY (a, b)".
+		if e, ob := reEngine.FindStringSubmatch(q), reOrderBy.FindStringSubmatch(q); e != nil && ob != nil {
+			o.sortingKey = strings.Trim(ob[1], "()")
+			o.engineFull = e[1] + " ORDER BY " + ob[1]
 		}
 		for _, line := range strings.Split(q, "\n") {
 			if cm := reCol.FindStringSubmatch(line); cm != nil {

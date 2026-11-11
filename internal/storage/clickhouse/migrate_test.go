@@ -206,10 +206,10 @@ func TestPlanSchema(t *testing.T) {
 	if p, err = c.PlanSchema(bg); err != nil || !p.Empty() {
 		t.Fatalf("up-to-date schema: %+v %v", p, err)
 	}
-	// An outdated Vario view is replaced; a foreign one stops the plan.
+	// An outdated Vario view (an older tag) is replaced; a foreign one stops the plan.
 	for i, tb := range f.tables {
 		if strings.HasPrefix(tb, "token_usage_daily|") {
-			f.tables[i] = "token_usage_daily|View|SELECT day FROM vario.provider_turns AS p FINAL|"
+			f.tables[i] = "token_usage_daily|View|SELECT day FROM vario.provider_turns AS p FINAL|vario:000000000000"
 		}
 	}
 	if p, _ = c.PlanSchema(bg); len(p.Steps) != 1 || !strings.Contains(p.Steps[0].SQL, "CREATE OR REPLACE VIEW") {
@@ -306,5 +306,169 @@ func TestApplyUsesPlanDatabase(t *testing.T) {
 	}
 	if m := f.mutations(); len(m) != 1 || !strings.Contains(m[0], "`metrics`.`vario_meta`") {
 		t.Fatalf("the version must be recorded in the plan's database: %v", m)
+	}
+}
+
+func setTable(f *fakeServer, name, row string) {
+	f.tables = append(f.tables[:0:0], f.tables...)
+	for i, tb := range f.tables {
+		if strings.HasPrefix(tb, name+"|") {
+			f.tables[i] = row
+			return
+		}
+	}
+	f.tables = append(f.tables, row)
+}
+
+// B-1: a table with Vario's column names and types but another sorting key
+// or version argument does not deduplicate the way Vario relies on (12
+// messages of one conversation collapsed into one row under ORDER BY
+// (source_id, conversation_id)). It is an incompatible schema for the
+// collector, doctor and migrate alike, and is never modified.
+func TestSortingKeyAndVersionAreVerified(t *testing.T) {
+	const rmt = "ReplacingMergeTree(version)"
+	cases := []struct {
+		name, row, want string
+	}{
+		{"shorter key", tableRow("messages", rmt, "source_id, conversation_id"),
+			"table messages: sorting key (ORDER BY) is source_id, conversation_id, expected source_id, conversation_id, message_id"},
+		{"reordered key", tableRow("messages", rmt, "source_id, message_id, conversation_id"), "sorting key"},
+		{"longer key", tableRow("messages", rmt, "source_id, conversation_id, message_id, version"), "sorting key"},
+		{"single column", tableRow("sources", rmt, "host_name"), "table sources: sorting key (ORDER BY) is host_name, expected source_id"},
+		{"no key reported", "messages|ReplacingMergeTree|||", "sorting key (ORDER BY) is empty"},
+		{"no version", tableRow("messages", "ReplacingMergeTree", sortingKeys["messages"]), "version argument is none, expected version"},
+		{"other version column", tableRow("messages", "ReplacingMergeTree(ingested_at)", sortingKeys["messages"]), "version argument is ingested_at, expected version"},
+		{"is_deleted", tableRow("messages", "ReplacingMergeTree(version, streaming)", sortingKeys["messages"]), "version argument is version, streaming"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, srv := newFake(t)
+			c := testClient(t, srv.URL)
+			f.tables, f.columns, f.meta = completeSchema("vario")
+			setTable(f, strings.SplitN(tc.row, "|", 2)[0], tc.row)
+
+			st, err := c.InspectSchema(bg)
+			if err != nil || st.Usable() || len(st.Problems) != 1 || !strings.Contains(st.Problems[0], tc.want) {
+				t.Fatalf("inspect: %v %v", st.Problems, err)
+			}
+			var se *SchemaError
+			if _, err := c.CheckDestination(bg); !errors.As(err, &se) {
+				t.Fatalf("the collector must not deliver into it: %v", err)
+			}
+			if r, err := c.CheckConnection(bg); err != nil || r.Ready() || r.Issues[0].Kind != KindSchema || r.Probe == "ok" {
+				t.Fatalf("doctor must report it: %+v %v", r, err)
+			}
+			if p, err := c.PlanSchema(bg); !errors.As(err, &se) || !p.Empty() {
+				t.Fatalf("migrate must stop: %+v %v", p, err)
+			}
+			if _, err := c.VerifyMigrated(bg); !errors.As(err, &se) {
+				t.Fatalf("verify: %v", err)
+			}
+			readOnly(t, f)
+		})
+	}
+
+	// Replicated and shared engines put the path and replica first; quoting
+	// and spacing of the key do not matter.
+	f, srv := newFake(t)
+	c := testClient(t, srv.URL)
+	f.tables, f.columns, f.meta = completeSchema("vario")
+	setTable(f, "messages", "messages|SharedReplacingMergeTree|||`source_id`,conversation_id,  message_id|"+
+		"SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) ORDER BY (source_id, conversation_id, message_id)")
+	setTable(f, "runs", "runs|ReplicatedReplacingMergeTree|||source_id, conversation_id, run_id|"+
+		"ReplicatedReplacingMergeTree('/ch/it\\'s(1),x', 'r1', version) ORDER BY (source_id, conversation_id, run_id)")
+	if st, err := c.InspectSchema(bg); err != nil || !st.Complete() {
+		t.Fatalf("equivalent engines must be accepted: %+v %v", st.Problems, err)
+	}
+}
+
+func TestEngineArgs(t *testing.T) {
+	for full, want := range map[string]string{
+		"ReplacingMergeTree(version) ORDER BY a":                            "version",
+		"ReplacingMergeTree ORDER BY a":                                     "",
+		"ReplacingMergeTree() ORDER BY a":                                   "",
+		"ReplacingMergeTree(`version`) ORDER BY (a, b)":                     "version",
+		"ReplacingMergeTree(version, is_deleted) PARTITION BY toYYYYMM(c)":  "version|is_deleted",
+		"ReplacingMergeTree('/p/{shard}', '{replica}', version) ORDER BY a": "version",
+		"ReplacingMergeTree('/p', 'r') ORDER BY a":                          "",
+		"ReplacingMergeTree(toUInt64(version)) ORDER BY a":                  "toUInt64(version)",
+		"ReplacingMergeTree(version":                                        "",
+		"MergeTree ORDER BY (version)":                                      "",
+	} {
+		if got := strings.Join(engineArgs("ReplacingMergeTree", full), "|"); got != want {
+			t.Errorf("engineArgs(%q) = %q, want %q", full, got, want)
+		}
+	}
+}
+
+// The queries of Vario 0.1's untagged views as ClickHouse 24.8 and 25.8
+// report them in system.tables.as_select (one line, quoting dropped).
+const (
+	legacyTokenUsage   = "SELECT toDate(coalesce(started_at, conversation_created_at)) AS day, source_id, provider, model, usage_scope, count() AS provider_turns, countIf(p.input_tokens IS NOT NULL) AS turns_with_usage, countIf(usage_status != 'complete') AS turns_incomplete_usage, sum(p.input_tokens) AS input_tokens, sum(p.cached_input_tokens) AS cached_input_tokens, sum(p.cache_creation_input_tokens) AS cache_creation_input_tokens, sum(p.uncached_input_tokens) AS uncached_input_tokens, sum(p.output_tokens) AS output_tokens, sum(p.reasoning_tokens) AS reasoning_tokens FROM vario.provider_turns AS p FINAL GROUP BY day, source_id, provider, model, usage_scope"
+	legacyTokenUsageV0 = "SELECT toDate(coalesce(started_at, conversation_created_at)) AS day, source_id, provider, model, count() AS provider_turns, countIf(p.input_tokens IS NOT NULL) AS turns_with_usage, countIf(usage_status != 'complete') AS turns_incomplete_usage, sum(p.input_tokens) AS input_tokens, sum(p.cached_input_tokens) AS cached_input_tokens, sum(p.cache_creation_input_tokens) AS cache_creation_input_tokens, sum(p.uncached_input_tokens) AS uncached_input_tokens, sum(p.output_tokens) AS output_tokens, sum(p.reasoning_tokens) AS reasoning_tokens FROM vario.provider_turns AS p FINAL GROUP BY day, source_id, provider, model"
+	legacyToolUsage    = "SELECT source_id, event_type, tool_name, count() AS executions, countIf(is_error = 1) AS failures, avg(duration_ms) AS avg_duration_ms, min(started_at) AS first_seen, max(started_at) AS last_seen FROM vario.execution_events FINAL WHERE event_type IN ('command_execution', 'dynamic_tool', 'file_change', 'web_search') GROUP BY source_id, event_type, tool_name"
+)
+
+// B-2: an untagged view is Vario's own only if its query is exactly one that
+// Vario 0.1 created. A user's view that merely reads from a table whose name
+// contains a Vario table name (execution_events_archive) is not, and is
+// never replaced.
+func TestViewOwnership(t *testing.T) {
+	f, srv := newFake(t)
+	c := testClient(t, srv.URL)
+	admin := &Admin{c}
+
+	// Genuine Vario 0.1 views: recognized, and replaced by the tagged versions.
+	f.tables, f.columns, f.meta = completeSchema("vario")
+	setTable(f, "token_usage_daily", "token_usage_daily|View|"+legacyTokenUsageV0+"|")
+	setTable(f, "tool_usage", "tool_usage|View|"+legacyToolUsage+"|")
+	setTable(f, "messages_latest", "messages_latest|View|SELECT * FROM vario.messages FINAL|")
+	p, err := c.PlanSchema(bg)
+	if err != nil || len(p.Steps) != 3 || len(p.Status.OutdatedViews) != 3 {
+		t.Fatalf("legacy views: %+v %v", p, err)
+	}
+	if res := admin.Apply(bg, p, nil); !res.OK() || len(f.mutations()) != 3 {
+		t.Fatalf("apply: %+v %v", res, f.mutations())
+	}
+	setTable(f, "token_usage_daily", "token_usage_daily|View|"+legacyTokenUsage+"|")
+	if st, err := c.InspectSchema(bg); err != nil || len(st.Problems) != 0 {
+		t.Fatalf("the later 0.1 definition is Vario's as well: %+v %v", st.Problems, err)
+	}
+
+	// User-owned views under Vario's names.
+	for name, query := range map[string]string{
+		"archive table":       strings.ReplaceAll(legacyToolUsage, "vario.execution_events FINAL", "vario.execution_events_archive FINAL"),
+		"other database":      strings.ReplaceAll(legacyToolUsage, "vario.execution_events", "analytics.execution_events"),
+		"extra filter":        legacyToolUsage + " HAVING executions > 10",
+		"mentions the table":  "SELECT 'execution_events' AS source, count() AS executions FROM vario.my_events",
+		"reads Vario's table": "SELECT tool_name, count() AS executions FROM vario.execution_events GROUP BY tool_name",
+		"no query reported":   "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, srv := newFake(t)
+			c := testClient(t, srv.URL)
+			f.tables, f.columns, f.meta = completeSchema("vario")
+			setTable(f, "tool_usage", "tool_usage|View|"+query+"|")
+			st, err := c.InspectSchema(bg)
+			if err != nil || len(st.OutdatedViews) != 0 || len(st.Problems) != 1 || !strings.Contains(st.Problems[0], "view tool_usage exists but was not created by Vario") {
+				t.Fatalf("a user-owned view must be reported as a conflict: outdated %v, problems %v, %v", st.OutdatedViews, st.Problems, err)
+			}
+			var se *SchemaError
+			p, err := c.PlanSchema(bg)
+			if !errors.As(err, &se) || !p.Empty() {
+				t.Fatalf("migrate must stop without a plan: %+v %v", p, err)
+			}
+			if res := (&Admin{c}).Apply(bg, p, nil); !res.OK() || len(res.Applied) != 0 {
+				t.Fatalf("apply: %+v", res)
+			}
+			readOnly(t, f)
+		})
+	}
+
+	// A view tagged by a user with something that is not Vario's tag.
+	f.tables, f.columns, f.meta = completeSchema("vario")
+	setTable(f, "tool_usage", "tool_usage|View|"+legacyToolUsage+"|my team's view")
+	if st, _ := c.InspectSchema(bg); len(st.Problems) != 1 || len(st.OutdatedViews) != 0 {
+		t.Fatalf("a view with a foreign comment is not Vario's: %+v", st)
 	}
 }

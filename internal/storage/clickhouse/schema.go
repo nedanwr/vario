@@ -235,20 +235,22 @@ ORDER BY (source_id, sequence, event_id)
 	}
 }
 
-// viewDef is a Vario-owned view. base is the table it reads from; it is used
-// to recognize views created by earlier Vario versions, which had no comment.
+// viewDef is a Vario-owned view. legacy lists the queries of the view as
+// Vario 0.1 created it, without a comment; an untagged view is recognized as
+// Vario's own only when its query is exactly one of them (see ownedLegacy).
 type viewDef struct {
-	name, base, query string
+	name, query string
+	legacy      []string
 }
 
 func viewDefs(db string) []viewDef {
 	t := func(name string) string { return quoteIdent(db) + "." + quoteIdent(name) }
 	var out []viewDef
 	for _, name := range model.Tables {
-		out = append(out, viewDef{name + "_latest", name, fmt.Sprintf("SELECT * FROM %s FINAL", t(name))})
+		q := fmt.Sprintf("SELECT * FROM %s FINAL", t(name))
+		out = append(out, viewDef{name + "_latest", q, []string{q}})
 	}
-	out = append(out,
-		viewDef{"token_usage_daily", model.TableProviderTurns, fmt.Sprintf(`SELECT
+	tokenUsage := fmt.Sprintf(`SELECT
   toDate(coalesce(started_at, conversation_created_at)) AS day,
   source_id,
   provider,
@@ -264,8 +266,25 @@ func viewDefs(db string) []viewDef {
   sum(p.output_tokens) AS output_tokens,
   sum(p.reasoning_tokens) AS reasoning_tokens
 FROM %s AS p FINAL
-GROUP BY day, source_id, provider, model, usage_scope`, t(model.TableProviderTurns))},
-		viewDef{"tool_usage", model.TableExecutionEvents, fmt.Sprintf(`SELECT
+GROUP BY day, source_id, provider, model, usage_scope`, t(model.TableProviderTurns))
+	// The first Vario 0.1 builds did not split usage by scope.
+	tokenUsageV0 := fmt.Sprintf(`SELECT
+  toDate(coalesce(started_at, conversation_created_at)) AS day,
+  source_id,
+  provider,
+  model,
+  count() AS provider_turns,
+  countIf(p.input_tokens IS NOT NULL) AS turns_with_usage,
+  countIf(usage_status != 'complete') AS turns_incomplete_usage,
+  sum(p.input_tokens) AS input_tokens,
+  sum(p.cached_input_tokens) AS cached_input_tokens,
+  sum(p.cache_creation_input_tokens) AS cache_creation_input_tokens,
+  sum(p.uncached_input_tokens) AS uncached_input_tokens,
+  sum(p.output_tokens) AS output_tokens,
+  sum(p.reasoning_tokens) AS reasoning_tokens
+FROM %s AS p FINAL
+GROUP BY day, source_id, provider, model`, t(model.TableProviderTurns))
+	toolUsage := fmt.Sprintf(`SELECT
   source_id,
   event_type,
   tool_name,
@@ -276,9 +295,35 @@ GROUP BY day, source_id, provider, model, usage_scope`, t(model.TableProviderTur
   max(started_at) AS last_seen
 FROM %s FINAL
 WHERE event_type IN ('command_execution', 'dynamic_tool', 'file_change', 'web_search')
-GROUP BY source_id, event_type, tool_name`, t(model.TableExecutionEvents))},
+GROUP BY source_id, event_type, tool_name`, t(model.TableExecutionEvents))
+	return append(out,
+		viewDef{"token_usage_daily", tokenUsage, []string{tokenUsage, tokenUsageV0}},
+		viewDef{"tool_usage", toolUsage, []string{toolUsage}},
 	)
-	return out
+}
+
+// normalizeSQL makes a query from Vario's source comparable with the form
+// ClickHouse reports in system.tables: whitespace runs become one space and
+// identifier quoting is dropped (ClickHouse quotes only where needed).
+func normalizeSQL(q string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(q, "`", "")), " ")
+}
+
+// ownedLegacy reports whether asSelect, the query of an existing view
+// without a comment, is exactly a query Vario 0.1 created the view with.
+// Anything else, including a view that merely reads from one of Vario's
+// tables, belongs to the user.
+func (v viewDef) ownedLegacy(asSelect string) bool {
+	got := normalizeSQL(asSelect)
+	if got == "" {
+		return false
+	}
+	for _, q := range v.legacy {
+		if normalizeSQL(q) == got {
+			return true
+		}
+	}
+	return false
 }
 
 // viewTagPrefix marks views created by Vario. The suffix identifies the view
@@ -325,6 +370,96 @@ func expectedColumns(ddl string) []column {
 		out = append(out, column{m[1], strings.TrimSpace(typ)})
 	}
 	return out
+}
+
+var orderByRe = regexp.MustCompile(`(?m)^ORDER BY \(?(.+?)\)?$`)
+
+// normalizeKey makes a key expression list comparable: no quoting, no spaces.
+func normalizeKey(k string) string {
+	return strings.NewReplacer("`", "", " ", "").Replace(k)
+}
+
+// expectedSortingKey extracts the ORDER BY columns from Vario's table DDL, in
+// the form of system.tables.sorting_key ("a, b, c").
+func expectedSortingKey(ddl string) string {
+	m := orderByRe.FindStringSubmatch(ddl)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// engineArgs returns the arguments of a table engine from
+// system.tables.engine_full, for example ["version"] for
+// "ReplacingMergeTree(version) ORDER BY ...". The string literals that
+// replicated and shared engines take first (ZooKeeper path, replica name) are
+// left out, so that the same check applies to them.
+func engineArgs(engine, engineFull string) []string {
+	rest, ok := strings.CutPrefix(engineFull, engine+"(")
+	if !ok {
+		return nil
+	}
+	var args []string
+	var cur strings.Builder
+	depth, quoted := 0, false
+	flush := func() {
+		if a := strings.TrimSpace(cur.String()); a != "" && !strings.HasPrefix(a, "'") {
+			args = append(args, strings.ReplaceAll(a, "`", ""))
+		}
+		cur.Reset()
+	}
+	for i := 0; i < len(rest); i++ {
+		ch := rest[i]
+		switch {
+		case quoted:
+			if ch == '\\' && i+1 < len(rest) {
+				cur.WriteByte(ch)
+				i++
+				ch = rest[i]
+			} else if ch == '\'' {
+				quoted = false
+			}
+		case ch == '\'':
+			quoted = true
+		case ch == '(':
+			depth++
+		case ch == ')' && depth == 0:
+			flush()
+			return args
+		case ch == ')':
+			depth--
+		case ch == ',' && depth == 0:
+			flush()
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	return nil
+}
+
+// checkEngine verifies what makes ReplacingMergeTree deduplicate the way
+// Vario relies on: rows are identified by the expected sorting key, and the
+// newest row is chosen by the version column alone. A table with the right
+// columns but another key collapses distinct records into one (or never
+// collapses updates); without the version argument the surviving row is
+// arbitrary, and with an is_deleted argument rows disappear.
+func checkEngine(ddl, engine, engineFull, sortingKey string) []string {
+	var bad []string
+	if want := expectedSortingKey(ddl); normalizeKey(sortingKey) != normalizeKey(want) {
+		got := sortingKey
+		if got == "" {
+			got = "empty"
+		}
+		bad = append(bad, fmt.Sprintf("sorting key (ORDER BY) is %s, expected %s", got, want))
+	}
+	if args := engineArgs(engine, engineFull); len(args) != 1 || args[0] != "version" {
+		got := "none"
+		if len(args) > 0 {
+			got = strings.Join(args, ", ")
+		}
+		bad = append(bad, fmt.Sprintf("ReplacingMergeTree version argument is %s, expected version", got))
+	}
+	return bad
 }
 
 // MetaTable records Vario's schema version and the destination id. It is
@@ -453,12 +588,14 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 	}
 	db := escapeString(c.database)
 	var objects []struct {
-		Name     string `json:"name"`
-		Engine   string `json:"engine"`
-		AsSelect string `json:"as_select"`
-		Comment  string `json:"comment"`
+		Name       string `json:"name"`
+		Engine     string `json:"engine"`
+		AsSelect   string `json:"as_select"`
+		Comment    string `json:"comment"`
+		SortingKey string `json:"sorting_key"`
+		EngineFull string `json:"engine_full"`
 	}
-	if err := c.Query(ctx, fmt.Sprintf("SELECT name, engine, as_select, comment FROM system.tables WHERE database = '%s'", db), &objects); err != nil {
+	if err := c.Query(ctx, fmt.Sprintf("SELECT name, engine, as_select, comment, sorting_key, engine_full FROM system.tables WHERE database = '%s'", db), &objects); err != nil {
 		return st, err
 	}
 	var cols []struct {
@@ -469,10 +606,10 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 	if err := c.Query(ctx, fmt.Sprintf("SELECT table, name, type FROM system.columns WHERE database = '%s'", db), &cols); err != nil {
 		return st, err
 	}
-	type object struct{ engine, asSelect, comment string }
+	type object struct{ engine, asSelect, comment, sortingKey, engineFull string }
 	have := map[string]object{}
 	for _, o := range objects {
-		have[o.Name] = object{o.Engine, o.AsSelect, o.Comment}
+		have[o.Name] = object{o.Engine, o.AsSelect, o.Comment, o.SortingKey, o.EngineFull}
 	}
 	colTypes := map[string]map[string]string{}
 	for _, col := range cols {
@@ -505,7 +642,8 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 			st.Problems = append(st.Problems, fmt.Sprintf("%s has engine %s, expected ReplacingMergeTree", name, o.engine))
 			continue
 		}
-		if bad := checkColumns(name, ddl[name]); len(bad) > 0 {
+		bad := checkEngine(ddl[name], o.engine, o.engineFull, o.sortingKey)
+		if bad = append(bad, checkColumns(name, ddl[name])...); len(bad) > 0 {
 			st.Problems = append(st.Problems, fmt.Sprintf("table %s: %s", name, strings.Join(bad, ", ")))
 		}
 	}
@@ -517,10 +655,11 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 		case o.engine != "View":
 			st.Problems = append(st.Problems, fmt.Sprintf("%s is a %s, expected a view", v.name, o.engine))
 		case o.comment == viewTag(v.name):
-		case strings.HasPrefix(o.comment, viewTagPrefix) || (o.comment == "" && strings.Contains(o.asSelect, v.base)):
+		case strings.HasPrefix(o.comment, viewTagPrefix) || (o.comment == "" && v.ownedLegacy(o.asSelect)):
+			// Positively Vario's own: its tag, or exactly a Vario 0.1 definition.
 			st.OutdatedViews = append(st.OutdatedViews, v.name)
 		default:
-			st.Problems = append(st.Problems, fmt.Sprintf("view %s exists but was not created by Vario", v.name))
+			st.Problems = append(st.Problems, fmt.Sprintf("view %s exists but was not created by Vario (it is kept as it is; rename or drop it, or use another database)", v.name))
 		}
 	}
 	if o, ok := have[MetaTable]; ok {

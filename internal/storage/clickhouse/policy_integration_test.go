@@ -296,8 +296,13 @@ func TestIntegrationProvisioning(t *testing.T) {
 		t.Fatal("GRANT to a user defined in users.xml must fail")
 	}
 
-	// 8. An outdated view (from Vario 0.1) is replaced by a migration; data is kept.
-	mustExec(t, admin.Client, fmt.Sprintf("CREATE OR REPLACE VIEW %s.tool_usage AS SELECT source_id FROM %s.execution_events FINAL", db, db))
+	// 8. An outdated view (from Vario 0.1: no comment, the first definition
+	// without usage_scope) is replaced by a migration; data is kept.
+	for _, v := range viewDefs(db) {
+		if v.name == "token_usage_daily" {
+			mustExec(t, admin.Client, fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS %s", db, v.name, v.legacy[1]))
+		}
+	}
 	if r, _ := op.CheckConnection(ctx); !r.Ready() || len(r.Warnings) != 1 {
 		t.Fatalf("an outdated view is a warning, not a blocker: %+v", r)
 	}

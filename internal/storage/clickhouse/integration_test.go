@@ -3,6 +3,7 @@ package clickhouse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -255,5 +256,180 @@ func TestIntegrationAggregationSemantics(t *testing.T) {
 	}](t, c, "SELECT executions, failures FROM DB.tool_usage")
 	if len(tu) != 1 || tu[0].E != 1 || tu[0].F != 1 {
 		t.Errorf("tool usage: %+v", tu)
+	}
+}
+
+type tableMeta struct {
+	Name       string `json:"name"`
+	Engine     string `json:"engine"`
+	SortingKey string `json:"sorting_key"`
+	EngineFull string `json:"engine_full"`
+	AsSelect   string `json:"as_select"`
+	Comment    string `json:"comment"`
+	UUID       string `json:"uuid"`
+}
+
+func tableMetaOf(t *testing.T, c *Client, name string) tableMeta {
+	t.Helper()
+	rows := queryOne[tableMeta](t, c, fmt.Sprintf("SELECT name, engine, sorting_key, engine_full, as_select, comment, toString(uuid) AS uuid FROM system.tables WHERE database = '%s' AND name = '%s'",
+		escapeString(c.Database()), name))
+	if len(rows) != 1 {
+		t.Fatalf("object %s: %+v", name, rows)
+	}
+	return rows[0]
+}
+
+// B-1: a table with Vario's columns but another sorting key or version
+// argument passes a column check and silently collapses records. It must be
+// rejected by the collector's check, doctor and migrate, and left as it is.
+func TestIntegrationSortingKeyAndVersion(t *testing.T) {
+	ctx := context.Background()
+	msgDDL := func(c *Client) string { return tableDDL(c.Database())[model.TableMessages] }
+	prepare := func(t *testing.T, rewrite func(ddl string) string) *Client {
+		t.Helper()
+		c := integrationClient(t)
+		if err := c.Exec(ctx, CreateDatabaseStep(c.Database()).SQL); err != nil {
+			t.Fatal(err)
+		}
+		ddl := rewrite(msgDDL(c))
+		if ddl == msgDDL(c) {
+			t.Fatal("the DDL was not rewritten")
+		}
+		if err := c.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	rejected := func(t *testing.T, c *Client, want string) {
+		t.Helper()
+		before := tableMetaOf(t, c, model.TableMessages)
+		var se *SchemaError
+		p, err := (&Admin{c}).PlanSchema(ctx)
+		if !errors.As(err, &se) || !p.Empty() || len(se.Problems) != 1 || !strings.Contains(se.Problems[0], want) {
+			t.Fatalf("migrate must reject the table (%q): %+v %v", want, p, err)
+		}
+		if _, err := c.CheckDestination(ctx); !errors.As(err, &se) {
+			t.Fatalf("the collector must not deliver into it: %v", err)
+		}
+		r, err := c.CheckConnection(ctx)
+		if err != nil || r.Ready() || r.Issues[0].Kind != KindSchema || !strings.Contains(r.Issues[0].Message, want) {
+			t.Fatalf("doctor must report it: %+v %v", r, err)
+		}
+		// Nothing was created next to it, and the table itself is untouched.
+		if objs := queryOne[tableMeta](t, c, fmt.Sprintf("SELECT name FROM system.tables WHERE database = '%s'", escapeString(c.Database()))); len(objs) != 1 {
+			t.Fatalf("objects were created next to an incompatible table: %+v", objs)
+		}
+		if after := tableMetaOf(t, c, model.TableMessages); after != before {
+			t.Fatalf("the incompatible table was modified:\n%+v\n%+v", before, after)
+		}
+	}
+
+	t.Run("sorting key", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string {
+			return strings.Replace(ddl, "ORDER BY (source_id, conversation_id, message_id)", "ORDER BY (source_id, conversation_id)", 1)
+		})
+		// The defect: 12 messages of one conversation are one row to this table.
+		var rows []any
+		for i := 0; i < 12; i++ {
+			rows = append(rows, model.MessageRow{Scoped: model.Scoped{Envelope: model.Envelope{SourceID: "src", Version: uint64(i + 1)}, ConversationID: "c1",
+				ConversationCreatedAt: model.ParseTime("2026-03-01T09:00:00Z")}, MessageID: fmt.Sprintf("m%d", i), Role: "user"})
+		}
+		if err := c.Insert(ctx, model.TableMessages, rowsBody(t, rows...), "b1"); err != nil {
+			t.Fatal(err)
+		}
+		if n := queryOne[struct {
+			N int `json:"n"`
+		}](t, c, "SELECT count() AS n FROM DB.messages FINAL"); n[0].N != 1 {
+			t.Fatalf("expected the wrong key to collapse the messages (the reproduced defect), got %d rows", n[0].N)
+		}
+		rejected(t, c, "sorting key (ORDER BY) is source_id, conversation_id, expected source_id, conversation_id, message_id")
+	})
+	t.Run("no version", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string {
+			return strings.Replace(ddl, "ReplacingMergeTree(version)", "ReplacingMergeTree", 1)
+		})
+		rejected(t, c, "version argument is none")
+	})
+	t.Run("other version column", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string {
+			return strings.Replace(ddl, "ReplacingMergeTree(version)", "ReplacingMergeTree(updated_at)", 1)
+		})
+		rejected(t, c, "version argument is updated_at")
+	})
+	t.Run("is_deleted", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string {
+			return strings.Replace(ddl, "ReplacingMergeTree(version)", "ReplacingMergeTree(version, streaming)", 1)
+		})
+		rejected(t, c, "version argument is version, streaming")
+	})
+}
+
+// B-2: migrate replaces only views that are positively Vario's own: tagged,
+// or exactly a Vario 0.1 definition. A user's view under one of Vario's
+// names is preserved and reported, even when it reads from a table whose
+// name contains a Vario table name.
+func TestIntegrationViewOwnership(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	admin := &Admin{c}
+	migrateAll(t, c)
+	db := quoteIdent(c.Database())
+	exec := func(q string) {
+		t.Helper()
+		if err := c.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+
+	// Vario 0.1 created its views without a comment. Recreate every view that
+	// way, with the oldest definitions: all are recognized and upgraded.
+	for _, v := range viewDefs(c.Database()) {
+		exec(fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS %s", db, quoteIdent(v.name), v.legacy[len(v.legacy)-1]))
+	}
+	st, err := c.InspectSchema(ctx)
+	if err != nil || len(st.Problems) != 0 || len(st.OutdatedViews) != len(viewDefs(c.Database())) {
+		t.Fatalf("genuine Vario 0.1 views must be recognized: problems %v, outdated %v, %v", st.Problems, st.OutdatedViews, err)
+	}
+	if res := migrateAll(t, c); len(res.Applied) != len(st.OutdatedViews) || len(res.Warnings) != 0 {
+		t.Fatalf("legacy views must be upgraded: %+v", res)
+	}
+	if st, err := c.VerifyMigrated(ctx); err != nil || !st.Complete() {
+		t.Fatalf("after upgrading the legacy views: %+v %v", st, err)
+	}
+	if cols := queryOne[struct {
+		N int `json:"n"`
+	}](t, c, fmt.Sprintf("SELECT count() AS n FROM system.columns WHERE database = '%s' AND table = 'token_usage_daily' AND name = 'usage_scope'", escapeString(c.Database()))); cols[0].N != 1 {
+		t.Fatal("token_usage_daily was not replaced by the current definition")
+	}
+
+	// A user replaces tool_usage with their own view over an archive table.
+	exec(fmt.Sprintf("CREATE TABLE %s.execution_events_archive AS %s.execution_events", db, db))
+	exec(fmt.Sprintf("CREATE OR REPLACE VIEW %[1]s.tool_usage AS SELECT tool_name, count() AS executions FROM %[1]s.execution_events_archive FINAL GROUP BY tool_name", db))
+	before := tableMetaOf(t, c, "tool_usage")
+	if before.Comment != "" || !strings.Contains(before.AsSelect, "execution_events_archive") {
+		t.Fatalf("user view: %+v", before)
+	}
+	var se *SchemaError
+	p, err := admin.PlanSchema(ctx)
+	if !errors.As(err, &se) || !p.Empty() || len(se.Problems) != 1 || !strings.Contains(se.Problems[0], "view tool_usage exists but was not created by Vario") {
+		t.Fatalf("a user-owned view must stop the migration with a clear conflict: %+v %v", p, err)
+	}
+	if res := admin.Apply(ctx, p, nil); len(res.Applied) != 0 {
+		t.Fatalf("nothing may be applied: %+v", res)
+	}
+	if after := tableMetaOf(t, c, "tool_usage"); after != before {
+		t.Fatalf("the user's view was replaced:\n%+v\n%+v", before, after)
+	}
+
+	// Once the user moves their view away, migrate creates Vario's.
+	exec(fmt.Sprintf("RENAME TABLE %[1]s.tool_usage TO %[1]s.my_tool_usage", db))
+	if res := migrateAll(t, c); len(res.Applied) != 1 {
+		t.Fatalf("expected only the missing view to be created: %+v", res)
+	}
+	if st, err := c.VerifyMigrated(ctx); err != nil || !st.Complete() {
+		t.Fatalf("verify: %+v %v", st, err)
+	}
+	if kept := tableMetaOf(t, c, "my_tool_usage"); kept.UUID != before.UUID {
+		t.Fatal("the user's view must survive the migration")
 	}
 }
