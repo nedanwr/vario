@@ -180,6 +180,16 @@ func TestIntegrationProvisioning(t *testing.T) {
 	if err := op.Insert(ctx, model.TableProviderTurns, rowsBody(t, turn(1, u64(5), "complete")), "t1"); err != nil {
 		t.Fatalf("insert as the operational user: %v", err)
 	}
+	// It reads and writes its delivery checkpoint; the metadata stays read-only.
+	if err := op.WriteCheckpoint(ctx, "writer-1", 1); err != nil {
+		t.Fatalf("checkpoint write as the operational user: %v", err)
+	}
+	if seq, found, err := op.ReadCheckpoint(ctx, "writer-1"); err != nil || !found || seq != 1 {
+		t.Fatalf("checkpoint read as the operational user: %d %v %v", seq, found, err)
+	}
+	if err := op.Exec(ctx, fmt.Sprintf("INSERT INTO %s.%s (key, value) VALUES ('destination_id', 'forged')", db, MetaTable)); Classify(err) != KindPermission {
+		t.Fatalf("the operational user must not write the metadata: %v", err)
+	}
 	var cnt []struct {
 		N int `json:"n"`
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/nedanwr/vario/internal/collector"
 	"github.com/nedanwr/vario/internal/config"
 	"github.com/nedanwr/vario/internal/privacy"
 	"github.com/nedanwr/vario/internal/service"
@@ -50,8 +51,10 @@ authentication and schema. It exits with status 1 if any check fails.
 
 Doctor only reads: it checks the operational login (authentication, database
 access, read-only settings, privileges via CHECK GRANT and an insert probe
-that writes no rows), the schema version, and which destination queued data
-belongs to. It never changes ClickHouse.
+that writes no rows), the schema version, which destination queued data
+belongs to, and whether the database still holds the delivery checkpoint the
+collector recorded (a lower one means it was restored to an earlier state).
+It never changes ClickHouse.
 
 --create-schema is deprecated: it runs 'vario migrate', which asks for
 administrative credentials and confirmation.`,
@@ -124,10 +127,11 @@ administrative credentials and confirmation.`,
 			}
 
 			fmt.Fprintln(c.w, "\nLocal state")
+			replaced, rolledBack := false, false
 			if err := os.MkdirAll(cfg.Collector.DataDir, 0o700); err != nil {
 				c.fail("data directory %s is not writable: %v", cfg.Collector.DataDir, err)
 			} else if store, err := spool.OpenReadOnly(statePath(cfg)); err == nil {
-				checkDestinations(ctx, c, cfg, store)
+				replaced, rolledBack = checkDestinations(ctx, c, cfg, store)
 				st, err := store.Stats(ctx)
 				store.Close()
 				if err != nil {
@@ -155,7 +159,7 @@ administrative credentials and confirmation.`,
 				}
 				fmt.Fprintln(c.w)
 			}
-			a.checkClickHouse(ctx, c, cfg)
+			a.checkClickHouse(ctx, c, cfg, replaced, rolledBack)
 
 			if c.failures > 0 {
 				fmt.Fprintf(c.w, "\n%d check(s) failed, %d warning(s)\n", c.failures, c.warnings)
@@ -208,19 +212,37 @@ func (a *app) checkServiceConfig(c *checker, cfg *config.Config) {
 	}
 }
 
-// checkDestinations reports which destination queued data belongs to.
-func checkDestinations(ctx context.Context, c *checker, cfg *config.Config, store *spool.Store) {
+// checkDestinations reports which destination queued data belongs to. It
+// returns whether it reported a detected database replacement or rollback.
+func checkDestinations(ctx context.Context, c *checker, cfg *config.Config, store *spool.Store) (replaced, rolledBack bool) {
 	if store.Legacy() {
 		c.info("local state from an earlier Vario version; the next `vario run` assigns it to the configured destination")
-		return
+		return false, false
 	}
 	active, hasActive, err := store.Active(ctx)
 	if err != nil {
 		c.fail("cannot read destinations: %v", err)
-		return
+		return false, false
 	}
 	configured, hasConfigured, _ := store.Lookup(ctx, cfg.ClickHouse.Endpoint(), cfg.ClickHouse.Database)
+	rep, isReplaced, _ := store.Replaced(ctx)
+	rb, isRolledBack, _ := store.RolledBack(ctx)
 	switch {
+	case isRolledBack && hasConfigured && rb.Destination.ID == configured.ID && !isReplaced:
+		rolledBack = true
+		c.fail("the database of %s was restored to an earlier state (detected %s): it acknowledged delivery checkpoint %d, but held %s", configured, rb.At.Local().Format(time.DateTime), rb.Confirmed, heldCheckpoint(rb.Found))
+		c.hint(fmt.Sprintf("It carries the recorded destination id %s, so rows delivered after that point are missing.", orDash(configured.ServerID)))
+		c.hint(fmt.Sprintf("Delivery is suspended and the collector does not start; %d queued rows are kept in the local spool.", configured.Pending))
+		for _, line := range strings.Split(collector.RollbackRecovery, "\n") {
+			c.hint(line)
+		}
+	case isReplaced && hasConfigured && rep.Destination.ID == configured.ID:
+		replaced = true
+		c.fail("the database of %s was replaced (detected %s): it now carries destination id %s, Vario delivered to %s", configured, rep.At.Local().Format(time.DateTime), rep.Found, configured.ServerID)
+		c.hint(fmt.Sprintf("Delivery is suspended and the collector does not start; %d queued rows are kept in the local spool.", configured.Pending))
+		for _, line := range strings.Split(collector.ReplacedRecovery, "\n") {
+			c.hint(line)
+		}
 	case !hasActive:
 	case hasConfigured && configured.ID == active.ID:
 		c.ok("destination: %s", active)
@@ -233,12 +255,106 @@ func checkDestinations(ctx context.Context, c *checker, cfg *config.Config, stor
 	dests, _ := store.Destinations(ctx)
 	for _, d := range dests {
 		if d.Pending > 0 && (!hasActive || d.ID != active.ID) && (!hasConfigured || d.ID != configured.ID) {
-			c.warn("%d rows are queued for %s, which is not configured (see `vario destination`)", d.Pending, d)
+			c.warn("%d rows are queued for %s, which is not in use; they are not delivered (see `vario destination pending`)", d.Pending, d)
+		}
+	}
+	return replaced, rolledBack
+}
+
+// checkCheckpoint compares the delivery checkpoint the database holds now
+// with the one recorded locally as acknowledged, for the configured
+// destination. Unlike the local state check, it also finds a rollback no
+// collector has seen yet. It only reads. reported says that the local state
+// check already gave the recovery steps.
+func checkCheckpoint(ctx context.Context, c *checker, cfg *config.Config, client *clickhouse.Client, st clickhouse.SchemaStatus, reported bool) {
+	if !st.Usable() {
+		return
+	}
+	var cp spool.Checkpoint
+	recorded := ""
+	if store, err := spool.OpenReadOnly(statePath(cfg)); err == nil {
+		if d, ok, _ := store.Lookup(ctx, cfg.ClickHouse.Endpoint(), cfg.ClickHouse.Database); ok && !store.Legacy() {
+			recorded = d.ServerID
+			cp, _ = store.Checkpoint(ctx, d.ID)
+		}
+		store.Close()
+	}
+	if recorded != "" && st.DestinationID != recorded {
+		return // another or an unverifiable database: reported by the identity check
+	}
+	recovery := func() {
+		if reported {
+			c.hint("See the recovery steps under \"Local state\" above.")
+			return
+		}
+		c.hint("Delivery is refused and queued rows are kept until you decide.")
+		for _, line := range strings.Split(collector.RollbackRecovery, "\n") {
+			c.hint(line)
+		}
+	}
+	switch {
+	case !st.Checkpoints && cp.Confirmed > 0:
+		c.fail("the database has no delivery checkpoint table (%s) that this user can read, but it acknowledged checkpoint %d: it was restored to a state from before the table existed, or the user lost access to it", clickhouse.CheckpointTable, cp.Confirmed)
+		recovery()
+	case !st.Checkpoints:
+		c.warn("the database has no delivery checkpoint table (%s) that this user can use: a database restored to an earlier state (for example from a backup) cannot be detected; run `vario migrate`", clickhouse.CheckpointTable)
+	case cp.Confirmed == 0:
+		c.info("delivery checkpoints are available; the collector writes its first one when it next starts, and detects a database restored to an earlier state from then on")
+	default:
+		found, _, err := client.ReadCheckpoint(ctx, cp.Writer)
+		switch {
+		case err != nil:
+			c.warn("the delivery checkpoint could not be read (%s): %v", clickhouse.Classify(err), err)
+		case found < cp.Confirmed:
+			c.fail("delivery checkpoint: the database acknowledged checkpoint %d, but holds %s: it was restored to an earlier state and lacks rows delivered after that point", cp.Confirmed, heldCheckpoint(found))
+			recovery()
+		default:
+			c.ok("delivery checkpoint %d (acknowledged %s) is held by the database: no rollback detected", cp.Confirmed, cp.At.Local().Format(time.DateTime))
 		}
 	}
 }
 
-func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Config) {
+// checkIdentity compares the destination id the database reports now with
+// the one recorded locally for the configured destination. Unlike the local
+// state check, it also finds a replacement no collector has seen yet.
+// reported says that the local state check already gave the recovery steps.
+func checkIdentity(ctx context.Context, c *checker, cfg *config.Config, st clickhouse.SchemaStatus, reported bool) {
+	if !st.Usable() {
+		return // reported as a schema problem; there is no identity to compare
+	}
+	recorded := ""
+	if store, err := spool.OpenReadOnly(statePath(cfg)); err == nil {
+		if d, ok, _ := store.Lookup(ctx, cfg.ClickHouse.Endpoint(), cfg.ClickHouse.Database); ok && !store.Legacy() {
+			recorded = d.ServerID
+		}
+		store.Close()
+	}
+	found := st.DestinationID
+	switch {
+	case found == "" && recorded != "":
+		c.fail("the database reports no destination id, but Vario recorded %s for it: %s is missing or not readable for this user", recorded, clickhouse.MetaTable)
+		c.hint("The collector delivers nothing while the database cannot be verified; queued rows are kept.")
+		c.hint("Restore read access to the table, or run `vario migrate` if the database was recreated (it then counts as replaced; see `vario destination`).")
+	case found == "":
+		c.warn("the database has no destination id yet (schema from before version 2): a replaced database cannot be detected; run `vario migrate` to record one")
+	case recorded == "":
+		c.ok("destination id %s", found)
+	case recorded == found:
+		c.ok("destination id %s (the database Vario delivered to before)", found)
+	default:
+		c.fail("destination id %s does not match %s, which Vario recorded for this destination: the database was replaced", found, recorded)
+		if reported {
+			c.hint("See the recovery steps under \"Local state\" above.")
+			return
+		}
+		c.hint("Delivery is refused and queued rows are kept until you decide.")
+		for _, line := range strings.Split(collector.ReplacedRecovery, "\n") {
+			c.hint(line)
+		}
+	}
+}
+
+func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Config, replaced, rolledBack bool) {
 	u, _ := url.Parse(cfg.ClickHouse.URL)
 	switch {
 	case u.Scheme == "https":
@@ -307,7 +423,6 @@ func (a *app) checkClickHouse(ctx context.Context, c *checker, cfg *config.Confi
 	if rep.Schema.DatabaseExists && rep.Schema.Usable() && !rep.Schema.Complete() && !rep.Schema.Newer() {
 		c.info("run `vario migrate` to update the schema")
 	}
-	if rep.Schema.DestinationID != "" {
-		c.ok("destination id %s", rep.Schema.DestinationID)
-	}
+	checkIdentity(ctx, c, cfg, rep.Schema, replaced)
+	checkCheckpoint(cctx, c, cfg, client, rep.Schema, rolledBack)
 }

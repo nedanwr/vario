@@ -40,12 +40,16 @@ func TestCheckConnection(t *testing.T) {
 	if r, _ = c.CheckConnection(bg); r.Ready() || r.Issues[0].Kind != KindDatabaseMissing {
 		t.Fatalf("missing database: %+v", r.Issues)
 	}
-	// Complete schema: INSERT on every table and SELECT on vario_meta are checked; the probe passes.
+	// Complete schema: INSERT on every table, SELECT on vario_meta and both on
+	// vario_checkpoints are checked; the probe passes and covers the checkpoints.
 	f.dbExists = true
 	f.tables, f.columns, f.meta = completeSchema("vario")
 	r, err = c.CheckConnection(bg)
-	if err != nil || !r.Ready() || !r.Schema.Complete() || r.Probe != "ok" || len(r.Privileges) != len(model.Tables)+1 {
+	if err != nil || !r.Ready() || !r.Schema.Complete() || r.Probe != "ok" || len(r.Privileges) != len(model.Tables)+3 {
 		t.Fatalf("complete schema: %+v %v", r, err)
+	}
+	if !strings.Contains(f.probeParams.Get("query"), CheckpointTable) {
+		t.Fatalf("the insert probe must cover the checkpoint table: %v", f.probeParams)
 	}
 	if r.Schema.DestinationID == "" || r.Schema.Recorded != SchemaVersion || len(r.Warnings) != 0 {
 		t.Fatalf("metadata: %+v", r.Schema)
@@ -150,9 +154,17 @@ func TestCheckDestinationIsReadOnly(t *testing.T) {
 	}
 	f.tables, f.columns, f.meta = completeSchema("vario")
 	info, err = c.CheckDestination(bg)
-	if err != nil || info.ServerID != "11111111-2222-4333-8444-555555555555" || info.Version != 2 || len(info.Warnings) != 0 {
+	if err != nil || info.ServerID != "11111111-2222-4333-8444-555555555555" || info.Version != 3 || !info.Checkpoints || len(info.Warnings) != 0 {
 		t.Fatalf("complete schema: %+v %v", info, err)
 	}
+	// A database migrated before delivery checkpoints existed stays usable:
+	// it is reported as behind, without checkpoints, and nothing is created.
+	f.tables, f.columns, f.meta = v2Schema("vario")
+	info, err = c.CheckDestination(bg)
+	if err != nil || info.ServerID == "" || info.Version != 2 || info.Checkpoints || len(info.Warnings) != 1 || !strings.Contains(info.Warnings[0], "vario migrate") {
+		t.Fatalf("version 2 schema: %+v %v", info, err)
+	}
+	f.tables, f.columns, f.meta = completeSchema("vario")
 	f.meta = append(f.meta, "schema_version|7")
 	if info, err = c.CheckDestination(bg); err != nil || len(info.Warnings) != 1 {
 		t.Fatalf("newer schema: %+v %v", info, err)
@@ -177,7 +189,7 @@ func TestPlanSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(p.Steps); n != len(model.Tables)+2+len(viewDefs("vario"))+1 || p.Has(StepDatabase) || kinds(p)[StepSchema] != n {
+	if n := len(p.Steps); n != len(model.Tables)+3+len(viewDefs("vario"))+1 || p.Has(StepDatabase) || kinds(p)[StepSchema] != n {
 		t.Fatalf("empty database plan: %d steps %+v", n, kinds(p))
 	}
 	last := p.Steps[len(p.Steps)-1]
@@ -195,11 +207,24 @@ func TestPlanSchema(t *testing.T) {
 		t.Fatalf("missing database: %+v", p.Steps[0])
 	}
 	f.dbExists = true
-	// Legacy schema: only the additive version 2 steps.
+	// Legacy schema: only the additive version 2 and 3 steps.
 	f.tables, f.columns = legacySchema("vario")
 	p, _ = c.PlanSchema(bg)
-	if len(p.Steps) != 3 || !strings.Contains(p.Steps[0].SQL, MetaTable) || !strings.Contains(p.Steps[1].SQL, "destination_id") {
+	if len(p.Steps) != 4 || !strings.Contains(p.Steps[0].SQL, MetaTable) || !strings.Contains(p.Steps[1].SQL, CheckpointTable) || !strings.Contains(p.Steps[2].SQL, "destination_id") {
 		t.Fatalf("legacy upgrade plan: %+v", p.Steps)
+	}
+	// Version 2 schema: the checkpoint table and the version, nothing else.
+	// The destination id is kept, so the database stays the same destination.
+	f.tables, f.columns, f.meta = v2Schema("vario")
+	p, _ = c.PlanSchema(bg)
+	if len(p.Steps) != 2 || !strings.HasPrefix(p.Steps[0].SQL, "CREATE TABLE IF NOT EXISTS `vario`.`"+CheckpointTable+"`") ||
+		!strings.Contains(p.Steps[0].SQL, "ReplacingMergeTree(seq)") || !strings.Contains(p.Steps[1].SQL, "'schema_version', '3'") {
+		t.Fatalf("version 2 upgrade plan: %+v", p.Steps)
+	}
+	// A table with that name that Vario did not create is never used.
+	f.tables = append(f.tables, CheckpointTable+"|MergeTree||")
+	if _, err := c.PlanSchema(bg); err == nil || !strings.Contains(err.Error(), CheckpointTable+" exists but was not created by Vario") {
+		t.Fatalf("foreign checkpoint table: %v", err)
 	}
 	// Up to date: nothing.
 	f.tables, f.columns, f.meta = completeSchema("vario")
@@ -227,7 +252,7 @@ func TestPlanSchema(t *testing.T) {
 	}
 	// A schema from a newer Vario is not touched.
 	f.tables, f.columns, f.meta = completeSchema("vario")
-	f.meta = append(f.meta, "schema_version|3")
+	f.meta = append(f.meta, "schema_version|4")
 	if _, err = c.PlanSchema(bg); !errors.Is(err, ErrSchemaNewer) {
 		t.Fatalf("newer schema: %v", err)
 	}
@@ -288,8 +313,14 @@ func TestRecordVersionRequiresCompleteTables(t *testing.T) {
 	if _, err := recordVersion(bg, admin); err != nil {
 		t.Fatal(err)
 	}
-	if m := f.mutations(); len(m) != 1 || !strings.Contains(m[0], "'schema_version', '2'") {
+	if m := f.mutations(); len(m) != 1 || !strings.Contains(m[0], "'schema_version', '3'") {
 		t.Fatalf("version insert: %v", m)
+	}
+	// Version 3 promises the checkpoint table: it is not recorded without it.
+	f.execs = nil
+	f.tables, f.columns, f.meta = v2Schema("vario")
+	if _, err := recordVersion(bg, admin); err == nil || len(f.mutations()) != 0 {
+		t.Fatalf("the version must not be recorded without the checkpoint table: %v %v", err, f.mutations())
 	}
 }
 
@@ -320,25 +351,35 @@ func setTable(f *fakeServer, name, row string) {
 	f.tables = append(f.tables, row)
 }
 
-// B-1: a table with Vario's column names and types but another sorting key
-// or version argument does not deduplicate the way Vario relies on (12
-// messages of one conversation collapsed into one row under ORDER BY
-// (source_id, conversation_id)). It is an incompatible schema for the
+// B-1: a table with Vario's column names and types but another sorting key,
+// partition key or version argument does not deduplicate the way Vario relies
+// on (12 messages of one conversation collapsed into one row under ORDER BY
+// (source_id, conversation_id); versions of one message kept in different
+// partitions are never merged). It is an incompatible schema for the
 // collector, doctor and migrate alike, and is never modified.
 func TestSortingKeyAndVersionAreVerified(t *testing.T) {
 	const rmt = "ReplacingMergeTree(version)"
+	msgKey, msgPart := sortingKeys["messages"], partitionKeys["messages"]
 	cases := []struct {
 		name, row, want string
 	}{
-		{"shorter key", tableRow("messages", rmt, "source_id, conversation_id"),
+		{"shorter key", tableRow("messages", rmt, "source_id, conversation_id", msgPart),
 			"table messages: sorting key (ORDER BY) is source_id, conversation_id, expected source_id, conversation_id, message_id"},
-		{"reordered key", tableRow("messages", rmt, "source_id, message_id, conversation_id"), "sorting key"},
-		{"longer key", tableRow("messages", rmt, "source_id, conversation_id, message_id, version"), "sorting key"},
-		{"single column", tableRow("sources", rmt, "host_name"), "table sources: sorting key (ORDER BY) is host_name, expected source_id"},
+		{"reordered key", tableRow("messages", rmt, "source_id, message_id, conversation_id", msgPart), "sorting key"},
+		{"longer key", tableRow("messages", rmt, "source_id, conversation_id, message_id, version", msgPart), "sorting key"},
+		{"single column", tableRow("sources", rmt, "host_name", ""), "table sources: sorting key (ORDER BY) is host_name, expected source_id"},
 		{"no key reported", "messages|ReplacingMergeTree|||", "sorting key (ORDER BY) is empty"},
-		{"no version", tableRow("messages", "ReplacingMergeTree", sortingKeys["messages"]), "version argument is none, expected version"},
-		{"other version column", tableRow("messages", "ReplacingMergeTree(ingested_at)", sortingKeys["messages"]), "version argument is ingested_at, expected version"},
-		{"is_deleted", tableRow("messages", "ReplacingMergeTree(version, streaming)", sortingKeys["messages"]), "version argument is version, streaming"},
+		{"no version", tableRow("messages", "ReplacingMergeTree", msgKey, msgPart), "version argument is none, expected version"},
+		{"other version column", tableRow("messages", "ReplacingMergeTree(ingested_at)", msgKey, msgPart), "version argument is ingested_at, expected version"},
+		{"no partition key", tableRow("messages", rmt, msgKey, ""),
+			"table messages: partition key (PARTITION BY) is none, expected toYYYYMM(conversation_created_at)"},
+		{"explicitly unpartitioned", tableRow("messages", rmt, msgKey, "tuple()"), "partition key (PARTITION BY) is none, expected toYYYYMM(conversation_created_at)"},
+		{"mutable partition column", tableRow("messages", rmt, msgKey, "toYYYYMM(updated_at)"),
+			"partition key (PARTITION BY) is toYYYYMM(updated_at), expected toYYYYMM(conversation_created_at)"},
+		{"other granularity", tableRow("messages", rmt, msgKey, "toYYYYMMDD(conversation_created_at)"), "partition key (PARTITION BY) is toYYYYMMDD(conversation_created_at)"},
+		{"composite partition key", tableRow("messages", rmt, msgKey, "(source_id, toYYYYMM(conversation_created_at))"), "partition key"},
+		{"partitioned sources", tableRow("sources", rmt, "source_id", "source_kind"), "table sources: partition key (PARTITION BY) is source_kind, expected none"},
+		{"is_deleted", tableRow("messages", "ReplacingMergeTree(version, streaming)", msgKey, msgPart), "version argument is version, streaming"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -369,14 +410,18 @@ func TestSortingKeyAndVersionAreVerified(t *testing.T) {
 	}
 
 	// Replicated and shared engines put the path and replica first; quoting
-	// and spacing of the key do not matter.
+	// and spacing of the keys do not matter, and PARTITION BY tuple() is the
+	// same as no partitioning.
 	f, srv := newFake(t)
 	c := testClient(t, srv.URL)
 	f.tables, f.columns, f.meta = completeSchema("vario")
 	setTable(f, "messages", "messages|SharedReplacingMergeTree|||`source_id`,conversation_id,  message_id|"+
-		"SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) ORDER BY (source_id, conversation_id, message_id)")
+		"SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) PARTITION BY toYYYYMM(conversation_created_at) ORDER BY (source_id, conversation_id, message_id)|"+
+		"toYYYYMM( `conversation_created_at` )")
 	setTable(f, "runs", "runs|ReplicatedReplacingMergeTree|||source_id, conversation_id, run_id|"+
-		"ReplicatedReplacingMergeTree('/ch/it\\'s(1),x', 'r1', version) ORDER BY (source_id, conversation_id, run_id)")
+		"ReplicatedReplacingMergeTree('/ch/it\\'s(1),x', 'r1', version) PARTITION BY toYYYYMM(conversation_created_at) ORDER BY (source_id, conversation_id, run_id)|"+
+		"toYYYYMM(conversation_created_at)")
+	setTable(f, "sources", tableRow("sources", rmt, "source_id", "tuple()"))
 	if st, err := c.InspectSchema(bg); err != nil || !st.Complete() {
 		t.Fatalf("equivalent engines must be accepted: %+v %v", st.Problems, err)
 	}

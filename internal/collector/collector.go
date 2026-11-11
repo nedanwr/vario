@@ -23,10 +23,17 @@ import (
 // the operational user. The collector never changes the destination's
 // schema, users or privileges: CheckDestination only reads, and a missing or
 // incompatible schema stops delivery (data stays spooled) until it is fixed
-// with `vario migrate`.
+// with `vario migrate`. Besides the rows themselves, the collector only
+// writes its delivery checkpoint (ReadCheckpoint, WriteCheckpoint), which is
+// what reveals a database that was restored to an earlier state.
 type Sink interface {
 	CheckDestination(ctx context.Context) (clickhouse.DestinationInfo, error)
 	Insert(ctx context.Context, table string, gzBody []byte, token string) error
+	// ReadCheckpoint returns the highest checkpoint the database holds for writer.
+	ReadCheckpoint(ctx context.Context, writer string) (seq uint64, found bool, err error)
+	// WriteCheckpoint inserts checkpoint seq for writer; a nil error means
+	// the database acknowledged it.
+	WriteCheckpoint(ctx context.Context, writer string, seq uint64) error
 }
 
 type Options struct {
@@ -57,6 +64,10 @@ type Collector struct {
 	schemaReady bool
 	checkedAt   time.Time
 	checkFailed bool
+	// checkpoints is set by the destination check when the database has the
+	// checkpoint table: delivered rows are then acknowledged only under a
+	// checkpoint (see confirmDelivered).
+	checkpoints bool
 	// dest is the destination selected by Prepare.
 	dest   spool.Destination
 	warned map[string]bool

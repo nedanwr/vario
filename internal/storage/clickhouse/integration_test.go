@@ -362,6 +362,86 @@ func TestIntegrationSortingKeyAndVersion(t *testing.T) {
 		})
 		rejected(t, c, "version argument is version, streaming")
 	})
+	const partition = "PARTITION BY toYYYYMM(conversation_created_at)\n"
+	t.Run("partition key", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string {
+			return strings.Replace(ddl, partition, "PARTITION BY toYYYYMM(updated_at)\n", 1)
+		})
+		// The defect: an update in a later month lands in another partition,
+		// and merges never cross partitions, so the old version stays forever.
+		for i, updated := range []string{"2026-03-31T23:00:00Z", "2026-04-01T01:00:00Z"} {
+			row := model.MessageRow{Scoped: model.Scoped{Envelope: model.Envelope{SourceID: "src", Version: uint64(i + 1)}, ConversationID: "c1",
+				ConversationCreatedAt: model.ParseTime("2026-03-01T09:00:00Z")}, MessageID: "m1", Role: "user", UpdatedAt: model.ParseTime(updated)}
+			if err := c.Insert(ctx, model.TableMessages, rowsBody(t, row), fmt.Sprintf("p%d", i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := c.Exec(ctx, "OPTIMIZE TABLE "+quoteIdent(c.Database())+".messages FINAL"); err != nil {
+			t.Fatal(err)
+		}
+		if n := queryOne[struct {
+			N int `json:"n"`
+		}](t, c, "SELECT count() AS n FROM DB.messages"); n[0].N != 2 {
+			t.Fatalf("expected both versions to survive a full merge under the wrong partition key (the reproduced defect), got %d rows", n[0].N)
+		}
+		rejected(t, c, "partition key (PARTITION BY) is toYYYYMM(updated_at), expected toYYYYMM(conversation_created_at)")
+	})
+	t.Run("no partition key", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string { return strings.Replace(ddl, partition, "", 1) })
+		rejected(t, c, "partition key (PARTITION BY) is none, expected toYYYYMM(conversation_created_at)")
+	})
+	t.Run("other partition granularity", func(t *testing.T) {
+		c := prepare(t, func(ddl string) string {
+			return strings.Replace(ddl, partition, "PARTITION BY toYYYYMMDD(conversation_created_at)\n", 1)
+		})
+		rejected(t, c, "partition key (PARTITION BY) is toYYYYMMDD(conversation_created_at)")
+	})
+}
+
+// B-1: the schema Vario creates passes its own check on a real server, whose
+// system.tables reports exactly the partition and sorting keys the unit
+// tests assume. Equivalent spellings (an explicit PARTITION BY tuple() for
+// an unpartitioned table) are accepted and completed, never altered.
+func TestIntegrationPartitionKeysAsReported(t *testing.T) {
+	ctx := context.Background()
+	c := integrationClient(t)
+	if err := c.Exec(ctx, CreateDatabaseStep(c.Database()).SQL); err != nil {
+		t.Fatal(err)
+	}
+	// sources is created by hand with an explicit empty partition key.
+	ddl := tableDDL(c.Database())[model.TableSources]
+	byHand := strings.Replace(ddl, "ORDER BY source_id\n", "PARTITION BY tuple()\nORDER BY source_id\n", 1)
+	if byHand == ddl {
+		t.Fatal("the DDL was not rewritten")
+	}
+	if err := c.Exec(ctx, byHand); err != nil {
+		t.Fatal(err)
+	}
+	before := tableMetaOf(t, c, model.TableSources)
+	migrateAll(t, c)
+	if st, err := c.VerifyMigrated(ctx); err != nil || !st.Complete() {
+		t.Fatalf("verify: %+v %v", st, err)
+	}
+	if _, err := c.CheckDestination(ctx); err != nil {
+		t.Fatalf("the collector must accept the schema: %v", err)
+	}
+	if after := tableMetaOf(t, c, model.TableSources); after != before {
+		t.Fatalf("the existing table was modified:\n%+v\n%+v", before, after)
+	}
+	type keys struct {
+		Name      string `json:"name"`
+		Partition string `json:"partition_key"`
+		Sorting   string `json:"sorting_key"`
+	}
+	rows := queryOne[keys](t, c, fmt.Sprintf("SELECT name, partition_key, sorting_key FROM system.tables WHERE database = '%s' AND engine LIKE '%%ReplacingMergeTree' AND name != '%s'", escapeString(c.Database()), CheckpointTable))
+	if len(rows) != len(model.Tables) {
+		t.Fatalf("tables: %+v", rows)
+	}
+	for _, r := range rows {
+		if normalizePartitionKey(r.Partition) != partitionKeys[r.Name] || r.Sorting != sortingKeys[r.Name] {
+			t.Errorf("%s: ClickHouse reports partition key %q and sorting key %q, the tests assume %q and %q", r.Name, r.Partition, r.Sorting, partitionKeys[r.Name], sortingKeys[r.Name])
+		}
+	}
 }
 
 // B-2: migrate replaces only views that are positively Vario's own: tagged,
@@ -431,5 +511,83 @@ func TestIntegrationViewOwnership(t *testing.T) {
 	}
 	if kept := tableMetaOf(t, c, "my_tool_usage"); kept.UUID != before.UUID {
 		t.Fatal("the user's view must survive the migration")
+	}
+}
+
+// The delivery checkpoint table on a real server: created by the migration,
+// one logical row per writer that holds the highest number, readable with
+// the consistency setting, and a version 2 database gets it without anything
+// else changing.
+func TestIntegrationCheckpointTable(t *testing.T) {
+	ctx := context.Background()
+	c := integrationClient(t)
+	migrateAll(t, c)
+	info, err := c.CheckDestination(ctx)
+	if err != nil || !info.Checkpoints || info.Version != SchemaVersion || len(info.Warnings) != 0 {
+		t.Fatalf("migrated schema: %+v %v", info, err)
+	}
+	if seq, found, err := c.ReadCheckpoint(ctx, "w1"); err != nil || found || seq != 0 {
+		t.Fatalf("no checkpoint yet: %d %v %v", seq, found, err)
+	}
+	for _, seq := range []uint64{1, 2, 7, 5} {
+		if err := c.WriteCheckpoint(ctx, "w1", seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The same number twice is two inserts, not a deduplicated one.
+	for i := 0; i < 2; i++ {
+		if err := c.WriteCheckpoint(ctx, "w'2", 3); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if seq, found, err := c.ReadCheckpoint(ctx, "w1"); err != nil || !found || seq != 7 {
+		t.Fatalf("checkpoint of w1: %d %v %v", seq, found, err)
+	}
+	if seq, found, err := c.ReadCheckpoint(ctx, "w'2"); err != nil || !found || seq != 3 {
+		t.Fatalf("checkpoint of a writer with a quote in its id: %d %v %v", seq, found, err)
+	}
+	type count struct {
+		N int `json:"n"`
+	}
+	table := quoteIdent(c.Database()) + "." + quoteIdent(CheckpointTable)
+	// Merges keep one row per writer, the highest: the table stays small.
+	if err := c.Exec(ctx, "OPTIMIZE TABLE "+table+" FINAL"); err != nil {
+		t.Fatal(err)
+	}
+	if n := queryOne[count](t, c, "SELECT count() AS n FROM "+table); n[0].N != 2 {
+		t.Fatalf("after merging: %+v", n)
+	}
+	if seq, _, err := c.ReadCheckpoint(ctx, "w1"); err != nil || seq != 7 {
+		t.Fatalf("after merging: %d %v", seq, err)
+	}
+
+	// A database as a Vario version before checkpoints left it.
+	id := info.ServerID
+	meta := quoteIdent(c.Database()) + "." + quoteIdent(MetaTable)
+	for _, q := range []string{"DROP TABLE " + table, "TRUNCATE TABLE " + meta,
+		fmt.Sprintf("INSERT INTO %s (key, value) VALUES ('destination_id', '%s'), ('schema_version', '2')", meta, id)} {
+		if err := c.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	info, err = c.CheckDestination(ctx)
+	if err != nil || info.Checkpoints || info.Version != 2 || info.ServerID != id || len(info.Warnings) != 1 {
+		t.Fatalf("version 2 schema: %+v %v", info, err)
+	}
+	var e *Error
+	if _, _, err := c.ReadCheckpoint(ctx, "w1"); !errors.As(err, &e) || e.Code != 60 {
+		t.Fatalf("a missing table must be an error, not \"no checkpoint\": %v", err)
+	}
+	p, err := c.PlanSchema(ctx)
+	if err != nil || len(p.Steps) != 2 || !strings.Contains(p.Steps[0].SQL, CheckpointTable) {
+		t.Fatalf("plan from version 2: %+v %v", p, err)
+	}
+	migrateAll(t, c)
+	st, err := c.VerifyMigrated(ctx)
+	if err != nil || !st.Complete() || st.DestinationID != id || st.Recorded != SchemaVersion {
+		t.Fatalf("migrated from version 2: %+v %v", st, err)
+	}
+	if seq, found, err := c.ReadCheckpoint(ctx, "w1"); err != nil || found || seq != 0 {
+		t.Fatalf("the new table is empty: %d %v %v", seq, found, err)
 	}
 }

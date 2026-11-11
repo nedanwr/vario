@@ -33,10 +33,102 @@ type fakeSink struct {
 	schemaCalls int
 	schemaErr   error  // returned by CheckDestination
 	serverID    string // destination id reported by CheckDestination
+	failTable   string // inserts into this table fail with failErr
+
+	// Delivery checkpoints (the vario_checkpoints table).
+	noCheckpoints bool              // the table does not exist (schema before version 3)
+	checkpoints   map[string]uint64 // writer -> highest sequence number
+	cpReads       int
+	cpWrites      int
+	cpReadErr     error  // returned by ReadCheckpoint
+	cpWriteErr    error  // returned by WriteCheckpoint; nothing is written
+	cpAmbiguous   int    // the next n checkpoint writes are stored but reported as failed
+	beforeCPRead  func() // called (unlocked) at the start of ReadCheckpoint
+	ambiguousData int    // the next n inserts are stored but reported as failed
 }
 
 func newSink() *fakeSink {
-	return &fakeSink{rows: map[string][]map[string]any{}, tokens: map[string]bool{}}
+	return &fakeSink{rows: map[string][]map[string]any{}, tokens: map[string]bool{}, checkpoints: map[string]uint64{}}
+}
+
+var errLostResponse = &clickhouse.Error{Message: "read: connection reset by peer", Transient: true}
+
+func (s *fakeSink) ReadCheckpoint(_ context.Context, writer string) (uint64, bool, error) {
+	if f := s.beforeCPRead; f != nil {
+		f()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cpReads++
+	if s.cpReadErr != nil {
+		return 0, false, s.cpReadErr
+	}
+	if s.noCheckpoints {
+		return 0, false, &clickhouse.Error{Status: 404, Code: 60, Message: "Unknown table vario_checkpoints"}
+	}
+	seq, ok := s.checkpoints[writer]
+	return seq, ok, nil
+}
+
+func (s *fakeSink) WriteCheckpoint(_ context.Context, writer string, seq uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cpWrites++
+	if s.cpWriteErr != nil {
+		return s.cpWriteErr
+	}
+	if s.noCheckpoints {
+		return &clickhouse.Error{Status: 404, Code: 60, Message: "Unknown table vario_checkpoints"}
+	}
+	if seq > s.checkpoints[writer] { // ReplacingMergeTree(seq) read with max(seq)
+		s.checkpoints[writer] = seq
+	}
+	if s.cpAmbiguous > 0 {
+		s.cpAmbiguous--
+		return errLostResponse
+	}
+	return nil
+}
+
+// sinkBackup is a copy of everything the fake database holds.
+type sinkBackup struct {
+	rows        map[string][]map[string]any
+	tokens      map[string]bool
+	checkpoints map[string]uint64
+}
+
+// backup copies the database, as BACKUP DATABASE would.
+func (s *fakeSink) backup() sinkBackup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := sinkBackup{rows: map[string][]map[string]any{}, tokens: map[string]bool{}, checkpoints: map[string]uint64{}}
+	for t, rs := range s.rows {
+		b.rows[t] = append([]map[string]any(nil), rs...)
+	}
+	for k, v := range s.tokens {
+		b.tokens[k] = v
+	}
+	for k, v := range s.checkpoints {
+		b.checkpoints[k] = v
+	}
+	return b
+}
+
+// restore replaces the database with a backup, as DROP DATABASE and RESTORE
+// DATABASE would. The destination id is part of the database and stays.
+func (s *fakeSink) restore(b sinkBackup) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rows, s.tokens, s.checkpoints = map[string][]map[string]any{}, map[string]bool{}, map[string]uint64{}
+	for t, rs := range b.rows {
+		s.rows[t] = append([]map[string]any(nil), rs...)
+	}
+	for k, v := range b.tokens {
+		s.tokens[k] = v
+	}
+	for k, v := range b.checkpoints {
+		s.checkpoints[k] = v
+	}
 }
 
 func (s *fakeSink) CheckDestination(context.Context) (clickhouse.DestinationInfo, error) {
@@ -46,7 +138,10 @@ func (s *fakeSink) CheckDestination(context.Context) (clickhouse.DestinationInfo
 	if s.schemaErr != nil {
 		return clickhouse.DestinationInfo{}, s.schemaErr
 	}
-	return clickhouse.DestinationInfo{ServerID: s.serverID, Version: 2}, nil
+	if s.noCheckpoints {
+		return clickhouse.DestinationInfo{ServerID: s.serverID, Version: 2}, nil
+	}
+	return clickhouse.DestinationInfo{ServerID: s.serverID, Version: 3, Checkpoints: true}, nil
 }
 
 func (s *fakeSink) Insert(_ context.Context, table string, body []byte, token string) error {
@@ -55,6 +150,14 @@ func (s *fakeSink) Insert(_ context.Context, table string, body []byte, token st
 	if s.failNext > 0 {
 		s.failNext--
 		return s.failErr
+	}
+	if s.failTable != "" && s.failTable == table {
+		return s.failErr
+	}
+	lost := false
+	if s.ambiguousData > 0 {
+		s.ambiguousData--
+		lost = true
 	}
 	if s.tokens[token] {
 		return nil
@@ -73,6 +176,9 @@ func (s *fakeSink) Insert(_ context.Context, table string, body []byte, token st
 			return err
 		}
 		s.rows[table] = append(s.rows[table], m)
+	}
+	if lost {
+		return errLostResponse
 	}
 	return nil
 }
@@ -106,7 +212,10 @@ type harness struct {
 	opts  Options
 }
 
-func setup(t *testing.T) *harness {
+func setup(t *testing.T) *harness { return setupSink(t, newSink()) }
+
+// setupSink is setup with a sink prepared by the caller.
+func setupSink(t *testing.T, sink *fakeSink) *harness {
 	t.Helper()
 	fix := t3codetest.New(t)
 	fix.Standard()
@@ -124,7 +233,6 @@ func setup(t *testing.T) *harness {
 	t.Cleanup(func() { store.Close() })
 	src := t3code.New(fix.Path, pol, 3)
 	t.Cleanup(func() { src.Close() })
-	sink := newSink()
 	h := &harness{fix: fix, store: store, sink: sink, src: src, opts: Options{
 		PollInterval: 20 * time.Millisecond, ReconcileInterval: time.Hour, BatchSize: 4,
 		FlushInterval: 20 * time.Millisecond, MaxInsertRows: 7, RetryInitial: 10 * time.Millisecond, RetryMax: 50 * time.Millisecond,

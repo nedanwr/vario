@@ -1,6 +1,7 @@
 package spool
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -295,5 +296,194 @@ func TestResolveByServerID(t *testing.T) {
 	old, _, _ := s.Destination(ctx, first)
 	if old.Retired.IsZero() {
 		t.Fatal("the replaced destination must be retired")
+	}
+}
+
+// C-2: a detected database replacement is remembered for status and doctor
+// without changing the destination, and stops applying once the original
+// database is back or the replacement was accepted with a switch.
+func TestReplacementIsRememberedUntilResolved(t *testing.T) {
+	s, _ := open(t, 0)
+	id := s.Selected()
+	if _, ok, err := s.Replaced(ctx); err != nil || ok {
+		t.Fatalf("nothing detected yet: %v %v", ok, err)
+	}
+	if err := s.BindServerID(ctx, id, "id-1"); err != nil {
+		t.Fatal(err)
+	}
+	// A database without an id where one is recorded cannot be verified, and
+	// the recorded id is kept.
+	if err := s.BindServerID(ctx, id, ""); !errors.Is(err, ErrIdentityMissing) {
+		t.Fatalf("a lost destination id must be reported: %v", err)
+	}
+	if d, _, _ := s.Destination(ctx, id); d.ServerID != "id-1" {
+		t.Fatalf("the recorded id must be kept: %+v", d)
+	}
+
+	if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1)}, nil, CommitOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkReplaced(ctx, id, "id-2"); err != nil {
+		t.Fatal(err)
+	}
+	rep, ok, err := s.Replaced(ctx)
+	if err != nil || !ok || rep.Destination.ID != id || rep.Destination.ServerID != "id-1" || rep.Found != "id-2" || rep.Destination.Pending != 1 || rep.At.IsZero() {
+		t.Fatalf("replacement: %+v %v %v", rep, ok, err)
+	}
+	// Detecting it again (every refused start does) keeps the first time.
+	time.Sleep(5 * time.Millisecond)
+	if err := s.MarkReplaced(ctx, id, "id-2"); err != nil {
+		t.Fatal(err)
+	}
+	if again, _, _ := s.Replaced(ctx); !again.At.Equal(rep.At) {
+		t.Fatalf("the time of the first detection must be kept: %v, then %v", rep.At, again.At)
+	}
+	// Read-only access (status, doctor) sees it too.
+	ro, err := OpenReadOnly(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := ro.Replaced(ctx); err != nil || !ok || got.Found != "id-2" {
+		t.Fatalf("read-only: %+v %v %v", got, ok, err)
+	}
+	ro.Close()
+
+	// The original database is back.
+	if err := s.ClearReplaced(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Replaced(ctx); ok {
+		t.Fatal("a cleared replacement must not be reported")
+	}
+
+	// Accepted with a switch: the old destination is retired, which resolves
+	// the report, and its queued rows are still there.
+	if err := s.MarkReplaced(ctx, id, "id-2"); err != nil {
+		t.Fatal(err)
+	}
+	nd, err := s.Replace(ctx, id, "id-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.Replaced(ctx); ok {
+		t.Fatal("a switch must resolve the replacement")
+	}
+	if old, _, _ := s.Destination(ctx, id); old.Pending != 1 || old.ServerID != "id-1" {
+		t.Fatalf("the replaced destination keeps its rows and id: %+v", old)
+	}
+	if nd.Cursors != 0 || nd.Pending != 0 {
+		t.Fatalf("the new destination starts empty: %+v", nd)
+	}
+}
+
+// Rows kept for a replaced destination (`destination switch --keep-pending`)
+// stay bound to it across restarts, and can be moved to the active
+// destination or discarded later: atomically, once, and never into a
+// destination that could not deliver them.
+func TestRetainedRowsCanBeMovedOrDiscardedLater(t *testing.T) {
+	for _, mode := range []string{"move", "discard"} {
+		t.Run(mode, func(t *testing.T) {
+			s, path := open(t, 0)
+			a := s.Selected()
+			if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1), raw(1)}, ptr("ca"), CommitOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			// The database is replaced and the rows are kept.
+			repl, err := s.Replace(ctx, a, "id-B")
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := repl.ID
+			if err := s.Activate(ctx, b); err != nil {
+				t.Fatal(err)
+			}
+			s.SelectDestination(b)
+			if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "a", 1)}, ptr("cb"), CommitOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			kept := func(s *Store) Destination {
+				t.Helper()
+				d, ok, err := s.Destination(ctx, a)
+				if err != nil || !ok {
+					t.Fatalf("destination: %v %v", ok, err)
+				}
+				return d
+			}
+			if d := kept(s); d.Pending != 2 || d.Cursors != 1 || d.Retired.IsZero() {
+				t.Fatalf("kept rows: %+v", d)
+			}
+
+			// Never into a replaced or unknown destination.
+			if _, err := s.MovePending(ctx, b, 999); err == nil {
+				t.Fatal("moving rows to an unknown destination must fail")
+			}
+			if _, err := s.MovePending(ctx, b, a); err == nil {
+				t.Fatal("moving rows to a replaced destination must fail")
+			}
+			if due, _ := s.Due(ctx, time.Now(), 100); len(due) != 1 {
+				t.Fatalf("a refused move must change nothing: %d entries due", len(due))
+			}
+			// An interrupted operation changes nothing.
+			cctx, cancel := context.WithCancel(ctx)
+			cancel()
+			if mode == "move" {
+				_, err = s.MovePending(cctx, a, b)
+			} else {
+				_, err = s.DiscardPending(cctx, a)
+			}
+			if err == nil {
+				t.Fatal("a cancelled operation must fail")
+			}
+			if d := kept(s); d.Pending != 2 || d.Cursors != 1 {
+				t.Fatalf("an interrupted %s must change nothing: %+v", mode, d)
+			}
+
+			// A restart keeps the rows where they are.
+			s.Close()
+			s, err = Open(path, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			s.SelectDestination(b)
+			if d := kept(s); d.Pending != 2 || d.Cursors != 1 {
+				t.Fatalf("after a restart: %+v", d)
+			}
+			if due, _ := s.Due(ctx, time.Now(), 100); len(due) != 1 {
+				t.Fatalf("kept rows must not be due for the active destination: %d entries", len(due))
+			}
+
+			var n int64
+			if mode == "move" {
+				n, err = s.MovePending(ctx, a, b)
+			} else {
+				n, err = s.DiscardPending(ctx, a)
+			}
+			if err != nil || n != 2 {
+				t.Fatalf("%s: %d %v", mode, n, err)
+			}
+			if d := kept(s); d.Pending != 0 || d.Cursors != 0 {
+				t.Fatalf("after %s: %+v", mode, d)
+			}
+			want := map[string]int{"move": 3, "discard": 1}[mode]
+			if due, _ := s.Due(ctx, time.Now(), 100); len(due) != want {
+				t.Fatalf("%s: %d entries due for the active destination, want %d", mode, len(due), want)
+			}
+			if cur, ok, _ := s.Cursor(ctx, "src"); !ok || cur != "cb" {
+				t.Fatalf("the active destination keeps its cursor: %q %v", cur, ok)
+			}
+			// Repeating the command finds nothing left and changes nothing.
+			if mode == "move" {
+				n, err = s.MovePending(ctx, a, b)
+			} else {
+				n, err = s.DiscardPending(ctx, a)
+			}
+			if err != nil || n != 0 {
+				t.Fatalf("repeated %s: %d %v", mode, n, err)
+			}
+			if due, _ := s.Due(ctx, time.Now(), 100); len(due) != want {
+				t.Fatalf("a repeated %s must change nothing", mode)
+			}
+		})
 	}
 }

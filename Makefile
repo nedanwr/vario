@@ -40,4 +40,4 @@ clickhouse-down:
 
 integration:
 	VARIO_TEST_CLICKHOUSE_URL=http://127.0.0.1:$(CH_PORT) VARIO_TEST_CLICKHOUSE_USER=vario \
-		VARIO_TEST_CLICKHOUSE_PASSWORD=testpass go test -count=1 -run Integration -v ./internal/storage/clickhouse/ ./internal/collector/
+		VARIO_TEST_CLICKHOUSE_PASSWORD=testpass go test -count=1 -run Integration -v ./internal/storage/clickhouse/ ./internal/collector/ ./internal/cli/

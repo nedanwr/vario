@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,9 +32,17 @@ type fakeCH struct {
 	databases map[string]bool
 	objects   map[string]map[string]*fakeObj // db -> name -> object
 	meta      map[string][]string            // db -> "key|value"
+	rows      map[string]int                 // "db.table" -> rows inserted
 	queries   []string                       // "user: query"
 	stmts     []string                       // statements that changed state
 	failing   []string                       // prefixes of statements that fail
+	down      bool                           // connections are dropped, as if the server were unreachable
+	insertErr map[string]int                 // table -> deliveries that still fail
+	// checkpoints are the vario_checkpoints rows: db -> writer -> highest seq.
+	checkpoints map[string]map[string]uint64
+	// savedCP keeps the checkpoints of a database that was dropped or
+	// replaced, by its destination id, for when that database comes back.
+	savedCP map[string]map[string]uint64
 }
 
 type fakeUser struct {
@@ -46,12 +56,13 @@ type fakeUser struct {
 type fakeObj struct {
 	engine, comment        string
 	sortingKey, engineFull string
+	partitionKey           string
 	cols                   [][2]string
 }
 
 func newFakeCH(t *testing.T, password string, dbs ...string) (*fakeCH, string) {
 	f := &fakeCH{password: password, users: map[string]*fakeUser{}, databases: map[string]bool{"system": true, "default": true, "INFORMATION_SCHEMA": true, "information_schema": true},
-		objects: map[string]map[string]*fakeObj{}, meta: map[string][]string{}}
+		objects: map[string]map[string]*fakeObj{}, meta: map[string][]string{}, rows: map[string]int{}, checkpoints: map[string]map[string]uint64{}}
 	for _, d := range dbs {
 		f.databases[d] = true
 	}
@@ -76,11 +87,175 @@ func (f *fakeCH) grant(user string, grants ...string) {
 	}
 }
 
+// recreate drops a database with everything in it and creates it again
+// empty, as DROP DATABASE and CREATE DATABASE would. Grants are kept.
+func (f *fakeCH) recreate(db string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveCheckpoints(db)
+	delete(f.objects, db)
+	delete(f.meta, db)
+	delete(f.checkpoints, db)
+	for k := range f.rows {
+		if strings.HasPrefix(k, db+".") {
+			delete(f.rows, k)
+		}
+	}
+}
+
+// fakeBackup is a copy of the data of one database: delivered rows, vario_meta
+// and the delivery checkpoints.
+type fakeBackup struct {
+	rows        map[string]int
+	meta        []string
+	checkpoints map[string]uint64
+	hadTable    bool
+}
+
+// backup copies a database, as BACKUP DATABASE would.
+func (f *fakeCH) backup(db string) fakeBackup {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b := fakeBackup{rows: map[string]int{}, meta: append([]string(nil), f.meta[db]...), checkpoints: map[string]uint64{}, hadTable: f.objects[db]["vario_checkpoints"] != nil}
+	for k, v := range f.rows {
+		if strings.HasPrefix(k, db+".") {
+			b.rows[k] = v
+		}
+	}
+	for k, v := range f.checkpoints[db] {
+		b.checkpoints[k] = v
+	}
+	return b
+}
+
+// restore replaces the data of a database with a backup, as DROP DATABASE and
+// RESTORE DATABASE would. The destination id in vario_meta is part of it.
+func (f *fakeCH) restore(db string, b fakeBackup) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k := range f.rows {
+		if strings.HasPrefix(k, db+".") {
+			delete(f.rows, k)
+		}
+	}
+	for k, v := range b.rows {
+		f.rows[k] = v
+	}
+	f.meta[db] = append([]string(nil), b.meta...)
+	f.checkpoints[db] = map[string]uint64{}
+	for k, v := range b.checkpoints {
+		f.checkpoints[db][k] = v
+	}
+	if !b.hadTable {
+		delete(f.objects[db], "vario_checkpoints")
+	}
+}
+
+// dropCheckpoints removes vario_checkpoints, leaving a version 2 schema.
+func (f *fakeCH) dropCheckpoints(db string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.objects[db], "vario_checkpoints")
+	delete(f.checkpoints, db)
+}
+
+// checkpoint returns the highest checkpoint a database holds for any writer.
+func (f *fakeCH) checkpoint(db string) uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var hi uint64
+	for _, v := range f.checkpoints[db] {
+		hi = max(hi, v)
+	}
+	return hi
+}
+
+// stripMeta removes vario_meta, leaving the schema as Vario 0.1 created it.
+func (f *fakeCH) stripMeta(db string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.objects[db], "vario_meta")
+	delete(f.meta, db)
+}
+
+// inserted returns the number of rows delivered to a table.
+func (f *fakeCH) inserted(db, table string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rows[db+"."+table]
+}
+
+// destinationID returns the destination id recorded in a database.
+func (f *fakeCH) destinationID(db string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, m := range f.meta[db] {
+		if k, v, _ := strings.Cut(m, "|"); k == "destination_id" {
+			return v
+		}
+	}
+	return ""
+}
+
 // changes returns the statements that changed state.
 func (f *fakeCH) changes() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.stmts...)
+}
+
+// setDown makes the server unreachable (every connection is dropped) or
+// brings it back.
+func (f *fakeCH) setDown(down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.down = down
+}
+
+// failInserts makes the next n deliveries into table fail.
+func (f *fakeCH) failInserts(table string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.insertErr == nil {
+		f.insertErr = map[string]int{}
+	}
+	f.insertErr[table] = n
+}
+
+// setDestinationID replaces the destination id recorded in a database, as
+// restoring another database in its place would.
+func (f *fakeCH) setDestinationID(db, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveCheckpoints(db)
+	for i, m := range f.meta[db] {
+		if k, _, _ := strings.Cut(m, "|"); k == "destination_id" {
+			f.meta[db][i] = k + "|" + id
+		}
+	}
+	// Another database is in place now: it holds its own checkpoints (those it
+	// had when it was last seen under this id), not the replaced one's.
+	f.checkpoints[db] = map[string]uint64{}
+	for k, v := range f.savedCP[id] {
+		f.checkpoints[db][k] = v
+	}
+}
+
+// saveCheckpoints remembers the checkpoints of the database currently at db
+// under its destination id. The caller holds f.mu.
+func (f *fakeCH) saveCheckpoints(db string) {
+	for _, m := range f.meta[db] {
+		if k, id, _ := strings.Cut(m, "|"); k == "destination_id" {
+			if f.savedCP == nil {
+				f.savedCP = map[string]map[string]uint64{}
+			}
+			f.savedCP[id] = map[string]uint64{}
+			for w, seq := range f.checkpoints[db] {
+				f.savedCP[id][w] = seq
+			}
+			return
+		}
+	}
 }
 
 func (f *fakeCH) failOn(prefixes ...string) {
@@ -102,6 +277,7 @@ var (
 	reComment   = regexp.MustCompile("COMMENT '([^']*)'$")
 	reEngine    = regexp.MustCompile(`(?m)^\) ENGINE = (.+)$`)
 	reOrderBy   = regexp.MustCompile(`(?m)^ORDER BY (.+)$`)
+	rePartition = regexp.MustCompile(`(?m)^PARTITION BY (.+)$`)
 	reCol       = regexp.MustCompile(`^  ([a-z_]+) (.+?),?$`)
 	reMeta      = regexp.MustCompile("^INSERT INTO `([^`]+)`\\.`vario_meta` \\(key, value\\) VALUES (.*)$")
 	rePair      = regexp.MustCompile(`\('([^']*)', '([^']*)'\)`)
@@ -113,6 +289,7 @@ var (
 	reMetaRead  = regexp.MustCompile("FROM `([^`]+)`\\.`vario_meta`")
 	reProbe     = regexp.MustCompile("^INSERT INTO `([^`]+)`\\.`([^`]+)` FORMAT JSONEachRow$")
 	reGrantUser = regexp.MustCompile(`user_name = '([^']*)'`)
+	reCPRead    = regexp.MustCompile("^SELECT max\\(seq\\) AS seq, count\\(\\) AS n FROM `([^`]+)`\\.`vario_checkpoints` WHERE writer_id = '([^']*)'$")
 )
 
 func (f *fakeCH) authenticate(r *http.Request) (string, *fakeUser, bool) {
@@ -145,6 +322,19 @@ func (u *fakeUser) sees(db, table string) bool {
 }
 
 func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	down := f.down
+	f.mu.Unlock()
+	if down {
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				conn.Close()
+				return
+			}
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	if r.URL.Path == "/ping" {
 		io.WriteString(w, "Ok.\n")
 		return
@@ -194,7 +384,7 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for n, o := range f.objects[db] {
 			if u.sees(db, n) {
 				data = append(data, map[string]any{"name": n, "engine": o.engine, "as_select": "", "comment": o.comment,
-					"sorting_key": o.sortingKey, "engine_full": o.engineFull})
+					"sorting_key": o.sortingKey, "engine_full": o.engineFull, "partition_key": o.partitionKey})
 			}
 		}
 	case strings.Contains(q, "FROM system.columns"):
@@ -216,6 +406,22 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			k, v, _ := strings.Cut(m, "|")
 			data = append(data, map[string]any{"key": k, "value": v})
 		}
+	case reCPRead.MatchString(q):
+		m := reCPRead.FindStringSubmatch(q)
+		switch {
+		case f.objects[m[1]]["vario_checkpoints"] == nil:
+			fail(404, 60, "Unknown table expression identifier 'vario_checkpoints'")
+			return
+		case !u.has("SELECT", m[1], "vario_checkpoints"):
+			fail(500, 497, "Not enough privileges")
+			return
+		}
+		seq, ok := f.checkpoints[m[1]][m[2]]
+		n := 0
+		if ok {
+			n = 1
+		}
+		data = append(data, map[string]any{"seq": seq, "n": n})
 	case strings.Contains(q, "FROM system.users"):
 		if !u.admin {
 			fail(500, 497, "Not enough privileges. To execute this query, it's necessary to have the grant SHOW USERS ON *.*")
@@ -274,7 +480,9 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		data = append(data, map[string]any{"result": res})
-	case reProbe.MatchString(q) && len(b) == 0:
+	case reProbe.MatchString(q):
+		// An insert: the probe without rows, or a delivery (gzip, one JSON
+		// object per line), whose rows are counted per table.
 		m := reProbe.FindStringSubmatch(q)
 		switch {
 		case u.readonly > 0:
@@ -283,6 +491,30 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fail(404, 60, "Unknown table")
 		case !u.has("INSERT", m[1], m[2]):
 			fail(500, 497, "Not enough privileges")
+		case len(b) > 0 && m[2] == "vario_checkpoints":
+			var row struct {
+				Writer string `json:"writer_id"`
+				Seq    uint64 `json:"seq"`
+			}
+			if err := json.Unmarshal(b, &row); err != nil {
+				fail(400, 27, "cannot parse the checkpoint")
+				return
+			}
+			if f.checkpoints[m[1]] == nil {
+				f.checkpoints[m[1]] = map[string]uint64{}
+			}
+			f.checkpoints[m[1]][row.Writer] = max(f.checkpoints[m[1]][row.Writer], row.Seq)
+		case len(b) > 0 && f.insertErr[m[2]] > 0:
+			f.insertErr[m[2]]--
+			fail(503, 999, "simulated delivery failure")
+		case len(b) > 0:
+			zr, err := gzip.NewReader(bytes.NewReader(b))
+			if err != nil {
+				fail(400, 27, "cannot decompress the insert")
+				return
+			}
+			data, _ := io.ReadAll(zr)
+			f.rows[m[1]+"."+m[2]] += bytes.Count(data, []byte("\n"))
 		}
 		return
 	case strings.HasPrefix(q, "SELECT"):
@@ -340,6 +572,9 @@ func (f *fakeCH) apply(q string) error {
 		if e, ob := reEngine.FindStringSubmatch(q), reOrderBy.FindStringSubmatch(q); e != nil && ob != nil {
 			o.sortingKey = strings.Trim(ob[1], "()")
 			o.engineFull = e[1] + " ORDER BY " + ob[1]
+		}
+		if pb := rePartition.FindStringSubmatch(q); pb != nil {
+			o.partitionKey = pb[1]
 		}
 		for _, line := range strings.Split(q, "\n") {
 			if cm := reCol.FindStringSubmatch(line); cm != nil {

@@ -53,7 +53,7 @@ func TestMigrate(t *testing.T) {
 	}
 	// Applied, verified, and checked as the collector user.
 	r = vario(t, "adminpw", "migrate", "--non-interactive", "--yes", "--admin-user", "default", "--admin-password-stdin")
-	if r.code != 0 || !strings.Contains(r.stdout, "✓ schema verified: version 2") || !strings.Contains(r.stdout, "Checking access as the collector user vario") ||
+	if r.code != 0 || !strings.Contains(r.stdout, "✓ schema verified: version 3") || !strings.Contains(r.stdout, "Checking access as the collector user vario") ||
 		!strings.Contains(r.stdout, "inserts accepted") {
 		t.Fatalf("migrate: %+v", r)
 	}
@@ -76,7 +76,7 @@ func TestMigrate(t *testing.T) {
 	}
 	// Up to date: nothing to do, no credentials needed.
 	r = vario(t, "", "migrate", "--non-interactive")
-	if r.code != 0 || !strings.Contains(r.stdout, "up to date (version 2). Nothing to do.") || len(ch.changes()) != n {
+	if r.code != 0 || !strings.Contains(r.stdout, "up to date (version 3). Nothing to do.") || len(ch.changes()) != n {
 		t.Fatalf("repeated migrate: %+v", r)
 	}
 }

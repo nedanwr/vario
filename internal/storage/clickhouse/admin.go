@@ -186,8 +186,9 @@ func (r Requirement) String(db string) string {
 }
 
 // OperationalRequirements lists the privileges of the operational user:
-// SELECT and INSERT on Vario's tables, SELECT on its views and on vario_meta.
-// Grants are scoped to these objects, so the user cannot read or change
+// SELECT and INSERT on Vario's tables and on vario_checkpoints (the collector
+// reads and writes its delivery checkpoint), SELECT on its views and on
+// vario_meta. Grants are scoped to these objects, so the user cannot read or change
 // unrelated tables in a shared database, and holds no global privileges, no
 // DDL privileges and no GRANT OPTION.
 func OperationalRequirements() []Requirement {
@@ -198,7 +199,7 @@ func OperationalRequirements() []Requirement {
 	for _, v := range viewDefs("\x00") {
 		out = append(out, Requirement{"SELECT", v.name})
 	}
-	return append(out, Requirement{"SELECT", MetaTable})
+	return append(out, Requirement{"SELECT", MetaTable}, Requirement{"SELECT", CheckpointTable}, Requirement{"INSERT", CheckpointTable})
 }
 
 // GrantPlan returns GRANT statements for the given requirements, one per object.

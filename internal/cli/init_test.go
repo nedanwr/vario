@@ -369,8 +369,8 @@ func TestInitGuidedCreatesDatabaseAndUser(t *testing.T) {
 			}
 		}
 	}
-	if created != 1 || grants != 19 {
-		t.Fatalf("expected one user and 19 object grants: %d %d\n%v", created, grants, ch.changes())
+	if created != 1 || grants != 20 {
+		t.Fatalf("expected one user and 20 object grants: %d %d\n%v", created, grants, ch.changes())
 	}
 	if u := ch.user("vario"); u == nil || u.admin {
 		t.Fatal("the operational user must not be an administrator")

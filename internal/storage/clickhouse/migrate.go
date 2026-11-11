@@ -17,12 +17,14 @@ import (
 //	1: the tables and views of Vario 0.1 (no recorded version).
 //	2: adds vario_meta with the schema version and a random destination id,
 //	   which identifies the database independently of the URL used to reach it.
+//	3: adds vario_checkpoints, the delivery checkpoints that reveal a database
+//	   restored to an earlier state under the same destination id.
 //
 // Migrations are additive: they create missing objects, replace Vario's own
 // outdated views and record metadata. Tables and databases are never
 // dropped, truncated or altered, and objects Vario did not create are never
 // touched; incompatible objects stop the migration (see SchemaError).
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // StepKind groups provisioning steps so that users can tell database
 // creation, user creation, privilege changes and schema changes apart.
@@ -115,6 +117,9 @@ func planSchema(db string, st SchemaStatus) (*Plan, error) {
 	if !st.MetaExists {
 		p.Steps = append(p.Steps, Step{Kind: StepSchema, Summary: "create table " + MetaTable + " (schema version and destination id)", SQL: metaDDL(db)})
 	}
+	if !st.Checkpoints {
+		p.Steps = append(p.Steps, Step{Kind: StepSchema, Summary: "create table " + CheckpointTable + " (delivery checkpoints, to detect a database restored to an earlier state)", SQL: checkpointDDL(db)})
+	}
 	if st.DestinationID == "" {
 		id, err := newUUID()
 		if err != nil {
@@ -150,9 +155,9 @@ func recordVersion(ctx context.Context, a *Admin) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !st.Usable() || !st.MetaExists || st.DestinationID == "" {
-		return "", fmt.Errorf("schema verification failed before recording the version (missing tables: %s; metadata present: %t)",
-			strings.Join(st.MissingTables, ", "), st.MetaExists && st.DestinationID != "")
+	if !st.Usable() || !st.MetaExists || st.DestinationID == "" || !st.Checkpoints {
+		return "", fmt.Errorf("schema verification failed before recording the version (missing tables: %s; metadata present: %t; checkpoint table present: %t)",
+			strings.Join(st.MissingTables, ", "), st.MetaExists && st.DestinationID != "", st.Checkpoints)
 	}
 	if st.Recorded >= SchemaVersion {
 		return "", nil
@@ -285,6 +290,9 @@ func (c *Client) VerifyMigrated(ctx context.Context) (SchemaStatus, error) {
 	missing = append(missing, st.MissingViews...)
 	if !st.MetaExists || st.DestinationID == "" {
 		missing = append(missing, MetaTable)
+	}
+	if !st.Checkpoints {
+		missing = append(missing, CheckpointTable)
 	}
 	if len(missing) > 0 {
 		return st, &MigrationRequiredError{Database: c.database, Missing: missing}

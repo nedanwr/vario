@@ -16,7 +16,9 @@ import (
 // Mutable entities use ReplacingMergeTree(version): the highest version of a
 // key wins. Merges are asynchronous, so readers must use FINAL (the *_latest
 // views) or argMax(..., version). Partition keys only use immutable values so
-// that all versions of a row share a partition and deduplicate.
+// that all versions of a row share a partition and deduplicate. Engine,
+// sorting key, partition key and version column of existing tables are
+// verified together (see checkEngine); a table that differs is never altered.
 const (
 	ts      = "DateTime64(3, 'UTC')"
 	tsNull  = "Nullable(DateTime64(3, 'UTC'))"
@@ -437,13 +439,38 @@ func engineArgs(engine, engineFull string) []string {
 	return nil
 }
 
+var partitionByRe = regexp.MustCompile(`(?m)^PARTITION BY (.+)$`)
+
+// expectedPartitionKey extracts the PARTITION BY expression from Vario's
+// table DDL, in the form of system.tables.partition_key ("" if the table is
+// not partitioned).
+func expectedPartitionKey(ddl string) string {
+	m := partitionByRe.FindStringSubmatch(ddl)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// normalizePartitionKey makes a partition expression comparable. An explicit
+// PARTITION BY tuple() is the same as no partitioning.
+func normalizePartitionKey(k string) string {
+	if k = normalizeKey(k); k == "tuple()" {
+		return ""
+	}
+	return k
+}
+
 // checkEngine verifies what makes ReplacingMergeTree deduplicate the way
-// Vario relies on: rows are identified by the expected sorting key, and the
-// newest row is chosen by the version column alone. A table with the right
-// columns but another key collapses distinct records into one (or never
-// collapses updates); without the version argument the surviving row is
-// arbitrary, and with an is_deleted argument rows disappear.
-func checkEngine(ddl, engine, engineFull, sortingKey string) []string {
+// Vario relies on: rows are identified by the expected sorting key, the
+// newest row is chosen by the version column alone, and every version of a
+// row lands in the same partition. A table with the right columns but another
+// sorting key collapses distinct records into one (or never collapses
+// updates); without the version argument the surviving row is arbitrary, and
+// with an is_deleted argument rows disappear. Merges never cross partitions,
+// so a partition key other than Vario's (which only uses values that never
+// change for a record) can keep superseded versions of a row forever.
+func checkEngine(ddl, engine, engineFull, sortingKey, partitionKey string) []string {
 	var bad []string
 	if want := expectedSortingKey(ddl); normalizeKey(sortingKey) != normalizeKey(want) {
 		got := sortingKey
@@ -458,6 +485,16 @@ func checkEngine(ddl, engine, engineFull, sortingKey string) []string {
 			got = strings.Join(args, ", ")
 		}
 		bad = append(bad, fmt.Sprintf("ReplacingMergeTree version argument is %s, expected version", got))
+	}
+	if want := expectedPartitionKey(ddl); normalizePartitionKey(partitionKey) != normalizePartitionKey(want) {
+		got := partitionKey
+		if normalizePartitionKey(got) == "" {
+			got = "none"
+		}
+		if want == "" {
+			want = "none"
+		}
+		bad = append(bad, fmt.Sprintf("partition key (PARTITION BY) is %s, expected %s", got, want))
 	}
 	return bad
 }
@@ -477,6 +514,28 @@ func metaDDL(db string) string {
 ) ENGINE = MergeTree
 ORDER BY (key, updated_at)
 COMMENT '%s'`, quoteIdent(db), quoteIdent(MetaTable), metaTag)
+}
+
+// CheckpointTable holds the delivery checkpoints of every collector that
+// delivers to the database: one logical row per writer (a local spool's
+// stream for this destination) with the highest sequence number it wrote.
+// A collector writes a checkpoint after the inserts of a delivery round were
+// acknowledged and only then removes those rows from its spool, so a database
+// that holds a lower sequence number than the collector had acknowledged was
+// restored to an earlier state (see the collector package). The table lives
+// in the database, so a backup captures it together with the data.
+const CheckpointTable = "vario_checkpoints"
+
+const checkpointTag = "vario:checkpoints"
+
+func checkpointDDL(db string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
+  writer_id String,
+  seq UInt64,
+  written_at DateTime64(3, 'UTC') DEFAULT now64(3)
+) ENGINE = ReplacingMergeTree(seq)
+ORDER BY writer_id
+COMMENT '%s'`, quoteIdent(db), quoteIdent(CheckpointTable), checkpointTag)
 }
 
 // ErrDatabaseMissing is returned when the configured database does not exist
@@ -529,6 +588,9 @@ type SchemaStatus struct {
 	Recorded int
 	// DestinationID is the destination id recorded in vario_meta.
 	DestinationID string
+	// Checkpoints reports whether the vario_checkpoints table is present
+	// (schema 3+) and visible to the inspecting user.
+	Checkpoints bool
 }
 
 // Version returns the effective schema version: the recorded one, 1 for a
@@ -552,7 +614,7 @@ func (s SchemaStatus) Usable() bool {
 // Complete reports whether the schema is fully migrated to SchemaVersion.
 func (s SchemaStatus) Complete() bool {
 	return s.Usable() && len(s.MissingViews) == 0 && len(s.OutdatedViews) == 0 && s.MetaExists &&
-		s.DestinationID != "" && s.Recorded >= SchemaVersion
+		s.DestinationID != "" && s.Checkpoints && s.Recorded >= SchemaVersion
 }
 
 // Newer reports whether a newer Vario version migrated the schema.
@@ -588,14 +650,15 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 	}
 	db := escapeString(c.database)
 	var objects []struct {
-		Name       string `json:"name"`
-		Engine     string `json:"engine"`
-		AsSelect   string `json:"as_select"`
-		Comment    string `json:"comment"`
-		SortingKey string `json:"sorting_key"`
-		EngineFull string `json:"engine_full"`
+		Name         string `json:"name"`
+		Engine       string `json:"engine"`
+		AsSelect     string `json:"as_select"`
+		Comment      string `json:"comment"`
+		SortingKey   string `json:"sorting_key"`
+		EngineFull   string `json:"engine_full"`
+		PartitionKey string `json:"partition_key"`
 	}
-	if err := c.Query(ctx, fmt.Sprintf("SELECT name, engine, as_select, comment, sorting_key, engine_full FROM system.tables WHERE database = '%s'", db), &objects); err != nil {
+	if err := c.Query(ctx, fmt.Sprintf("SELECT name, engine, as_select, comment, sorting_key, engine_full, partition_key FROM system.tables WHERE database = '%s'", db), &objects); err != nil {
 		return st, err
 	}
 	var cols []struct {
@@ -606,10 +669,10 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 	if err := c.Query(ctx, fmt.Sprintf("SELECT table, name, type FROM system.columns WHERE database = '%s'", db), &cols); err != nil {
 		return st, err
 	}
-	type object struct{ engine, asSelect, comment, sortingKey, engineFull string }
+	type object struct{ engine, asSelect, comment, sortingKey, engineFull, partitionKey string }
 	have := map[string]object{}
 	for _, o := range objects {
-		have[o.Name] = object{o.Engine, o.AsSelect, o.Comment, o.SortingKey, o.EngineFull}
+		have[o.Name] = object{o.Engine, o.AsSelect, o.Comment, o.SortingKey, o.EngineFull, o.PartitionKey}
 	}
 	colTypes := map[string]map[string]string{}
 	for _, col := range cols {
@@ -642,7 +705,7 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 			st.Problems = append(st.Problems, fmt.Sprintf("%s has engine %s, expected ReplacingMergeTree", name, o.engine))
 			continue
 		}
-		bad := checkEngine(ddl[name], o.engine, o.engineFull, o.sortingKey)
+		bad := checkEngine(ddl[name], o.engine, o.engineFull, o.sortingKey, o.partitionKey)
 		if bad = append(bad, checkColumns(name, ddl[name])...); len(bad) > 0 {
 			st.Problems = append(st.Problems, fmt.Sprintf("table %s: %s", name, strings.Join(bad, ", ")))
 		}
@@ -674,6 +737,17 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 			if err := c.readMeta(ctx, &st); err != nil {
 				return st, fmt.Errorf("read %s.%s: %w", c.database, MetaTable, err)
 			}
+		}
+	}
+	if o, ok := have[CheckpointTable]; ok {
+		bad := checkColumns(CheckpointTable, checkpointDDL(c.database))
+		switch {
+		case o.comment != checkpointTag:
+			st.Problems = append(st.Problems, fmt.Sprintf("table %s exists but was not created by Vario", CheckpointTable))
+		case len(bad) > 0:
+			st.Problems = append(st.Problems, fmt.Sprintf("table %s: %s", CheckpointTable, strings.Join(bad, ", ")))
+		default:
+			st.Checkpoints = true
 		}
 	}
 	return st, nil

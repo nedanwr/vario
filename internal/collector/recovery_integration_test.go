@@ -291,6 +291,9 @@ func TestIntegrationRecreatedDatabaseWhileRunning(t *testing.T) {
 	if d, _, _ := e.store.Active(ctx); d.ServerID != firstID {
 		t.Fatalf("the recorded identity must not be overwritten: %+v", d)
 	}
+	if rep, ok, _ := e.store.Replaced(ctx); !ok || rep.Found != newID || rep.Destination.ServerID != firstID {
+		t.Fatalf("the replacement must be recorded for status and doctor: %+v %v", rep, ok)
+	}
 	if _, err := e.collector(db).Prepare(ctx, true); !errors.As(err, &de) || !de.Replaced {
 		t.Fatalf("a restart must be refused until the switch: %v", err)
 	}
@@ -310,10 +313,76 @@ func TestIntegrationRecreatedDatabaseWhileRunning(t *testing.T) {
 	if err := e.store.Activate(ctx, repl.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, ok, _ := e.store.Replaced(ctx); ok {
+		t.Fatal("the switch must resolve the reported replacement")
+	}
 	fresh := e.prepared(db)
 	e.syncAndDrain(fresh)
 	got := e.mustRead(db)
 	if got.Convs != complete.Convs+1 || got.Turns != complete.Turns+1 || got.Msgs != complete.Msgs+1 || got.Events != complete.Events || got.Raw <= complete.Raw {
 		t.Fatalf("the recreated database is incomplete: %+v, before the drop %+v plus one conversation", got, complete)
+	}
+}
+
+// C-2: a database migrated by Vario 0.1 has no vario_meta and no destination
+// id. `vario migrate` gives it one without touching the tables; the collector
+// binds it to the existing destination (no second backfill, nothing counted
+// twice), and from then on a recreated database is recognized.
+func TestIntegrationLegacyDatabaseAcquiresIdentity(t *testing.T) {
+	e := newRecoveryEnv(t)
+	db := fmt.Sprintf("vario_legacy_%d", time.Now().UnixNano())
+	e.migrate(db)
+	// The schema as version 1 left it. The test drops the metadata; Vario never does.
+	if err := e.clients[db].Exec(ctx, "DROP TABLE `"+db+"`.vario_meta"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := e.clients[db].CheckDestination(ctx)
+	if err != nil || info.ServerID != "" || info.Version != 1 {
+		t.Fatalf("legacy schema: %+v %v", info, err)
+	}
+
+	c := e.prepared(db)
+	e.syncAndDrain(c)
+	before := e.mustRead(db)
+	if before.Msgs != 2 || before.Convs != 1 {
+		t.Fatalf("delivery to a legacy schema: %+v", before)
+	}
+	if d, _, _ := e.store.Active(ctx); d.ServerID != "" {
+		t.Fatalf("no identity is known yet: %+v", d)
+	}
+	cursor, _, _ := e.store.Cursor(ctx, e.src.ID())
+
+	id := e.migrate(db) // `vario migrate`
+	if again := e.migrate(db); again != id {
+		t.Fatalf("the destination id must be persistent: %s, then %s", id, again)
+	}
+	c.checkedAt = time.Now().Add(-2 * identityCheckInterval)
+	e.moreHistory(1)
+	e.syncAndDrain(c)
+	d, _, _ := e.store.Active(ctx)
+	if d.ServerID != id || d.ID != c.Destination().ID {
+		t.Fatalf("the identity must be bound to the existing destination: %+v, want %s", d, id)
+	}
+	if cur, _, _ := e.store.Cursor(ctx, e.src.ID()); cur == cursor || cur == "" {
+		t.Fatalf("the destination must keep synchronizing incrementally: %q, was %q", cur, cursor)
+	}
+	if got := e.mustRead(db); got.Msgs != before.Msgs+1 || got.Convs != before.Convs+1 || got.Events != before.Events {
+		t.Fatalf("after acquiring the identity: %+v, before %+v plus one conversation", got, before)
+	}
+	// A restart recognizes the database by its id.
+	if res, err := e.collector(db).Prepare(ctx, true); err != nil || res.Replaced || res.Configured.ID != d.ID {
+		t.Fatalf("restart: %+v %v", res, err)
+	}
+
+	// Recreated: now detected.
+	if err := e.clients[db].Exec(ctx, "DROP DATABASE `"+db+"`"); err != nil {
+		t.Fatal(err)
+	}
+	if newID := e.migrate(db); newID == id {
+		t.Fatal("a recreated database must get a new destination id")
+	}
+	var de *DestinationError
+	if _, err := e.collector(db).Prepare(ctx, true); !errors.As(err, &de) || !de.Replaced {
+		t.Fatalf("a recreated database must be refused: %v", err)
 	}
 }

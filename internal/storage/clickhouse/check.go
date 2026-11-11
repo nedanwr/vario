@@ -30,6 +30,7 @@ const (
 const (
 	codeSyntaxError     = 62
 	codeUnknownDatabase = 81
+	codeUnknownSetting  = 115
 	codeReadonly        = 164
 	codeQuotaExceeded   = 201
 	codeSettingLimit    = 452 // SETTING_CONSTRAINT_VIOLATION
@@ -252,6 +253,9 @@ func (c *Client) CheckConnection(ctx context.Context) (*Report, error) {
 	if st.MetaExists {
 		grants = append(grants, "SELECT ON "+db+"."+quoteIdent(MetaTable))
 	}
+	if st.Checkpoints {
+		grants = append(grants, "SELECT ON "+db+"."+quoteIdent(CheckpointTable), "INSERT ON "+db+"."+quoteIdent(CheckpointTable))
+	}
 	for _, g := range grants {
 		granted, err := c.checkGrant(ctx, g)
 		if err != nil {
@@ -286,7 +290,12 @@ func (c *Client) CheckConnection(ctx context.Context) (*Report, error) {
 		r.Probe = "not run (read-only session)"
 	default:
 		r.Probe = "ok"
-		for _, t := range requiredTables() {
+		probed := requiredTables()
+		if st.Checkpoints {
+			// The collector does not acknowledge delivered rows without a checkpoint.
+			probed = append(probed, CheckpointTable)
+		}
+		for _, t := range probed {
 			if err := c.probeInsert(ctx, t); err != nil {
 				r.Probe = fmt.Sprintf("insert into %s.%s rejected: %v", c.database, t, err)
 				r.Issues = append(r.Issues, Issue{Classify(err), r.Probe})
@@ -326,7 +335,11 @@ type DestinationInfo struct {
 	// schema created before version 2, or if the user cannot read it).
 	ServerID string
 	Version  int
-	Warnings []string
+	// Checkpoints reports whether the delivery checkpoint table exists and
+	// is visible to the user (schema 3+). Without it, a database restored
+	// to an earlier state cannot be detected.
+	Checkpoints bool
+	Warnings    []string
 }
 
 // CheckDestination is the collector's startup check. It only reads, and it
@@ -349,7 +362,7 @@ func (c *Client) CheckDestination(ctx context.Context) (DestinationInfo, error) 
 	case len(st.MissingTables) > 0:
 		return info, &MigrationRequiredError{Database: c.database, Missing: st.MissingTables}
 	}
-	info.ServerID, info.Version = st.DestinationID, st.Version()
+	info.ServerID, info.Version, info.Checkpoints = st.DestinationID, st.Version(), st.Checkpoints
 	switch {
 	case st.Newer():
 		info.Warnings = append(info.Warnings, fmt.Sprintf("schema version %d is newer than this Vario supports (%d); upgrade Vario", st.Recorded, SchemaVersion))

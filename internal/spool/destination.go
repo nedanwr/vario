@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,7 +19,9 @@ import (
 // credentials keeps the destination. Two endpoints that lead to the same
 // database (an alias, a new host name) are recognized by their ServerID. A
 // database that was dropped and recreated gets a new ServerID and is
-// therefore a new destination, which must be repopulated.
+// therefore a new destination, which must be repopulated. A database that
+// was restored to an earlier state keeps its ServerID; that is detected by
+// the delivery checkpoint (see Checkpoint).
 type Destination struct {
 	ID       int64
 	Endpoint string // normalized endpoint (see config.ClickHouseConfig.Endpoint); empty for legacy state
@@ -326,24 +329,85 @@ func (s *Store) Activate(ctx context.Context, id int64) error {
 // different server id.
 var ErrIdentityMismatch = errors.New("the ClickHouse database is not the one Vario delivered to before")
 
+// ErrIdentityMissing is returned when a destination has a recorded server id
+// but the database reports none: its vario_meta table is gone or not readable
+// any more, so the database cannot be told apart from a replacement.
+var ErrIdentityMissing = errors.New("the ClickHouse database no longer reports a destination id")
+
 // BindServerID records the server id of a destination the first time it is
-// learned. A different, already recorded id yields ErrIdentityMismatch.
+// learned (a database migrated from a schema without one acquires its
+// identity this way). A different, already recorded id yields
+// ErrIdentityMismatch; no id where one is recorded yields ErrIdentityMissing.
+// The recorded id is never overwritten.
 func (s *Store) BindServerID(ctx context.Context, id int64, serverID string) error {
-	if serverID == "" {
-		return nil
-	}
 	d, ok, err := getDest(ctx, s.db, id)
 	if err != nil || !ok {
 		return err
 	}
-	switch d.ServerID {
-	case serverID:
+	switch {
+	case d.ServerID == serverID:
 		return nil
-	case "":
+	case serverID == "":
+		return fmt.Errorf("%w (recorded destination id %s)", ErrIdentityMissing, d.ServerID)
+	case d.ServerID == "":
 		_, err := s.db.ExecContext(ctx, `UPDATE destinations SET server_id = ?, updated_at = ? WHERE id = ? AND server_id = ''`, serverID, nowMs(), id)
 		return err
 	}
 	return fmt.Errorf("%w (recorded destination id %s, found %s)", ErrIdentityMismatch, d.ServerID, serverID)
+}
+
+const replacedKey = "destination.replaced"
+
+// Replacement describes a detected database replacement that has not been
+// resolved: the database of Destination now reports the id Found instead of
+// the recorded Destination.ServerID.
+type Replacement struct {
+	Destination Destination
+	Found       string
+	// At is when the replacement was first detected.
+	At time.Time
+}
+
+// MarkReplaced remembers that the database of destination id was found to
+// carry another server id, so that `vario status` and `vario doctor` can
+// report it without contacting ClickHouse. Nothing else changes: the recorded
+// id, queued entries, cursors and fingerprints are kept.
+func (s *Store) MarkReplaced(ctx context.Context, id int64, found string) error {
+	v := strconv.FormatInt(id, 10) + "|" + found
+	if cur, _, ok, err := s.KV(ctx, replacedKey); err != nil || (ok && cur == v) {
+		return err // keep the time of the first detection
+	}
+	return s.SetKV(ctx, replacedKey, v)
+}
+
+// ClearReplaced forgets a detected replacement (the recorded database is
+// back, or the replacement was accepted with `vario destination switch`).
+func (s *Store) ClearReplaced(ctx context.Context) error {
+	if cur, _, ok, err := s.KV(ctx, replacedKey); err != nil || !ok || cur == "" {
+		return err
+	}
+	return s.SetKV(ctx, replacedKey, "")
+}
+
+// Replaced returns the detected replacement, if it still applies: the
+// destination is current (not retired by a switch) and its recorded id still
+// differs from the one found.
+func (s *Store) Replaced(ctx context.Context) (Replacement, bool, error) {
+	var r Replacement
+	if s.legacy {
+		return r, false, nil
+	}
+	v, at, ok, err := s.KV(ctx, replacedKey)
+	if err != nil || !ok || v == "" {
+		return r, false, err
+	}
+	idStr, found, _ := strings.Cut(v, "|")
+	id, _ := strconv.ParseInt(idStr, 10, 64)
+	d, ok, err := getDest(ctx, s.db, id)
+	if err != nil || !ok || !d.Retired.IsZero() || d.ServerID == "" || d.ServerID == found {
+		return r, false, err
+	}
+	return Replacement{Destination: d, Found: found, At: at}, true, nil
 }
 
 // Replace retires destination id, whose database was recreated or replaced,
@@ -392,6 +456,12 @@ func (s *Store) Replace(ctx context.Context, id int64, serverID string) (Destina
 func (s *Store) MovePending(ctx context.Context, from, to int64) (int64, error) {
 	if from == to {
 		return 0, nil
+	}
+	if d, ok, err := getDest(ctx, s.db, to); err != nil {
+		return 0, err
+	} else if !ok || !d.Retired.IsZero() {
+		// Rows bound to an unknown or replaced destination would never be delivered.
+		return 0, fmt.Errorf("spool: destination %d cannot receive queued rows", to)
 	}
 	// Reset the retry schedule: earlier failures concerned the old destination.
 	return s.takePending(ctx, from, `UPDATE queue SET destination_id = ?, attempts = 0, next_attempt_at = 0, last_error = '' WHERE destination_id = ?`, to, from)

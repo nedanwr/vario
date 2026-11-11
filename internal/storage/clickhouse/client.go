@@ -232,7 +232,15 @@ func (c *Client) Exec(ctx context.Context, query string) error {
 
 // Query runs a SELECT and decodes rows from ClickHouse's JSON output format.
 func (c *Client) Query(ctx context.Context, query string, rows any) error {
+	return c.query(ctx, query, rows, nil)
+}
+
+// query is Query with additional settings.
+func (c *Client) query(ctx context.Context, query string, rows any, settings url.Values) error {
 	params := url.Values{}
+	for k, v := range settings {
+		params[k] = v
+	}
 	params.Set("default_format", "JSON")
 	params.Set("output_format_json_quote_64bit_integers", "0")
 	data, err := c.do(ctx, http.MethodPost, params, strings.NewReader(query), false)
@@ -295,6 +303,51 @@ func (c *Client) insertParams(table, token string) url.Values {
 // written bytes, disk space, memory) are not exercised.
 func (c *Client) probeInsert(ctx context.Context, table string) error {
 	_, err := c.do(ctx, http.MethodPost, c.insertParams(table, "vario-access-probe"), strings.NewReader(""), false)
+	return err
+}
+
+// ReadCheckpoint returns the highest delivery checkpoint the database holds
+// for writer, and whether it holds one at all. It only reads.
+//
+// select_sequential_consistency makes the read see every acknowledged insert
+// on engines that share or replicate data between replicas; it has no effect
+// on a single server. A session that may not change the setting reads
+// without it.
+func (c *Client) ReadCheckpoint(ctx context.Context, writer string) (seq uint64, found bool, err error) {
+	var rows []struct {
+		Seq uint64 `json:"seq"`
+		N   uint64 `json:"n"`
+	}
+	q := fmt.Sprintf("SELECT max(seq) AS seq, count() AS n FROM %s.%s WHERE writer_id = '%s'",
+		quoteIdent(c.database), quoteIdent(CheckpointTable), escapeString(writer))
+	err = c.query(ctx, q, &rows, url.Values{"select_sequential_consistency": {"1"}})
+	var e *Error
+	if errors.As(err, &e) && (e.Code == codeReadonly || e.Code == codeSettingLimit || e.Code == codeUnknownSetting) {
+		rows = nil
+		err = c.query(ctx, q, &rows, nil)
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if len(rows) != 1 {
+		return 0, false, errors.New("unexpected checkpoint response")
+	}
+	return rows[0].Seq, rows[0].N > 0, nil
+}
+
+// WriteCheckpoint inserts delivery checkpoint seq for writer, with the
+// settings of a delivery (in particular a synchronous insert, so that the
+// acknowledgement means the row was written). Every checkpoint is a new row
+// with a higher sequence number; a repeated write is never deduplicated away.
+func (c *Client) WriteCheckpoint(ctx context.Context, writer string, seq uint64) error {
+	body, err := json.Marshal(struct {
+		Writer string `json:"writer_id"`
+		Seq    uint64 `json:"seq"`
+	}{writer, seq})
+	if err != nil {
+		return err
+	}
+	_, err = c.do(ctx, http.MethodPost, c.insertParams(CheckpointTable, ""), bytes.NewReader(append(body, '\n')), false)
 	return err
 }
 

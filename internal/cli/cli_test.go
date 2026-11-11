@@ -636,7 +636,7 @@ func TestDoctorClassifiesFailures(t *testing.T) {
 	// After an administrator migrates, the restricted user is ready.
 	provisionSchema(t, url, "admin", "adminpw", "vario")
 	r = vario(t, "", "doctor")
-	if r.code != 0 || !strings.Contains(r.stdout, "Vario schema version 2 (up to date)") || !strings.Contains(r.stdout, "inserts accepted") || !strings.Contains(r.stdout, "destination id") {
+	if r.code != 0 || !strings.Contains(r.stdout, "Vario schema version 3 (up to date)") || !strings.Contains(r.stdout, "inserts accepted") || !strings.Contains(r.stdout, "destination id") {
 		t.Fatalf("ready: %s", r.stdout)
 	}
 }

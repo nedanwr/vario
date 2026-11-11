@@ -116,7 +116,8 @@ func TestAssessGrants(t *testing.T) {
 
 func TestGrantPlanIsScopedToVarioObjects(t *testing.T) {
 	p := GrantPlan("we`ird", "vario", OperationalRequirements())
-	if len(p.Steps) != len(model.Tables)+len(viewDefs("x"))+1 {
+	// Tables, views, vario_meta and vario_checkpoints.
+	if len(p.Steps) != len(model.Tables)+len(viewDefs("x"))+2 {
 		t.Fatalf("one statement per object: %d", len(p.Steps))
 	}
 	for _, s := range p.Steps {
@@ -131,8 +132,12 @@ func TestGrantPlanIsScopedToVarioObjects(t *testing.T) {
 	if p.Steps[0].SQL != "GRANT SELECT, INSERT ON `vario`.`sources` TO `we``ird`" {
 		t.Fatalf("table grant: %s", p.Steps[0].SQL)
 	}
-	if last := p.Steps[len(p.Steps)-1].SQL; last != "GRANT SELECT ON `vario`.`vario_meta` TO `we``ird`" {
-		t.Fatalf("metadata grant: %s", last)
+	// The metadata stays read-only for the collector; it writes checkpoints only.
+	if meta := p.Steps[len(p.Steps)-2].SQL; meta != "GRANT SELECT ON `vario`.`vario_meta` TO `we``ird`" {
+		t.Fatalf("metadata grant: %s", meta)
+	}
+	if last := p.Steps[len(p.Steps)-1].SQL; last != "GRANT SELECT, INSERT ON `vario`.`vario_checkpoints` TO `we``ird`" {
+		t.Fatalf("checkpoint grant: %s", last)
 	}
 }
 

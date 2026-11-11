@@ -65,6 +65,12 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 					fmt.Fprintln(w, "Destination    not recorded yet (state from an earlier version; assigned to the configured destination on the next run)")
 				case hasState && d.ID == active.ID:
 					fmt.Fprintf(w, "Destination    %s (destination id %s)\n", active, orDash(active.ServerID))
+					if rep, ok, _ := store.Replaced(ctx); ok && rep.Destination.ID == active.ID {
+						fmt.Fprint(w, replacementNotice(rep, "  "))
+					}
+					if rb, ok, _ := store.RolledBack(ctx); ok && rb.Destination.ID == active.ID {
+						fmt.Fprint(w, rollbackNotice(rb, "  "))
+					}
 				default:
 					fmt.Fprintf(w, "Destination    the collector last delivered to %s; the configured destination differs (see `vario destination`)\n", active)
 				}
@@ -122,6 +128,15 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 				fmt.Fprintf(w, "  last delivery  %s (%s rows)\n", at.Local().Format(time.DateTime), v)
 			} else {
 				fmt.Fprintln(w, "  last delivery  never")
+			}
+			if id := store.Selected(); hasState && id > 0 {
+				// How far ClickHouse acknowledged delivery (see spool.Checkpoint).
+				// It says nothing about the database's state now: `vario doctor` compares.
+				if cp, err := store.Checkpoint(ctx, id); err == nil && cp.Confirmed > 0 {
+					fmt.Fprintf(w, "  checkpoint     %d acknowledged by ClickHouse (%s)\n", cp.Confirmed, cp.At.Local().Format(time.DateTime))
+				} else if err == nil {
+					fmt.Fprintln(w, "  checkpoint     none yet (a database restored to an earlier state is not detected; see `vario doctor`)")
+				}
 			}
 			if v, at, ok, _ := store.KV(ctx, "delivery.last_error"); ok && v != "" {
 				fmt.Fprintf(w, "  last error     %s (%s)\n", v, at.Local().Format(time.DateTime))

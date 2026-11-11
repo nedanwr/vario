@@ -24,7 +24,7 @@ type fakeServer struct {
 
 	dbExists bool
 	dbs      []string
-	tables   []string // existing objects: "name|engine|as_select|comment[|sorting_key|engine_full]"
+	tables   []string // existing objects: "name|engine|as_select|comment[|sorting_key|engine_full[|partition_key]]"
 	columns  []string // "table|name|type"
 	meta     []string // vario_meta rows: "key|value"
 
@@ -42,6 +42,13 @@ type fakeServer struct {
 	grants     []string // "user|role|access|database|table|partial|grant_option" (empty = NULL)
 	noSystem   map[string]bool
 
+	checkpoints  map[string]uint64 // vario_checkpoints: writer -> highest seq
+	cpParams     []url.Values      // URL parameters of every checkpoint read and write
+	cpBodies     []string          // bodies of checkpoint inserts
+	cpSettingErr int               // error code for a checkpoint read that changes a setting
+	cpReadErr    int               // error code for every checkpoint read
+	cpWriteErr   int               // error code for every checkpoint insert
+
 	fail    map[string]int // statement prefix -> error code
 	queries []string
 	execs   []string
@@ -49,7 +56,7 @@ type fakeServer struct {
 
 func newFake(t *testing.T) (*fakeServer, *httptest.Server) {
 	f := &fakeServer{password: "pw-123", dbExists: true, denied: map[string]bool{}, insertDenied: map[string]bool{},
-		noSystem: map[string]bool{}, fail: map[string]int{}}
+		noSystem: map[string]bool{}, fail: map[string]int{}, checkpoints: map[string]uint64{}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, srv
@@ -60,6 +67,8 @@ var (
 	userEqRe   = regexp.MustCompile(`user_name = '([^']*)'`)
 	roleEqRe   = regexp.MustCompile(`role_name = '([^']*)'`)
 	insertToRe = regexp.MustCompile("^INSERT INTO `[^`]*`\\.`([^`]*)` FORMAT JSONEachRow$")
+	cpReadRe   = regexp.MustCompile("^SELECT max\\(seq\\) AS seq, count\\(\\) AS n FROM `[^`]*`\\.`vario_checkpoints` WHERE writer_id = '((?:[^'\\\\]|\\\\.)*)'$")
+	cpRowRe    = regexp.MustCompile(`^\{"writer_id":"([^"]*)","seq":(\d+)\}\n$`)
 )
 
 func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -111,14 +120,48 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case strings.Contains(q, "system.tables"):
 		for _, t := range f.tables {
-			p := append(strings.Split(t, "|"), "", "")
-			rows = append(rows, fmt.Sprintf(`{"name":%q,"engine":%q,"as_select":%q,"comment":%q,"sorting_key":%q,"engine_full":%q}`, p[0], p[1], p[2], p[3], p[4], p[5]))
+			p := append(strings.Split(t, "|"), "", "", "")
+			rows = append(rows, fmt.Sprintf(`{"name":%q,"engine":%q,"as_select":%q,"comment":%q,"sorting_key":%q,"engine_full":%q,"partition_key":%q}`, p[0], p[1], p[2], p[3], p[4], p[5], p[6]))
 		}
 	case strings.Contains(q, "system.columns"):
 		for _, c := range f.columns {
 			p := strings.Split(c, "|")
 			rows = append(rows, fmt.Sprintf(`{"table":%q,"name":%q,"type":%q}`, p[0], p[1], p[2]))
 		}
+	case cpReadRe.MatchString(q):
+		f.cpParams = append(f.cpParams, r.URL.Query())
+		if f.cpSettingErr != 0 && r.URL.Query().Get("select_sequential_consistency") != "" {
+			fail(f.cpSettingErr, "Setting select_sequential_consistency should not be changed")
+			return
+		}
+		if f.cpReadErr != 0 {
+			fail(f.cpReadErr, "simulated failure")
+			return
+		}
+		seq, ok := f.checkpoints[cpReadRe.FindStringSubmatch(q)[1]]
+		n := 0
+		if ok {
+			n = 1
+		}
+		rows = []string{fmt.Sprintf(`{"seq":%d,"n":%d}`, seq, n)}
+	case insertToRe.MatchString(q) && len(b) > 0 && insertToRe.FindStringSubmatch(q)[1] == CheckpointTable:
+		f.cpParams = append(f.cpParams, r.URL.Query())
+		f.cpBodies = append(f.cpBodies, string(b))
+		if f.cpWriteErr != 0 {
+			fail(f.cpWriteErr, "simulated failure")
+			return
+		}
+		m := cpRowRe.FindStringSubmatch(string(b))
+		if m == nil {
+			fail(27, "Cannot parse input")
+			return
+		}
+		var seq uint64
+		fmt.Sscan(m[2], &seq)
+		if seq > f.checkpoints[m[1]] {
+			f.checkpoints[m[1]] = seq
+		}
+		return
 	case strings.HasPrefix(q, "SELECT key, value FROM"):
 		for _, m := range f.meta {
 			k, v, _ := strings.Cut(m, "|")
@@ -212,8 +255,19 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // completeSchema returns system.tables and system.columns rows for an
-// up-to-date Vario schema (version 2) and its vario_meta rows.
+// up-to-date Vario schema (version 3) and its vario_meta rows.
 func completeSchema(db string) (tables, columns, meta []string) {
+	tables, columns, _ = v2Schema(db)
+	tables = append(tables, CheckpointTable+"|ReplacingMergeTree||"+checkpointTag)
+	for _, c := range expectedColumns(checkpointDDL(db)) {
+		columns = append(columns, CheckpointTable+"|"+c.name+"|"+c.typ)
+	}
+	return tables, columns, []string{"destination_id|11111111-2222-4333-8444-555555555555", "schema_version|3"}
+}
+
+// v2Schema returns a schema migrated by a Vario version before delivery
+// checkpoints: vario_meta with a destination id, no vario_checkpoints.
+func v2Schema(db string) (tables, columns, meta []string) {
 	tables, columns = legacySchema(db)
 	tables = append(tables, MetaTable+"|MergeTree||"+metaTag)
 	for _, c := range expectedColumns(metaDDL(db)) {
@@ -226,7 +280,7 @@ func completeSchema(db string) (tables, columns, meta []string) {
 func legacySchema(db string) (tables, columns []string) {
 	ddl := tableDDL(db)
 	for _, name := range requiredTables() {
-		tables = append(tables, tableRow(name, "ReplacingMergeTree(version)", sortingKeys[name]))
+		tables = append(tables, tableRow(name, "ReplacingMergeTree(version)", sortingKeys[name], partitionKeys[name]))
 		for _, c := range expectedColumns(ddl[name]) {
 			columns = append(columns, name+"|"+c.name+"|"+c.typ)
 		}
@@ -251,14 +305,34 @@ var sortingKeys = map[string]string{
 	model.TableRawEvents:       "source_id, sequence, event_id",
 }
 
+// partitionKeys are the partition keys of Vario's tables as ClickHouse
+// reports them in system.tables.partition_key ("" for an unpartitioned
+// table). Like sortingKeys, they are written out so that a changed PARTITION
+// BY is noticed.
+var partitionKeys = map[string]string{
+	model.TableSources:         "",
+	model.TableProjects:        "",
+	model.TableConversations:   "toYYYYMM(created_at)",
+	model.TableRuns:            "toYYYYMM(conversation_created_at)",
+	model.TableMessages:        "toYYYYMM(conversation_created_at)",
+	model.TableExecutionEvents: "toYYYYMM(conversation_created_at)",
+	model.TableProviderTurns:   "toYYYYMM(conversation_created_at)",
+	model.TableRawEvents:       "toYYYYMM(occurred_at)",
+}
+
 // tableRow is the system.tables row of a ReplacingMergeTree table with the
-// given engine clause and sorting key, in the format ClickHouse reports.
-func tableRow(name, engine, sortingKey string) string {
+// given engine clause, sorting key and partition key, in the format
+// ClickHouse reports.
+func tableRow(name, engine, sortingKey, partitionKey string) string {
 	order := sortingKey
 	if strings.Contains(order, ",") {
 		order = "(" + order + ")"
 	}
-	return name + "|ReplacingMergeTree||" + "|" + sortingKey + "|" + engine + " ORDER BY " + order + " SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 8192"
+	full := engine
+	if partitionKey != "" {
+		full += " PARTITION BY " + partitionKey
+	}
+	return name + "|ReplacingMergeTree||" + "|" + sortingKey + "|" + full + " ORDER BY " + order + " SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 8192|" + partitionKey
 }
 
 // mutations returns the recorded statements that change ClickHouse.
