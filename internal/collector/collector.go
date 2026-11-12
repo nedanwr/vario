@@ -283,12 +283,24 @@ type SnapshotResult struct {
 // Snapshot reads the source's full state into the spool and then advances its
 // cursor. If interrupted, the cursor is untouched and the next run repeats the
 // snapshot; already-queued records are skipped by fingerprint.
+//
+// A forced snapshot re-sends records the destination may already have had,
+// possibly in the same batches as before. It is a historical replay, not a
+// retry, and is queued under a new replay identity (spool.BeginReplay):
+// otherwise ClickHouse, which remembers the insert tokens of the earlier
+// delivery even after its rows were deleted or replaced, would acknowledge
+// the batches without restoring anything.
 func (c *Collector) Snapshot(ctx context.Context, src sources.Source, force, includeHistory bool) (SnapshotResult, error) {
 	start := time.Now()
 	var res SnapshotResult
 	prev, _, err := c.store.Cursor(ctx, src.ID())
 	if err != nil {
 		return res, err
+	}
+	if force {
+		if err := c.store.BeginReplay(ctx); err != nil {
+			return res, err
+		}
 	}
 	next, err := src.Snapshot(ctx, prev, includeHistory, func(recs []model.Record) error {
 		r, err := c.store.Commit(ctx, src.ID(), recs, nil, c.commitOpts(force))

@@ -290,7 +290,9 @@ type CommitOptions struct {
 	// PolicyFingerprint is mixed into record fingerprints so that changing
 	// privacy settings re-emits affected records.
 	PolicyFingerprint string
-	// Force enqueues records even when their content is unchanged.
+	// Force enqueues records even when their content is unchanged. A forced
+	// re-send is a historical replay: start it with BeginReplay, so that
+	// ClickHouse does not take it for a retry of the earlier delivery.
 	Force bool
 	// MaxRowsPerEntry bounds queue entry size.
 	MaxRowsPerEntry int
@@ -368,6 +370,7 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 	if maxRows <= 0 {
 		maxRows = 1000
 	}
+	replay := ""
 	tables := make([]string, 0, len(byTable))
 	for t := range byTable {
 		tables = append(tables, t)
@@ -394,9 +397,14 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 			}
 			lines = append(lines, p.line)
 		}
+		if len(lines) > 0 && replay == "" {
+			if replay, err = replayIdentity(ctx, tx, s.dest); err != nil {
+				return res, err
+			}
+		}
 		for start := 0; start < len(lines); start += maxRows {
 			end := min(start+maxRows, len(lines))
-			if err := insertEntry(ctx, tx, s.dest, table, lines[start:end]); err != nil {
+			if err := insertEntry(ctx, tx, s.dest, replay, table, lines[start:end]); err != nil {
 				return res, err
 			}
 			res.Enqueued += end - start
@@ -412,13 +420,18 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 	return res, tx.Commit()
 }
 
-func insertEntry(ctx context.Context, tx *sql.Tx, dest int64, table string, lines [][]byte) error {
+// insertEntry queues lines for table. The entry's token is the
+// insert_deduplication_token of its delivery: it is derived from the table,
+// the destination's replay identity and the rows, and stored with the entry,
+// so every retry of the entry (a failed or unanswered insert, a restart)
+// carries the same token and ClickHouse stores the rows at most once.
+func insertEntry(ctx context.Context, tx *sql.Tx, dest int64, replay, table string, lines [][]byte) error {
 	var raw bytes.Buffer
 	for _, l := range lines {
 		raw.Write(l)
 		raw.WriteByte('\n')
 	}
-	sum := sha256.Sum256(append([]byte(table+"\x00"), raw.Bytes()...))
+	sum := sha256.Sum256(append([]byte(table+"\x00"+replay+"\x00"), raw.Bytes()...))
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
 	if _, err := zw.Write(raw.Bytes()); err != nil {
@@ -608,6 +621,10 @@ func (s *Store) ResetSource(ctx context.Context, sourceID string) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fingerprints WHERE destination_id = ? AND source_id = ?`, s.dest, sourceID); err != nil {
+		return err
+	}
+	// The re-read is a replay (see replay.go).
+	if _, err := newReplay(ctx, tx, s.dest); err != nil {
 		return err
 	}
 	return tx.Commit()

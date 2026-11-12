@@ -507,13 +507,18 @@ func (s *Store) takePending(ctx context.Context, id int64, stmt string, args ...
 // source without a cursor is read again in full, and without fingerprints
 // every record is queued again; records the destination already has carry the
 // same keys and versions, so ReplacingMergeTree keeps one row per record.
+//
+// That re-read is a historical replay, so the destination also gets a new
+// replay identity: the database may still remember the insert tokens of the
+// rows it lost (see replay.go).
 func invalidateSync(ctx context.Context, q querier, id int64) error {
 	for _, stmt := range []string{`DELETE FROM cursors WHERE destination_id = ?`, `DELETE FROM fingerprints WHERE destination_id = ?`} {
 		if _, err := q.ExecContext(ctx, stmt, id); err != nil {
 			return err
 		}
 	}
-	return nil
+	_, err := newReplay(ctx, q, id)
+	return err
 }
 
 // LabelLegacy assigns state of an earlier Vario version (which recorded no
