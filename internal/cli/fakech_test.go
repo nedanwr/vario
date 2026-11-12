@@ -384,7 +384,7 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for n, o := range f.objects[db] {
 			if u.sees(db, n) {
 				data = append(data, map[string]any{"name": n, "engine": o.engine, "as_select": "", "comment": o.comment,
-					"sorting_key": o.sortingKey, "engine_full": o.engineFull, "partition_key": o.partitionKey})
+					"sorting_key": o.sortingKey, "engine_full": o.engineFull, "partition_key": o.partitionKey, "primary_key": o.sortingKey})
 			}
 		}
 	case strings.Contains(q, "FROM system.columns"):

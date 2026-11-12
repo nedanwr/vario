@@ -439,6 +439,18 @@ func engineArgs(engine, engineFull string) []string {
 	return nil
 }
 
+var versionArgRe = regexp.MustCompile(`(?m)^\) ENGINE = ReplacingMergeTree\(([a-z_]+)\)$`)
+
+// expectedVersionArg extracts the version column of ReplacingMergeTree from
+// Vario's table DDL ("version" for the data tables, "seq" for checkpoints).
+func expectedVersionArg(ddl string) string {
+	m := versionArgRe.FindStringSubmatch(ddl)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
 var partitionByRe = regexp.MustCompile(`(?m)^PARTITION BY (.+)$`)
 
 // expectedPartitionKey extracts the PARTITION BY expression from Vario's
@@ -479,12 +491,12 @@ func checkEngine(ddl, engine, engineFull, sortingKey, partitionKey string) []str
 		}
 		bad = append(bad, fmt.Sprintf("sorting key (ORDER BY) is %s, expected %s", got, want))
 	}
-	if args := engineArgs(engine, engineFull); len(args) != 1 || args[0] != "version" {
+	if want, args := expectedVersionArg(ddl), engineArgs(engine, engineFull); len(args) != 1 || args[0] != want {
 		got := "none"
 		if len(args) > 0 {
 			got = strings.Join(args, ", ")
 		}
-		bad = append(bad, fmt.Sprintf("ReplacingMergeTree version argument is %s, expected version", got))
+		bad = append(bad, fmt.Sprintf("ReplacingMergeTree version argument is %s, expected %s", got, want))
 	}
 	if want := expectedPartitionKey(ddl); normalizePartitionKey(partitionKey) != normalizePartitionKey(want) {
 		got := partitionKey
@@ -657,8 +669,9 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 		SortingKey   string `json:"sorting_key"`
 		EngineFull   string `json:"engine_full"`
 		PartitionKey string `json:"partition_key"`
+		PrimaryKey   string `json:"primary_key"`
 	}
-	if err := c.Query(ctx, fmt.Sprintf("SELECT name, engine, as_select, comment, sorting_key, engine_full, partition_key FROM system.tables WHERE database = '%s'", db), &objects); err != nil {
+	if err := c.Query(ctx, fmt.Sprintf("SELECT name, engine, as_select, comment, sorting_key, engine_full, partition_key, primary_key FROM system.tables WHERE database = '%s'", db), &objects); err != nil {
 		return st, err
 	}
 	var cols []struct {
@@ -669,10 +682,10 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 	if err := c.Query(ctx, fmt.Sprintf("SELECT table, name, type FROM system.columns WHERE database = '%s'", db), &cols); err != nil {
 		return st, err
 	}
-	type object struct{ engine, asSelect, comment, sortingKey, engineFull, partitionKey string }
+	type object struct{ engine, asSelect, comment, sortingKey, engineFull, partitionKey, primaryKey string }
 	have := map[string]object{}
 	for _, o := range objects {
-		have[o.Name] = object{o.Engine, o.AsSelect, o.Comment, o.SortingKey, o.EngineFull, o.PartitionKey}
+		have[o.Name] = object{o.Engine, o.AsSelect, o.Comment, o.SortingKey, o.EngineFull, o.PartitionKey, o.PrimaryKey}
 	}
 	colTypes := map[string]map[string]string{}
 	for _, col := range cols {
@@ -740,7 +753,26 @@ func (c *Client) InspectSchema(ctx context.Context) (SchemaStatus, error) {
 		}
 	}
 	if o, ok := have[CheckpointTable]; ok {
-		bad := checkColumns(CheckpointTable, checkpointDDL(c.database))
+		// The checkpoint is read as max(seq) per writer, but only a table that
+		// stores what it acknowledges can be trusted: ENGINE = Null (or any
+		// engine that drops or reorders rows) accepts checkpoint inserts and
+		// discards them, so a database restored to an earlier state could not
+		// be detected. The engine is verified like the data tables'.
+		cpDDL := checkpointDDL(c.database)
+		var bad []string
+		if strings.Contains(o.engine, "ReplacingMergeTree") {
+			bad = checkEngine(cpDDL, o.engine, o.engineFull, o.sortingKey, o.partitionKey)
+			if normalizeKey(o.primaryKey) != normalizeKey(o.sortingKey) {
+				got := o.primaryKey
+				if got == "" {
+					got = "empty"
+				}
+				bad = append(bad, fmt.Sprintf("primary key is %s, expected %s", got, expectedSortingKey(cpDDL)))
+			}
+		} else {
+			bad = append(bad, fmt.Sprintf("engine is %s, expected ReplacingMergeTree", o.engine))
+		}
+		bad = append(bad, checkColumns(CheckpointTable, cpDDL)...)
 		switch {
 		case o.comment != checkpointTag:
 			st.Problems = append(st.Problems, fmt.Sprintf("table %s exists but was not created by Vario", CheckpointTable))

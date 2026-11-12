@@ -24,7 +24,7 @@ type fakeServer struct {
 
 	dbExists bool
 	dbs      []string
-	tables   []string // existing objects: "name|engine|as_select|comment[|sorting_key|engine_full[|partition_key]]"
+	tables   []string // existing objects: "name|engine|as_select|comment[|sorting_key|engine_full[|partition_key[|primary_key]]]"
 	columns  []string // "table|name|type"
 	meta     []string // vario_meta rows: "key|value"
 
@@ -120,8 +120,13 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case strings.Contains(q, "system.tables"):
 		for _, t := range f.tables {
-			p := append(strings.Split(t, "|"), "", "", "")
-			rows = append(rows, fmt.Sprintf(`{"name":%q,"engine":%q,"as_select":%q,"comment":%q,"sorting_key":%q,"engine_full":%q,"partition_key":%q}`, p[0], p[1], p[2], p[3], p[4], p[5], p[6]))
+			p := append(strings.Split(t, "|"), "", "", "", "")
+			if len(strings.Split(t, "|")) < 8 {
+				// ClickHouse reports the sorting key as primary key unless
+				// PRIMARY KEY is given.
+				p[7] = p[4]
+			}
+			rows = append(rows, fmt.Sprintf(`{"name":%q,"engine":%q,"as_select":%q,"comment":%q,"sorting_key":%q,"engine_full":%q,"partition_key":%q,"primary_key":%q}`, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]))
 		}
 	case strings.Contains(q, "system.columns"):
 		for _, c := range f.columns {
@@ -258,12 +263,16 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // up-to-date Vario schema (version 3) and its vario_meta rows.
 func completeSchema(db string) (tables, columns, meta []string) {
 	tables, columns, _ = v2Schema(db)
-	tables = append(tables, CheckpointTable+"|ReplacingMergeTree||"+checkpointTag)
+	tables = append(tables, checkpointRow)
 	for _, c := range expectedColumns(checkpointDDL(db)) {
 		columns = append(columns, CheckpointTable+"|"+c.name+"|"+c.typ)
 	}
 	return tables, columns, []string{"destination_id|11111111-2222-4333-8444-555555555555", "schema_version|3"}
 }
+
+// checkpointRow is the system.tables row of vario_checkpoints as Vario
+// creates it, in the format ClickHouse reports.
+const checkpointRow = CheckpointTable + "|ReplacingMergeTree||" + checkpointTag + "|writer_id|ReplacingMergeTree(seq) ORDER BY writer_id SETTINGS index_granularity = 8192||writer_id"
 
 // v2Schema returns a schema migrated by a Vario version before delivery
 // checkpoints: vario_meta with a destination id, no vario_checkpoints.

@@ -427,6 +427,199 @@ func TestSortingKeyAndVersionAreVerified(t *testing.T) {
 	}
 }
 
+// cpRow is a system.tables row of vario_checkpoints, owned by Vario (its
+// comment), with the given engine, keys and engine_full.
+func cpRow(engine, sortingKey, engineFull, partitionKey, primaryKey string) string {
+	return strings.Join([]string{CheckpointTable, engine, "", checkpointTag, sortingKey, engineFull, partitionKey, primaryKey}, "|")
+}
+
+// setColumn replaces (or, with typ "", removes) a column of the fake schema.
+func setColumn(f *fakeServer, table, name, typ string) {
+	var out []string
+	for _, c := range f.columns {
+		if !strings.HasPrefix(c, table+"|"+name+"|") {
+			out = append(out, c)
+		}
+	}
+	if typ != "" {
+		out = append(out, table+"|"+name+"|"+typ)
+	}
+	f.columns = out
+}
+
+// P2: a vario_checkpoints table that carries Vario's comment and columns but
+// another engine, key, partitioning or version column does not keep the
+// checkpoints Vario writes (ENGINE = Null acknowledges inserts and discards
+// them), so a database restored to an earlier state would go unnoticed. It
+// is an incompatible schema for the collector, doctor and migrate alike, it
+// is never reported as up to date, and it is never modified.
+func TestCheckpointSchemaIsVerified(t *testing.T) {
+	const opts = " SETTINGS index_granularity = 8192"
+	cases := []struct {
+		name, row string
+		col, typ  string // a changed column ("" type: missing)
+		want      string
+	}{
+		{name: "null engine", row: cpRow("Null", "", "Null", "", ""),
+			want: "table vario_checkpoints: engine is Null, expected ReplacingMergeTree"},
+		{name: "memory engine", row: cpRow("Memory", "", "Memory", "", ""), want: "engine is Memory, expected ReplacingMergeTree"},
+		{name: "plain MergeTree", row: cpRow("MergeTree", "writer_id", "MergeTree ORDER BY writer_id"+opts, "", "writer_id"),
+			want: "engine is MergeTree, expected ReplacingMergeTree"},
+		{name: "sorting key seq", row: cpRow("ReplacingMergeTree", "seq", "ReplacingMergeTree(seq) ORDER BY seq"+opts, "", "seq"),
+			want: "table vario_checkpoints: sorting key (ORDER BY) is seq, expected writer_id"},
+		{name: "longer sorting key", row: cpRow("ReplacingMergeTree", "writer_id, seq", "ReplacingMergeTree(seq) ORDER BY (writer_id, seq)"+opts, "", "writer_id, seq"),
+			want: "sorting key (ORDER BY) is writer_id, seq, expected writer_id"},
+		{name: "no sorting key", row: cpRow("ReplacingMergeTree", "", "ReplacingMergeTree(seq) ORDER BY tuple()"+opts, "", ""),
+			want: "sorting key (ORDER BY) is empty, expected writer_id"},
+		{name: "empty primary key", row: cpRow("ReplacingMergeTree", "writer_id", "ReplacingMergeTree(seq) PRIMARY KEY tuple() ORDER BY writer_id"+opts, "", ""),
+			want: "primary key is empty, expected writer_id"},
+		{name: "partitioned", row: cpRow("ReplacingMergeTree", "writer_id", "ReplacingMergeTree(seq) PARTITION BY toYYYYMM(written_at) ORDER BY writer_id"+opts, "toYYYYMM(written_at)", "writer_id"),
+			want: "partition key (PARTITION BY) is toYYYYMM(written_at), expected none"},
+		{name: "no version column", row: cpRow("ReplacingMergeTree", "writer_id", "ReplacingMergeTree ORDER BY writer_id"+opts, "", "writer_id"),
+			want: "ReplacingMergeTree version argument is none, expected seq"},
+		{name: "other version column", row: cpRow("ReplacingMergeTree", "writer_id", "ReplacingMergeTree(written_at) ORDER BY writer_id"+opts, "", "writer_id"),
+			want: "ReplacingMergeTree version argument is written_at, expected seq"},
+		{name: "is_deleted", row: cpRow("ReplacingMergeTree", "writer_id", "ReplacingMergeTree(seq, flag) ORDER BY writer_id"+opts, "", "writer_id"),
+			want: "version argument is seq, flag, expected seq"},
+		{name: "missing seq", row: cpRow("ReplacingMergeTree", "writer_id", "ReplacingMergeTree(written_at) ORDER BY writer_id"+opts, "", "writer_id"),
+			col: "seq", want: "version argument is written_at, expected seq, missing column seq"},
+		{name: "seq type", row: checkpointRow, col: "seq", typ: "UInt32",
+			want: "table vario_checkpoints: column seq is UInt32, expected UInt64"},
+		{name: "signed seq", row: checkpointRow, col: "seq", typ: "Int64", want: "column seq is Int64, expected UInt64"},
+		{name: "writer_id type", row: checkpointRow, col: "writer_id", typ: "LowCardinality(String)",
+			want: "column writer_id is LowCardinality(String), expected String"},
+		{name: "missing writer_id", row: checkpointRow, col: "writer_id", want: "missing column writer_id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, srv := newFake(t)
+			c := testClient(t, srv.URL)
+			f.tables, f.columns, f.meta = completeSchema("vario")
+			setTable(f, CheckpointTable, tc.row)
+			if tc.col != "" {
+				setColumn(f, CheckpointTable, tc.col, tc.typ)
+			}
+
+			st, err := c.InspectSchema(bg)
+			if err != nil || st.Usable() || st.Complete() || st.Checkpoints || len(st.Problems) != 1 || !strings.Contains(st.Problems[0], tc.want) {
+				t.Fatalf("inspect: %q checkpoints=%v %v", st.Problems, st.Checkpoints, err)
+			}
+			// Collector startup: nothing is delivered (data stays spooled).
+			var se *SchemaError
+			if info, err := c.CheckDestination(bg); !errors.As(err, &se) || info.Checkpoints {
+				t.Fatalf("the collector must not deliver: %+v %v", info, err)
+			}
+			// Doctor: an issue, never healthy, and no insert probe.
+			r, err := c.CheckConnection(bg)
+			if err != nil || r.Ready() || r.Issues[0].Kind != KindSchema || !strings.Contains(r.Issues[0].Message, tc.want) || r.Probe == "ok" {
+				t.Fatalf("doctor must report it: %+v %v", r, err)
+			}
+			for _, w := range r.Warnings {
+				if strings.Contains(w, "up to date") {
+					t.Fatalf("doctor must not call it up to date: %q", w)
+				}
+			}
+			// Migrate: stops without planning or applying anything.
+			if p, err := c.PlanSchema(bg); !errors.As(err, &se) || !p.Empty() {
+				t.Fatalf("migrate must stop: %+v %v", p, err)
+			}
+			if _, err := c.VerifyMigrated(bg); !errors.As(err, &se) {
+				t.Fatalf("verify: %v", err)
+			}
+			readOnly(t, f)
+		})
+	}
+
+	// What Vario creates is accepted, also replicated or shared, with quoting
+	// and PARTITION BY tuple() (the same as no partitioning).
+	for name, row := range map[string]string{
+		"as created": checkpointRow,
+		"replicated": cpRow("ReplicatedReplacingMergeTree", "writer_id",
+			"ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', seq) ORDER BY writer_id"+opts, "", "writer_id"),
+		"shared": cpRow("SharedReplacingMergeTree", "`writer_id`",
+			"SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', `seq`) ORDER BY writer_id"+opts, "tuple()", "writer_id"),
+	} {
+		f, srv := newFake(t)
+		c := testClient(t, srv.URL)
+		f.tables, f.columns, f.meta = completeSchema("vario")
+		setTable(f, CheckpointTable, row)
+		if st, err := c.InspectSchema(bg); err != nil || !st.Complete() || !st.Checkpoints {
+			t.Fatalf("%s: a compatible checkpoint table must be accepted: %q %v", name, st.Problems, err)
+		}
+		if info, err := c.CheckDestination(bg); err != nil || !info.Checkpoints || len(info.Warnings) != 0 {
+			t.Fatalf("%s: collector: %+v %v", name, info, err)
+		}
+		if r, err := c.CheckConnection(bg); err != nil || !r.Ready() || r.Probe != "ok" {
+			t.Fatalf("%s: doctor: %+v %v", name, r, err)
+		}
+		if p, err := c.PlanSchema(bg); err != nil || !p.Empty() {
+			t.Fatalf("%s: migrate: %+v %v", name, p, err)
+		}
+	}
+}
+
+// Upgrading a version 1 or 2 schema creates the checkpoint table; one that
+// already exists with an incompatible engine stops the upgrade instead of
+// being reused, and the version is not recorded even if it appears between
+// planning and applying (CREATE TABLE IF NOT EXISTS keeps it).
+func TestCheckpointUpgradeRefusesIncompatibleTable(t *testing.T) {
+	nullRow := cpRow("Null", "", "Null", "", "")
+	for name, schema := range map[string]func() (tables, columns, meta []string){
+		"version 1": func() ([]string, []string, []string) { tb, cl := legacySchema("vario"); return tb, cl, nil },
+		"version 2": func() ([]string, []string, []string) { return v2Schema("vario") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, srv := newFake(t)
+			c := testClient(t, srv.URL)
+			admin := &Admin{c}
+			f.tables, f.columns, f.meta = schema()
+			// The legitimate upgrade path plans the checkpoint table.
+			p, err := c.PlanSchema(bg)
+			if err != nil || !strings.Contains(p.Steps[len(p.Steps)-1].SQL, "'schema_version', '3'") {
+				t.Fatalf("upgrade plan: %+v %v", p, err)
+			}
+			var cpStep bool
+			for _, s := range p.Steps {
+				cpStep = cpStep || strings.Contains(s.SQL, "CREATE TABLE IF NOT EXISTS `vario`.`"+CheckpointTable+"`")
+			}
+			if !cpStep {
+				t.Fatalf("the upgrade must create %s: %+v", CheckpointTable, p.Steps)
+			}
+
+			// An incompatible table already there: nothing is planned.
+			tables := f.tables
+			f.tables = append(append([]string(nil), tables...), nullRow)
+			for _, c := range expectedColumns(checkpointDDL("vario")) {
+				f.columns = append(f.columns, CheckpointTable+"|"+c.name+"|"+c.typ)
+			}
+			var se *SchemaError
+			if q, err := c.PlanSchema(bg); !errors.As(err, &se) || !q.Empty() || !strings.Contains(err.Error(), "engine is Null") {
+				t.Fatalf("migrate must stop: %+v %v", q, err)
+			}
+			readOnly(t, f)
+
+			// The table appears after planning: the upgrade runs, CREATE ... IF
+			// NOT EXISTS leaves the table alone, and the version is not recorded.
+			if f.meta == nil {
+				f.meta = []string{"destination_id|11111111-2222-4333-8444-555555555555"}
+			}
+			res := admin.Apply(bg, p, nil)
+			if res.OK() || res.Failed == nil || !strings.Contains(res.Failed.Summary, "record schema version") {
+				t.Fatalf("the version must not be recorded: %+v", res)
+			}
+			for _, m := range f.mutations() {
+				if strings.Contains(m, "schema_version") || strings.Contains(m, "DROP") || strings.Contains(m, "ALTER") ||
+					strings.Contains(m, "TRUNCATE") || strings.Contains(m, "REPLACE TABLE") {
+					t.Fatalf("unexpected statement: %s", m)
+				}
+			}
+			if _, err := c.VerifyMigrated(bg); !errors.As(err, &se) {
+				t.Fatalf("verify: %v", err)
+			}
+		})
+	}
+}
+
 func TestEngineArgs(t *testing.T) {
 	for full, want := range map[string]string{
 		"ReplacingMergeTree(version) ORDER BY a":                            "version",

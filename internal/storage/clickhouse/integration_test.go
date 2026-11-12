@@ -591,3 +591,88 @@ func TestIntegrationCheckpointTable(t *testing.T) {
 		t.Fatalf("the new table is empty: %d %v %v", seq, found, err)
 	}
 }
+
+// P2: a vario_checkpoints table with Vario's comment and columns but another
+// engine, key, partitioning, version column or column type passed the check
+// before. ENGINE = Null acknowledges checkpoint inserts and discards them.
+// On a real server every variant is rejected by migrate (from version 3 and
+// from version 2), doctor and the collector's check, and is left as it is.
+func TestIntegrationCheckpointSchemaVerified(t *testing.T) {
+	ctx := context.Background()
+	const engine = "ENGINE = ReplacingMergeTree(seq)\nORDER BY writer_id"
+	cases := []struct{ name, from, to, want string }{
+		{"null engine", engine, "ENGINE = Null", "engine is Null, expected ReplacingMergeTree"},
+		{"plain MergeTree", "ReplacingMergeTree(seq)", "MergeTree", "engine is MergeTree, expected ReplacingMergeTree"},
+		{"sorting key", "ORDER BY writer_id", "ORDER BY (writer_id, seq)", "sorting key (ORDER BY) is writer_id, seq, expected writer_id"},
+		{"primary key", "ORDER BY writer_id", "PRIMARY KEY tuple()\nORDER BY writer_id", "primary key is empty, expected writer_id"},
+		{"partition key", "ORDER BY writer_id", "PARTITION BY toYYYYMM(written_at)\nORDER BY writer_id", "partition key (PARTITION BY) is toYYYYMM(written_at), expected none"},
+		{"no version", "ReplacingMergeTree(seq)", "ReplacingMergeTree", "version argument is none, expected seq"},
+		{"other version column", "ReplacingMergeTree(seq)", "ReplacingMergeTree(written_at)", "version argument is written_at, expected seq"},
+		{"column type", "seq UInt64", "seq UInt32", "column seq is UInt32, expected UInt64"},
+	}
+	for _, tc := range cases {
+		for _, from := range []int{3, 2} {
+			t.Run(fmt.Sprintf("%s from version %d", tc.name, from), func(t *testing.T) {
+				c := integrationClient(t)
+				migrateAll(t, c)
+				info, err := c.CheckDestination(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				table := quoteIdent(c.Database()) + "." + quoteIdent(CheckpointTable)
+				meta := quoteIdent(c.Database()) + "." + quoteIdent(MetaTable)
+				// The test replaces the table; Vario never does.
+				ddl := checkpointDDL(c.Database())
+				bad := strings.Replace(ddl, tc.from, tc.to, 1)
+				if bad == ddl {
+					t.Fatal("the DDL was not rewritten")
+				}
+				stmts := []string{"DROP TABLE " + table, bad}
+				if from == 2 {
+					stmts = append(stmts, "TRUNCATE TABLE "+meta,
+						fmt.Sprintf("INSERT INTO %s (key, value) VALUES ('destination_id', '%s'), ('schema_version', '2')", meta, info.ServerID))
+				}
+				for _, q := range stmts {
+					if err := c.Exec(ctx, q); err != nil {
+						t.Fatalf("%s: %v", q, err)
+					}
+				}
+				if tc.name == "null engine" {
+					// The defect: the insert is acknowledged, the checkpoint is gone.
+					if err := c.WriteCheckpoint(ctx, "w1", 7); err != nil {
+						t.Fatal(err)
+					}
+					if _, found, err := c.ReadCheckpoint(ctx, "w1"); err != nil || found {
+						t.Fatalf("expected ENGINE = Null to discard the checkpoint (the reproduced defect): %v %v", found, err)
+					}
+				}
+				before := tableMetaOf(t, c, CheckpointTable)
+
+				st, err := c.InspectSchema(ctx)
+				if err != nil || st.Usable() || st.Complete() || st.Checkpoints || len(st.Problems) != 1 || !strings.Contains(st.Problems[0], tc.want) {
+					t.Fatalf("inspect: %q %v", st.Problems, err)
+				}
+				var se *SchemaError
+				if p, err := (&Admin{c}).PlanSchema(ctx); !errors.As(err, &se) || !p.Empty() {
+					t.Fatalf("migrate must stop: %+v %v", p, err)
+				}
+				if _, err := c.VerifyMigrated(ctx); !errors.As(err, &se) {
+					t.Fatalf("verify: %v", err)
+				}
+				if _, err := c.CheckDestination(ctx); !errors.As(err, &se) {
+					t.Fatalf("the collector must not deliver: %v", err)
+				}
+				r, err := c.CheckConnection(ctx)
+				if err != nil || r.Ready() || r.Issues[0].Kind != KindSchema || !strings.Contains(r.Issues[0].Message, tc.want) || r.Probe == "ok" {
+					t.Fatalf("doctor must report it: %+v %v", r, err)
+				}
+				if after := tableMetaOf(t, c, CheckpointTable); after != before {
+					t.Fatalf("the incompatible table was modified:\n%+v\n%+v", before, after)
+				}
+				if st, _ := c.InspectSchema(ctx); st.Recorded != from {
+					t.Fatalf("the schema version must stay %d: %d", from, st.Recorded)
+				}
+			})
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,5 +390,83 @@ func TestIntegrationVersion2DatabaseGetsCheckpoints(t *testing.T) {
 	var de *DestinationError
 	if _, err := e.collector(db).Prepare(ctx, true); !errors.As(err, &de) || !de.RolledBack || de.FoundCheckpoint != 0 {
 		t.Fatalf("a restore to the state before the migration must be refused: %v", err)
+	}
+}
+
+// P2: a vario_checkpoints table that carries Vario's comment and columns but
+// discards rows (ENGINE = Null) stops delivery at startup and while running:
+// rows stay spooled, nothing is acknowledged and no checkpoint is recorded,
+// until the table is replaced by an operator and `vario migrate` was run.
+func TestIntegrationIncompatibleCheckpointTableStopsDelivery(t *testing.T) {
+	e := newRecoveryEnv(t)
+	db := fmt.Sprintf("vario_cp_null_%d", time.Now().UnixNano())
+	e.migrate(db)
+	admin := e.clients[db]
+	table := "`" + db + "`." + clickhouse.CheckpointTable
+	toNull := func() {
+		t.Helper()
+		// The test replaces the table; Vario never does.
+		for _, q := range []string{"DROP TABLE " + table, "CREATE TABLE " + table +
+			" (writer_id String, seq UInt64, written_at DateTime64(3, 'UTC') DEFAULT now64(3)) ENGINE = Null COMMENT 'vario:checkpoints'"} {
+			if err := admin.Exec(ctx, q); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+		}
+	}
+	refused := func(c *Collector) {
+		t.Helper()
+		dr, err := c.Drain(ctx)
+		var se *clickhouse.SchemaError
+		if !errors.As(err, &se) || !strings.Contains(err.Error(), "engine is Null") || dr.Remaining == 0 {
+			t.Fatalf("delivery must be refused with rows kept: %+v %v", dr, err)
+		}
+	}
+
+	// At startup.
+	toNull()
+	c := e.collector(db)
+	if _, err := c.Prepare(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.syncOnce(ctx, e.src, c.log); err != nil {
+		t.Fatal(err)
+	}
+	refused(c)
+	if got := e.mustRead(db); got != (logical{}) {
+		t.Fatalf("nothing may be delivered: %+v", got)
+	}
+	destID := c.Destination().ID
+	if cp, _ := e.store.Checkpoint(ctx, destID); cp != (spool.Checkpoint{}) {
+		t.Fatalf("no checkpoint may be recorded: %+v", cp)
+	}
+
+	// Replaced by an operator and migrated: the spooled rows are delivered.
+	if err := admin.Exec(ctx, "DROP TABLE "+table); err != nil {
+		t.Fatal(err)
+	}
+	e.migrate(db)
+	e.syncAndDrain(c)
+	delivered := e.mustRead(db)
+	if delivered.Msgs != 2 || delivered.Convs != 1 {
+		t.Fatalf("after the migration: %+v", delivered)
+	}
+	local, held := e.checkpoints(db, destID)
+	if local.Confirmed == 0 || held != local.Confirmed {
+		t.Fatalf("checkpoints after the migration: %+v, held %d", local, held)
+	}
+
+	// While running: the next destination check refuses delivery.
+	toNull()
+	c.checkedAt = time.Now().Add(-2 * identityCheckInterval)
+	e.moreHistory(1)
+	if err := c.syncOnce(ctx, e.src, c.log); err != nil {
+		t.Fatal(err)
+	}
+	refused(c)
+	if got := e.mustRead(db); got != delivered {
+		t.Fatalf("nothing more may be delivered: %+v, was %+v", got, delivered)
+	}
+	if cp, _ := e.store.Checkpoint(ctx, destID); cp != local {
+		t.Fatalf("the checkpoint must not advance: %+v, was %+v", cp, local)
 	}
 }
