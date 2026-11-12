@@ -8,6 +8,7 @@ package model
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -44,6 +45,46 @@ type Envelope struct {
 }
 
 func (e *Envelope) Env() *Envelope { return e }
+
+// Policy generations.
+//
+// The version a row is stored with is the version its source assigned
+// (which orders the source's own revisions) under a *policy generation* in
+// the top GenerationBits bits:
+//
+//	generation << GenerationShift | source version
+//
+// The spool assigns the generation when it queues a row (see
+// spool.CommitOptions) and starts a new, higher one whenever the privacy
+// settings change. Every row produced under newer privacy settings therefore
+// has a higher version than every row produced under earlier ones, so under
+// ReplacingMergeTree it wins regardless of the order in which rows reach
+// ClickHouse: a retry of a row queued before the change can never become the
+// latest version again. Within a generation, the source version decides as
+// before. Rows of Vario versions without generations have generation 0.
+const (
+	GenerationBits  = 10
+	GenerationShift = 64 - GenerationBits
+	// MaxGeneration is the highest generation a version can carry.
+	MaxGeneration = 1<<GenerationBits - 1
+	// MaxSourceVersion is the highest version a source may assign.
+	MaxSourceVersion = 1<<GenerationShift - 1
+)
+
+// WithGeneration returns the stored version of a row with source version v
+// under policy generation gen.
+func WithGeneration(gen, v uint64) (uint64, error) {
+	if gen > MaxGeneration {
+		return 0, fmt.Errorf("policy generation %d exceeds the maximum %d", gen, MaxGeneration)
+	}
+	if v > MaxSourceVersion {
+		return 0, fmt.Errorf("source version %d exceeds the maximum %d", v, uint64(MaxSourceVersion))
+	}
+	return gen<<GenerationShift | v, nil
+}
+
+// Generation returns the policy generation of a stored version.
+func Generation(version uint64) uint64 { return version >> GenerationShift }
 
 // Time serializes as a ClickHouse DateTime64(3) literal in UTC, or null when zero.
 type Time struct{ time.Time }

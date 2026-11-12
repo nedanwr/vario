@@ -18,4 +18,18 @@ Vario handles potentially sensitive content. Transcripts and command output can 
 - **No telemetry.** Vario sends data only to the ClickHouse endpoint you configure.
 - Source databases are opened read-only and are never modified.
 
-Changing the collection or redaction settings applies to records collected afterwards. Existing records are re-sent under the new policy at the next periodic reconciliation (`reconcile_interval`) or on `vario backfill --source t3code --force`; this replaces the latest version of each row, but older versions remain in the base tables until ClickHouse merges them. Lowering the mode therefore does not immediately remove content already stored in ClickHouse; to purge it, delete it in ClickHouse yourself (for example `OPTIMIZE TABLE vario.messages FINAL` after re-sending, or dropping the affected tables and re-sending with `--force`).
+## Changing the privacy settings
+
+Changing `mode`, `redact_secrets`, `extra_redaction_patterns` or `max_field_bytes` starts a new *policy generation*. On its next sync the collector re-reads every source in full, event history included, and queues every record again under the new settings (for each destination, when it is next used). Every stored row carries its generation in the top bits of `version`, so a row produced under newer settings always outranks every row produced under earlier ones in `ReplacingMergeTree`. This holds even for rows of the earlier settings that were still queued, retried after a failed or unacknowledged insert, moved to another destination with `vario destination switch --move-pending`, or sent after a restart: whatever order they arrive in, they never become the latest version again. This works in both directions: raising the mode makes the newly allowed content the latest version just as lowering it removes it.
+
+**What is guaranteed (logical latest records).** Once the re-read has been delivered, the `*_latest`, `token_usage_daily` and `tool_usage` views, and any query using `FINAL` or `argMax(..., version)`, show for every record that still exists in the source only what the current settings allow. Token totals and record counts are unaffected, because each record is still counted once.
+
+**What is not guaranteed (physical retention).** Changing the settings does not erase anything:
+
+- Earlier versions of each row stay in the base tables until ClickHouse merges them, and plain `SELECT`s on the base tables (without `FINAL`) can return them. They also remain in backups, replicas, exports and anything else that copied the data before.
+- Until the re-read has been delivered (for example while ClickHouse is unreachable), the latest version of each record is still the one collected under the earlier settings.
+- A record that no longer exists in the source (a message or item hard-deleted from T3 Code) cannot be read again: its latest row stays as it was collected, and a row of it still queued under the earlier settings is delivered as it was.
+
+To purge content collected under earlier settings after the re-read has been delivered, delete it in ClickHouse yourself, for example with `OPTIMIZE TABLE vario.messages FINAL` (and likewise for the other tables), which merges each row down to its latest version, or by dropping the tables and re-sending with `vario migrate` and `vario backfill --source t3code --force`. Backups need to be handled separately.
+
+The generation is kept in the local state. If `state.db` is deleted or restored from an older copy, the collector notices at its first check of the database that it holds rows of a later generation than the local state, starts a generation above them and re-reads every source in full, before it delivers anything. Up to 1023 generations are available per database; after that the collector stops with an error, and the database has to be recreated (`vario migrate` into a new database, then `vario destination switch`).

@@ -517,6 +517,10 @@ func (f *fakeCH) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.rows[m[1]+"."+m[2]] += bytes.Count(data, []byte("\n"))
 		}
 		return
+	case strings.HasPrefix(q, "SELECT max(v) AS v FROM (SELECT max(version)"):
+		// The collector's policy generation check (Client.MaxVersion). Rows
+		// are only counted here, so the database holds no generation yet.
+		data = append(data, map[string]any{"v": 0})
 	case strings.HasPrefix(q, "SELECT"):
 	default:
 		if !u.admin {

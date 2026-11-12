@@ -45,6 +45,7 @@ type fakeSink struct {
 	cpAmbiguous   int    // the next n checkpoint writes are stored but reported as failed
 	beforeCPRead  func() // called (unlocked) at the start of ReadCheckpoint
 	ambiguousData int    // the next n inserts are stored but reported as failed
+	maxVersionErr error  // returned by MaxVersion
 
 	inserts []fakeInsert // every insert that reached the database
 	deduped int          // inserts acknowledged without writing (known token)
@@ -189,12 +190,46 @@ func (s *fakeSink) Insert(_ context.Context, table string, body []byte, token st
 		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
 			return err
 		}
+		// Versions carry the policy generation in their top bits, beyond
+		// float64 precision: keep the exact value next to the decoded row.
+		var v struct {
+			Version uint64 `json:"version"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &v); err != nil {
+			return err
+		}
+		m[exactVersion] = v.Version
 		s.rows[table] = append(s.rows[table], m)
 	}
 	if lost {
 		return errLostResponse
 	}
 	return nil
+}
+
+// exactVersion is the key under which fakeSink keeps a row's exact version.
+const exactVersion = "\x00version"
+
+// MaxVersion returns the highest version of the given sources' rows.
+func (s *fakeSink) MaxVersion(_ context.Context, sourceIDs []string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxVersionErr != nil {
+		return 0, s.maxVersionErr
+	}
+	ids := map[string]bool{}
+	for _, id := range sourceIDs {
+		ids[id] = true
+	}
+	var v uint64
+	for _, rows := range s.rows {
+		for _, r := range rows {
+			if id, _ := r["source_id"].(string); ids[id] {
+				v = max(v, r[exactVersion].(uint64))
+			}
+		}
+	}
+	return v, nil
 }
 
 func (s *fakeSink) count(table string) int {
@@ -210,7 +245,7 @@ func (s *fakeSink) latest(table, key string) map[string]map[string]any {
 	out := map[string]map[string]any{}
 	for _, r := range s.rows[table] {
 		k := r[key].(string)
-		if cur, ok := out[k]; !ok || r["version"].(float64) >= cur["version"].(float64) {
+		if cur, ok := out[k]; !ok || r[exactVersion].(uint64) >= cur[exactVersion].(uint64) {
 			out[k] = r
 		}
 	}

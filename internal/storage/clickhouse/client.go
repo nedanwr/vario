@@ -25,6 +25,7 @@ import (
 
 	"github.com/nedanwr/vario/internal/buildinfo"
 	"github.com/nedanwr/vario/internal/config"
+	"github.com/nedanwr/vario/internal/model"
 )
 
 // Client is a connection to one database as one ClickHouse user. The
@@ -349,6 +350,43 @@ func (c *Client) WriteCheckpoint(ctx context.Context, writer string, seq uint64)
 	}
 	_, err = c.do(ctx, http.MethodPost, c.insertParams(CheckpointTable, ""), bytes.NewReader(append(body, '\n')), false)
 	return err
+}
+
+// MaxVersion returns the highest version any row of the given sources holds
+// in Vario's tables (0 if there is none). It only reads. The collector
+// derives the highest policy generation the database holds from it (see
+// spool.VerifyLineage).
+func (c *Client) MaxVersion(ctx context.Context, sourceIDs []string) (uint64, error) {
+	if len(sourceIDs) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(sourceIDs))
+	for i, id := range sourceIDs {
+		ids[i] = "'" + escapeString(id) + "'"
+	}
+	in := strings.Join(ids, ", ")
+	parts := make([]string, len(model.Tables))
+	for i, t := range model.Tables {
+		parts[i] = fmt.Sprintf("SELECT max(version) AS v FROM %s.%s WHERE source_id IN (%s)", quoteIdent(c.database), quoteIdent(t), in)
+	}
+	var rows []struct {
+		V uint64 `json:"v"`
+	}
+	q := "SELECT max(v) AS v FROM (" + strings.Join(parts, " UNION ALL ") + ")"
+	if err := c.query(ctx, q, &rows, url.Values{"select_sequential_consistency": {"1"}}); err != nil {
+		var e *Error
+		if !errors.As(err, &e) || (e.Code != codeReadonly && e.Code != codeSettingLimit && e.Code != codeUnknownSetting) {
+			return 0, err
+		}
+		rows = nil
+		if err := c.query(ctx, q, &rows, nil); err != nil {
+			return 0, err
+		}
+	}
+	if len(rows) != 1 {
+		return 0, errors.New("unexpected response to the version query")
+	}
+	return rows[0].V, nil
 }
 
 // quoteIdent quotes an identifier for use in SQL. Every identifier Vario puts

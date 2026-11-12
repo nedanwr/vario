@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -323,6 +324,14 @@ type CommitOptions struct {
 	Force bool
 	// MaxRowsPerEntry bounds queue entry size.
 	MaxRowsPerEntry int
+	// VerifiedDestination is the destination whose policy generation this
+	// process verified against its database (see VerifyLineage), 0 if none.
+	VerifiedDestination int64
+	// SnapshotGeneration, when non-zero on a commit with a cursor, records
+	// that a complete re-read of the source including its event history,
+	// started under this policy generation, ends with this commit (see
+	// NeedsResync).
+	SnapshotGeneration uint64
 }
 
 type CommitResult struct {
@@ -334,6 +343,10 @@ type CommitResult struct {
 // cursor is non-nil, advances the source cursor in the same transaction.
 // Records whose content is identical to the last version enqueued for the
 // same destination are skipped unless opts.Force is set.
+//
+// Each row is queued with the version its source assigned under the current
+// policy generation (see generation.go), which the same transaction starts
+// if opts.PolicyFingerprint differs from the recorded privacy settings.
 func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record, cursor *string, opts CommitOptions) (CommitResult, error) {
 	var res CommitResult
 	if s.dest == 0 {
@@ -349,37 +362,29 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 		}
 	}
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return res, err
+	}
+	defer tx.Rollback()
+	gen, err := currentGeneration(ctx, tx, opts.PolicyFingerprint, opts.VerifiedDestination)
+	if err != nil {
+		return res, err
+	}
+
 	type prepared struct {
 		key, hash string
 		line      []byte
 	}
 	byTable := map[string][]prepared{}
 	for _, r := range recs {
-		env := r.Row.Env()
-		version := env.Version
-		env.Version = 0
-		plain, err := json.Marshal(r.Row)
-		env.Version = version
-		if err != nil {
-			return res, fmt.Errorf("encode %s/%s: %w", r.Table, r.Key, err)
-		}
-		h := sha256.New()
-		h.Write([]byte(opts.PolicyFingerprint))
-		h.Write([]byte{0})
-		h.Write(plain)
-		line, err := json.Marshal(r.Row)
+		line, hash, err := encodeRecord(r, gen, opts.PolicyFingerprint)
 		if err != nil {
 			return res, err
 		}
 		key := r.Table + "/" + r.Key
-		byTable[r.Table] = append(byTable[r.Table], prepared{key: key, hash: hex.EncodeToString(h.Sum(nil)[:16]), line: line})
+		byTable[r.Table] = append(byTable[r.Table], prepared{key: key, hash: hash, line: line})
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return res, err
-	}
-	defer tx.Rollback()
 
 	getFP, err := tx.PrepareContext(ctx, `SELECT hash FROM fingerprints WHERE destination_id = ? AND source_id = ? AND record_key = ?`)
 	if err != nil {
@@ -443,8 +448,41 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 			s.dest, sourceID, *cursor, nowMs()); err != nil {
 			return res, err
 		}
+		if opts.SnapshotGeneration != 0 {
+			if err := kvPut(ctx, tx, syncedKey(s.dest, sourceID), strconv.FormatUint(opts.SnapshotGeneration, 10)); err != nil {
+				return res, err
+			}
+		}
 	}
 	return res, tx.Commit()
+}
+
+// encodeRecord returns the JSONEachRow line of r, whose version is the
+// source's version under policy generation gen, and the fingerprint of its
+// content under the privacy settings fp (which ignores the version). The
+// record itself is left unchanged.
+func encodeRecord(r model.Record, gen uint64, fp string) (line []byte, hash string, err error) {
+	env := r.Row.Env()
+	version := env.Version
+	defer func() { env.Version = version }()
+	stored, err := model.WithGeneration(gen, version)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode %s/%s: %w", r.Table, r.Key, err)
+	}
+	env.Version = 0
+	plain, err := json.Marshal(r.Row)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode %s/%s: %w", r.Table, r.Key, err)
+	}
+	h := sha256.New()
+	h.Write([]byte(fp))
+	h.Write([]byte{0})
+	h.Write(plain)
+	env.Version = stored
+	if line, err = json.Marshal(r.Row); err != nil {
+		return nil, "", fmt.Errorf("encode %s/%s: %w", r.Table, r.Key, err)
+	}
+	return line, hex.EncodeToString(h.Sum(nil)[:16]), nil
 }
 
 // insertEntry queues lines for table. The entry's token is the

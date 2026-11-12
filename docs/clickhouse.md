@@ -54,7 +54,7 @@ The **operational user** needs, on the target database only:
 
 | Privilege        | Objects                                                                                                                   | Needed for                                                      |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `SELECT, INSERT` | the tables `sources`, `projects`, `conversations`, `runs`, `messages`, `execution_events`, `provider_turns`, `raw_events` | inserting collected data; seeing the tables in the schema check |
+| `SELECT, INSERT` | the tables `sources`, `projects`, `conversations`, `runs`, `messages`, `execution_events`, `provider_turns`, `raw_events` | inserting collected data; seeing the tables in the schema check; reading the highest stored version (policy generation check) |
 | `SELECT`         | the `*_latest`, `token_usage_daily` and `tool_usage` views, and `vario_meta`                                              | the schema check, the destination id, and querying Vario's data |
 | `SELECT, INSERT` | the table `vario_checkpoints`                                                                                             | reading and writing the collector's delivery checkpoint         |
 

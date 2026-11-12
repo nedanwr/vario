@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nedanwr/vario/internal/model"
@@ -34,6 +35,10 @@ type Sink interface {
 	// WriteCheckpoint inserts checkpoint seq for writer; a nil error means
 	// the database acknowledged it.
 	WriteCheckpoint(ctx context.Context, writer string, seq uint64) error
+	// MaxVersion returns the highest version the database holds for any row
+	// of the given sources (0 if none). It only reads; the collector compares
+	// the policy generation in it with the spool's (see verifyLineage).
+	MaxVersion(ctx context.Context, sourceIDs []string) (uint64, error)
 }
 
 type Options struct {
@@ -71,6 +76,10 @@ type Collector struct {
 	// dest is the destination selected by Prepare.
 	dest   spool.Destination
 	warned map[string]bool
+	// verified is the destination whose policy generation this process
+	// verified against its database (see verifyLineage), 0 if none. Source
+	// loops read it for their commits while delivery sets it.
+	verified atomic.Int64
 }
 
 func New(store *spool.Store, sink Sink, srcs []sources.Source, opts Options, log *slog.Logger) *Collector {
@@ -228,6 +237,19 @@ func (c *Collector) syncOnce(ctx context.Context, src sources.Source, log *slog.
 		_, err := c.Snapshot(ctx, src, false, true)
 		return err
 	}
+	// A new policy generation (changed privacy settings, or a database that
+	// holds rows of a later generation than the spool) needs every record
+	// queued again under it, including the event history, before the rows
+	// of earlier settings stop being the latest of records nobody changes.
+	need, force, err := c.store.NeedsResync(ctx, src.ID(), c.opts.PolicyFingerprint)
+	if err != nil {
+		return err
+	}
+	if need {
+		log.Info("privacy policy generation changed; re-reading the source in full", "requeue_all", force)
+		_, err := c.Snapshot(ctx, src, force, true)
+		return err
+	}
 	if c.opts.ReconcileInterval > 0 {
 		_, at, found, err := c.store.KV(ctx, key(src, "last_snapshot"))
 		if err != nil {
@@ -271,7 +293,8 @@ func (c *Collector) syncOnce(ctx context.Context, src sources.Source, log *slog.
 }
 
 func (c *Collector) commitOpts(force bool) spool.CommitOptions {
-	return spool.CommitOptions{PolicyFingerprint: c.opts.PolicyFingerprint, Force: force, MaxRowsPerEntry: c.opts.MaxInsertRows}
+	return spool.CommitOptions{PolicyFingerprint: c.opts.PolicyFingerprint, Force: force, MaxRowsPerEntry: c.opts.MaxInsertRows,
+		VerifiedDestination: c.verified.Load()}
 }
 
 type SnapshotResult struct {
@@ -283,6 +306,10 @@ type SnapshotResult struct {
 // Snapshot reads the source's full state into the spool and then advances its
 // cursor. If interrupted, the cursor is untouched and the next run repeats the
 // snapshot; already-queued records are skipped by fingerprint.
+//
+// A snapshot that includes the event history completes the re-read after a
+// new policy generation (see spool.NeedsResync) if no other generation
+// started while it ran.
 //
 // A forced snapshot re-sends records the destination may already have had,
 // possibly in the same batches as before. It is a historical replay, not a
@@ -302,6 +329,10 @@ func (c *Collector) Snapshot(ctx context.Context, src sources.Source, force, inc
 			return res, err
 		}
 	}
+	gen, err := c.store.EnsureGeneration(ctx, c.commitOpts(force))
+	if err != nil {
+		return res, err
+	}
 	next, err := src.Snapshot(ctx, prev, includeHistory, func(recs []model.Record) error {
 		r, err := c.store.Commit(ctx, src.ID(), recs, nil, c.commitOpts(force))
 		res.Enqueued += r.Enqueued
@@ -314,7 +345,11 @@ func (c *Collector) Snapshot(ctx context.Context, src sources.Source, force, inc
 	if err != nil {
 		return res, err
 	}
-	if _, err := c.store.Commit(ctx, src.ID(), nil, &next, c.commitOpts(force)); err != nil {
+	final := c.commitOpts(force)
+	if includeHistory {
+		final.SnapshotGeneration = gen
+	}
+	if _, err := c.store.Commit(ctx, src.ID(), nil, &next, final); err != nil {
 		return res, err
 	}
 	_ = c.store.SetKV(ctx, key(src, "last_snapshot"), time.Now().UTC().Format(time.RFC3339))

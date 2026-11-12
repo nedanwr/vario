@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nedanwr/vario/internal/model"
 	"github.com/nedanwr/vario/internal/spool"
 	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
@@ -203,6 +204,14 @@ func (c *Collector) Prepare(ctx context.Context, probe bool) (spool.Resolution, 
 			// Leave it to the check before the first delivery.
 			c.schemaReady = false
 			c.log.Warn("the delivery checkpoint could not be verified; nothing is delivered until it is", "error", err.Error())
+		case err == nil:
+			lctx, cancel := context.WithTimeout(ctx, probeTimeout)
+			err := c.verifyLineage(lctx)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				c.schemaReady = false
+				c.log.Warn("the policy generation could not be verified against the database; nothing is delivered until it is", "error", err.Error())
+			}
 		}
 	}
 	switch {
@@ -280,7 +289,42 @@ func (c *Collector) checkDestination(ctx context.Context) error {
 		_ = c.store.SetKV(ctx, "delivery.last_error", "destination: "+err.Error())
 		return fmt.Errorf("destination check: %w", err)
 	}
+	if c.verified.Load() != c.dest.ID {
+		if err := c.verifyLineage(ctx); err != nil {
+			_ = c.store.SetKV(ctx, "delivery.last_error", "destination: "+err.Error())
+			return fmt.Errorf("destination check: %w", err)
+		}
+	}
 	c.noteWarnings(info.Warnings)
+	return nil
+}
+
+// verifyLineage compares the spool's policy generation with the highest
+// generation the database holds rows of for the configured sources, once per
+// process and destination, before anything is delivered (see
+// spool.VerifyLineage). A database that holds rows of a later generation
+// than the spool (the local state was deleted or restored from an older
+// copy) gets a new generation above them, and every source is then re-read
+// in full under it, so that rows written under other privacy settings
+// cannot outrank or tie with the rows of the current ones.
+func (c *Collector) verifyLineage(ctx context.Context) error {
+	ids := make([]string, len(c.sources))
+	for i, src := range c.sources {
+		ids[i] = src.ID()
+	}
+	v, err := c.sink.MaxVersion(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("read the highest policy generation in the database: %w", err)
+	}
+	raised, gen, err := c.store.VerifyLineage(ctx, model.Generation(v))
+	if err != nil {
+		return err
+	}
+	if raised {
+		c.log.Warn("the database holds rows of a later privacy policy generation than the local state (it was reset or restored from an older copy); every source is read again in full under a new generation",
+			"destination", c.dest.String(), "database_generation", model.Generation(v), "generation", gen)
+	}
+	c.verified.Store(c.dest.ID)
 	return nil
 }
 
