@@ -199,10 +199,16 @@ func entryIDs(group []spool.Entry) []int64 {
 // insertGroup sends the entries of one table as a single insert and returns
 // the number of rows ClickHouse acknowledged. It does not remove the entries
 // from the spool: that is confirmDelivered's decision.
+//
+// Only a nil error is a confirmed insert. Any other outcome, a ClickHouse
+// error as much as a lost response, may still have stored some or all rows,
+// and is never covered by a checkpoint. Before the insert is sent, the spool
+// records that it may reach ClickHouse (spool.BeginAttempt), so that an entry
+// that stays queued after it, for whatever reason, is retried under a new
+// insert_deduplication_token that ClickHouse cannot take for this attempt.
 func (c *Collector) insertGroup(ctx context.Context, table string, group []spool.Entry) (int, error) {
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
-	h := sha256.New()
 	rows := 0
 	for _, e := range group {
 		body, err := e.Body()
@@ -212,11 +218,21 @@ func (c *Collector) insertGroup(ctx context.Context, table string, group []spool
 		if _, err := zw.Write(body); err != nil {
 			return 0, err
 		}
-		h.Write([]byte(e.Token))
 		rows += e.Rows
 	}
 	if err := zw.Close(); err != nil {
 		return 0, err
+	}
+	group, renewed, err := c.store.BeginAttempt(ctx, group)
+	if err != nil {
+		return 0, fmt.Errorf("prepare delivery attempt: %w", err)
+	}
+	if renewed > 0 {
+		c.log.Debug("retrying entries whose earlier attempt may have reached ClickHouse under new deduplication tokens", "table", table, "entries", renewed)
+	}
+	h := sha256.New()
+	for _, e := range group {
+		h.Write([]byte(e.Token))
 	}
 	token := hex.EncodeToString(h.Sum(nil)[:16])
 	if err := c.sink.Insert(ctx, table, gz.Bytes(), token); err != nil {
@@ -243,8 +259,12 @@ func (c *Collector) insertGroup(ctx context.Context, table string, group []spool
 // stay queued and are sent again in a later round, followed by a new, higher
 // checkpoint: the confirmed checkpoint never runs ahead of rows the database
 // acknowledged, and a checkpoint that was written without the spool learning
-// of it only raises the number the database holds. Rows sent twice carry the
-// same keys and versions.
+// of it only raises the number the database holds. The retry carries new
+// insert tokens (see insertGroup): the rows of this round's inserts may be
+// gone by then (partitions restored to an earlier state that still holds the
+// confirmed checkpoint), and ClickHouse would acknowledge the old tokens
+// without storing anything, after which the next checkpoint would remove the
+// entries from the queue. Rows sent twice carry the same keys and versions.
 //
 // A database without the checkpoint table (a schema older than version 3)
 // gets the entries acknowledged directly, as before; a rollback cannot be

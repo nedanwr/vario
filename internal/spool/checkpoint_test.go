@@ -265,8 +265,8 @@ func TestLegacySpoolHasNoCheckpoint(t *testing.T) {
 	}
 }
 
-// The checkpoint state lives in the kv table only: a spool written by this
-// version has the tables and schema version of the previous one.
+// The checkpoint state lives in the kv table only: it adds no table and
+// needs no schema version of its own.
 func TestCheckpointNeedsNoSpoolSchemaChange(t *testing.T) {
 	s, path := open(t, 0)
 	if _, err := s.CheckpointWriter(ctx, s.Selected()); err != nil {
@@ -282,7 +282,7 @@ func TestCheckpointNeedsNoSpoolSchemaChange(t *testing.T) {
 	}
 	defer db.Close()
 	var version, tables int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 1 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("spool schema version: %d %v", version, err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).Scan(&tables); err != nil || tables != 5 {

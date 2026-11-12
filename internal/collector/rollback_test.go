@@ -520,7 +520,9 @@ func TestInterruptedRoundIsResentAfterRestart(t *testing.T) {
 	if h.sink.count(model.TableMessages) != 3 || pending(t, h) != queued || h.checkpoint(t) != base {
 		t.Fatalf("after the crash: %d messages, %d rows queued, %+v", h.sink.count(model.TableMessages), pending(t, h), h.checkpoint(t))
 	}
-	h.sink.restore(backup)
+	// Restored like REPLACE PARTITION does: the deduplication memory stays,
+	// so a retry under the tokens of the interrupted round would be swallowed.
+	h.sink.loseRowsKeepTokens(&backup)
 
 	restarted, _ := h.logged(t)
 	if dr, err := restarted.Drain(ctx); err != nil || dr.Remaining != 0 || int64(dr.Delivered) != queued {

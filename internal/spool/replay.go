@@ -9,12 +9,10 @@ import (
 
 // Replay identity.
 //
-// Every queue entry carries the insert_deduplication_token of its delivery
-// (see insertEntry). ClickHouse remembers the tokens of recent inserts per
-// table partition and acknowledges an insert with a known token without
-// writing anything. That is what makes a retried delivery safe, and the
-// token must therefore stay the same for every retry of an entry: it is
-// stored with the entry, never recomputed.
+// Every queue entry carries the insert_deduplication_token of its first
+// delivery attempt (see insertEntry). ClickHouse remembers the tokens of
+// recent inserts per table partition and acknowledges an insert with a known
+// token without writing anything.
 //
 // The memory outlives the rows, though: ALTER ... DELETE, REPLACE PARTITION
 // and RESTORE into existing tables remove or replace rows and keep the
@@ -35,6 +33,11 @@ import (
 // queued before is re-tokenized. Logical deduplication is unaffected: rows
 // sent again carry the same keys and versions, so ReplacingMergeTree and the
 // *_latest views count each record once.
+//
+// For the same reason a queued entry is never retried under a token that an
+// earlier attempt may have used: BeginAttempt gives it a new, random one
+// first (an acknowledged insert whose checkpoint was not confirmed, a failed
+// or unanswered insert, an interrupted process).
 
 func replayKey(dest int64) string { return "replay." + strconv.FormatInt(dest, 10) }
 
@@ -62,7 +65,7 @@ func newReplay(ctx context.Context, q querier, dest int64) (string, error) {
 // destination: records queued from now on get insert tokens that no earlier
 // delivery used, so that ClickHouse stores them even where it still
 // remembers the tokens of the rows they restore. Entries already queued keep
-// their tokens (their retries stay idempotent).
+// their tokens until they are attempted (see BeginAttempt).
 func (s *Store) BeginReplay(ctx context.Context) error {
 	if s.dest == 0 {
 		return ErrNoDestination

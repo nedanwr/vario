@@ -45,6 +45,15 @@ type fakeSink struct {
 	cpAmbiguous   int    // the next n checkpoint writes are stored but reported as failed
 	beforeCPRead  func() // called (unlocked) at the start of ReadCheckpoint
 	ambiguousData int    // the next n inserts are stored but reported as failed
+
+	inserts []fakeInsert // every insert that reached the database
+	deduped int          // inserts acknowledged without writing (known token)
+}
+
+// fakeInsert is one insert that reached the database.
+type fakeInsert struct {
+	table, token string
+	deduped      bool
 }
 
 func newSink() *fakeSink {
@@ -159,7 +168,12 @@ func (s *fakeSink) Insert(_ context.Context, table string, body []byte, token st
 		s.ambiguousData--
 		lost = true
 	}
+	s.inserts = append(s.inserts, fakeInsert{table: table, token: token, deduped: s.tokens[token]})
 	if s.tokens[token] {
+		s.deduped++
+		if lost {
+			return errLostResponse
+		}
 		return nil
 	}
 	s.tokens[token] = true

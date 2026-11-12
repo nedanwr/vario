@@ -321,12 +321,13 @@ func TestIntegrationRollbackByBackupIntoExistingTablesIsRecovered(t *testing.T) 
 	}
 }
 
-// tokenSink records the token of every insert and loses the response of
-// the first insert of each token after ClickHouse committed it.
+// tokenSink records the token of every insert and, while lossy, loses the
+// response of every insert after ClickHouse committed it.
 type tokenSink struct {
 	*clickhouse.Client
 	mu       sync.Mutex
 	attempts map[string]int
+	lossy    bool
 	lost     int
 }
 
@@ -337,17 +338,21 @@ func (s *tokenSink) Insert(ctx context.Context, table string, body []byte, token
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attempts[token]++
-	if s.attempts[token] == 1 {
+	if s.lossy {
 		s.lost++
 		return &clickhouse.Error{Message: "read: connection reset by peer", Transient: true}
 	}
 	return nil
 }
 
-// A forced backfill through a connection that loses every first response,
-// interrupted and continued by a restarted collector on the reopened spool:
-// every retry carries the token of its first attempt (ClickHouse keeps one
-// copy), and the replay still restores everything that was deleted.
+// A forced backfill through a connection that loses every response,
+// interrupted and continued by a restarted collector on the reopened spool.
+// An insert whose response was lost may have stored its rows, so every
+// retry carries a new token, stored in the spool before it is sent; no
+// insert, before or after the restart, is sent under a token ClickHouse
+// already holds. The replay restores
+// everything; rows of lost responses may be stored twice with the same keys
+// and versions, which the *_latest views count once.
 func TestIntegrationInterruptedReplayWithLostResponses(t *testing.T) {
 	e := newRecoveryEnv(t)
 	db := fmt.Sprintf("vario_replay_amb_%d", time.Now().UnixNano())
@@ -358,7 +363,7 @@ func TestIntegrationInterruptedReplayWithLostResponses(t *testing.T) {
 	want := e.mustRead(db)
 	e.deleteRows(db)
 
-	sink := &tokenSink{Client: e.clients[db], attempts: map[string]int{}}
+	sink := &tokenSink{Client: e.clients[db], attempts: map[string]int{}, lossy: true}
 	lossy := New(e.store, sink, []sources.Source{e.src}, c.opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := lossy.Prepare(ctx, true); err != nil {
 		t.Fatal(err)
@@ -382,9 +387,12 @@ func TestIntegrationInterruptedReplayWithLostResponses(t *testing.T) {
 	for i := 0; i < 6; i++ { // interrupted after a few rounds
 		_, _ = lossy.deliverRound(ctx, time.Now().Add(time.Hour))
 	}
-	if sink.lost == 0 {
-		t.Fatal("the test must lose responses")
+	if sink.lost < 2 {
+		t.Fatalf("the test must lose responses: %d", sink.lost)
 	}
+	sink.mu.Lock()
+	sink.lossy = false
+	sink.mu.Unlock()
 
 	// Restart: a new process opens the spool and delivers the rest.
 	store, err := spool.Open(e.store.Path(), 64<<20)
@@ -393,10 +401,14 @@ func TestIntegrationInterruptedReplayWithLostResponses(t *testing.T) {
 	}
 	defer store.Close()
 	store.SelectDestination(e.store.Selected())
+	renewed := 0
 	for id, tok := range queued(store) {
 		if before[id] != tok {
-			t.Fatalf("entry %d changed its token across the restart: %s, was %s", id, tok, before[id])
+			renewed++ // stored before its attempt was sent
 		}
+	}
+	if renewed == 0 {
+		t.Fatal("no entry was retried under a new token before the restart")
 	}
 	restarted := New(store, sink, []sources.Source{e.src}, c.opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if _, err := restarted.Prepare(ctx, true); err != nil {
@@ -414,22 +426,18 @@ func TestIntegrationInterruptedReplayWithLostResponses(t *testing.T) {
 	if got := e.mustRead(db); got != want {
 		t.Fatalf("the interrupted replay must restore everything once:\n got %+v\nwant %+v", got, want)
 	}
-	// Every lost response was retried under the same token, which ClickHouse
-	// acknowledged without storing a second copy.
-	retried := 0
-	for _, n := range sink.attempts {
+	// No token was sent twice: no retry could be swallowed by ClickHouse.
+	for tok, n := range sink.attempts {
 		if n > 1 {
-			retried++
+			t.Fatalf("token %s was sent %d times", tok, n)
 		}
 	}
-	if retried == 0 {
-		t.Fatal("no insert was retried with its original token")
+	// At most the rows of the lost responses are stored twice.
+	if n := e.physical(db, model.TableMessages); n < want.Msgs || n > 2*want.Msgs {
+		t.Fatalf("%d message rows for %d records", n, want.Msgs)
 	}
-	if n := e.physical(db, model.TableMessages); n != want.Msgs {
-		t.Fatalf("retries stored duplicate messages: %d rows for %d records", n, want.Msgs)
-	}
-	if n := e.physical(db, model.TableProviderTurns); n != want.Turns {
-		t.Fatalf("retries stored duplicate provider turns: %d rows for %d records", n, want.Turns)
+	if n := e.physical(db, model.TableProviderTurns); n < want.Turns || n > 2*want.Turns {
+		t.Fatalf("%d provider turn rows for %d records", n, want.Turns)
 	}
 }
 

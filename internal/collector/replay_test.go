@@ -2,6 +2,7 @@ package collector
 
 import (
 	"testing"
+	"time"
 )
 
 // loseRowsKeepTokens removes rows like ALTER ... DELETE, REPLACE PARTITION or
@@ -94,10 +95,12 @@ func TestReconciliationRestoresRowsWhoseTokensAreRemembered(t *testing.T) {
 	}
 }
 
-// Ambiguous acknowledgements during a replay: every retry carries the token
-// of its first attempt, so the database keeps one copy, and the replay
-// restores everything.
-func TestReplayRetriesKeepTheirTokens(t *testing.T) {
+// Ambiguous acknowledgements during a replay: an insert whose response was
+// lost may have stored its rows, so its retry carries a new token and is
+// never acknowledged without writing (the rows may be gone by then). The
+// replay restores everything; the rows of lost responses are stored twice
+// with the same keys and versions, which the *_latest views count once.
+func TestReplayRetriesAfterLostResponsesUseNewTokens(t *testing.T) {
 	h := setup(t)
 	h.syncDrain(t, h.c)
 	want := h.sink.logical()
@@ -106,19 +109,34 @@ func TestReplayRetriesKeepTheirTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.sink.mu.Lock()
-	h.sink.ambiguousData = 3
+	h.sink.ambiguousData = 1000 // every insert of the first round
+	deduped := h.sink.deduped
 	h.sink.mu.Unlock()
-	for i := 0; i < 20; i++ {
-		if dr, err := h.c.Drain(ctx); err == nil && dr.Remaining == 0 {
-			break
-		}
+	if _, err := h.c.deliverRound(ctx, time.Now()); err == nil {
+		t.Fatal("the round must fail")
 	}
+	h.sink.mu.Lock()
+	h.sink.ambiguousData = 0
+	h.sink.mu.Unlock()
+	h.drainAll(t, h.c)
 	if got := h.sink.logical(); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
-	// Physically one copy per record: no retry was stored twice.
+	h.sink.mu.Lock()
+	defer h.sink.mu.Unlock()
+	if h.sink.deduped != deduped {
+		t.Fatalf("%d retries were acknowledged without writing", h.sink.deduped-deduped)
+	}
+	seen := map[string]bool{}
+	for _, in := range h.sink.inserts {
+		if seen[in.token] && !in.deduped {
+			t.Fatalf("token %s stored twice", in.token)
+		}
+		seen[in.token] = true
+	}
+	// At most one extra copy per record: only the lost round is stored twice.
 	for table, n := range map[string]int{"messages": want.Messages, "provider_turns": want.Turns, "raw_events": want.Raw} {
-		if got := h.sink.count(table); got != n {
+		if got := len(h.sink.rows[table]); got < n || got > 2*n {
 			t.Fatalf("%s: %d rows stored for %d records", table, got, n)
 		}
 	}

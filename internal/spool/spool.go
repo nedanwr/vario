@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -37,7 +38,9 @@ var ErrLeaseHeld = errors.New("another vario collector is running")
 //
 //	0: queue, cursors and fingerprints without a destination (Vario <= 0.1).
 //	1: every queue entry, cursor and fingerprint belongs to a destination.
-const schemaVersion = 1
+//	2: queue entries record whether an insert carrying their current token
+//	   may have reached ClickHouse (queue.sent, see BeginAttempt).
+const schemaVersion = 2
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS destinations (
@@ -143,10 +146,11 @@ func Open(path string, maxBytes int64) (*Store, error) {
 // cannot be upgraded because a collector of that version is still running.
 var ErrUpgradeBlocked = errors.New("the local state was created by an earlier Vario version whose collector is still running")
 
-// upgrade creates the current schema, or converts a version 0 spool. The
-// conversion keeps every queued entry, cursor and fingerprint: they are
-// assigned to a "legacy" destination (empty endpoint), which the collector
-// adopts as the configured destination on its next start (see Resolve).
+// upgrade creates the current schema, or converts the spool of an earlier
+// version. Converting a version 0 spool keeps every queued entry, cursor and
+// fingerprint: they are assigned to a "legacy" destination (empty endpoint),
+// which the collector adopts as the configured destination on its next start
+// (see Resolve). Converting to version 2 marks every queued entry as sent.
 func upgrade(ctx context.Context, db *sql.DB) error {
 	var version int
 	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
@@ -155,23 +159,30 @@ func upgrade(ctx context.Context, db *sql.DB) error {
 	if version >= schemaVersion {
 		return nil
 	}
-	var legacyTables int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cursors'`).Scan(&legacyTables); err != nil {
-		return err
-	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if legacyTables == 0 {
-		if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
-			return err
-		}
-	} else {
-		// A collector of the earlier version would keep writing rows without a
-		// destination, and its cursor statements would fail against the new
-		// tables. Refuse while it holds a live lease.
+	// Read again under the write lock: another process may have upgraded the
+	// spool meanwhile.
+	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version >= schemaVersion {
+		return nil
+	}
+	var legacyTables int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cursors'`).Scan(&legacyTables); err != nil {
+		return err
+	}
+	if legacyTables > 0 {
+		// A collector of an earlier version would keep working with the old
+		// schema: one of version 0 writes rows without a destination (and its
+		// cursor statements fail against the new tables), one of version 1
+		// sends queued entries without recording it (queue.sent), so that a
+		// later retry could reuse a token ClickHouse already consumed. Refuse
+		// while it holds a live lease.
 		var raw string
 		if err := tx.QueryRowContext(ctx, `SELECT value FROM kv WHERE key = ?`, leaseKey).Scan(&raw); err == nil {
 			var l Lease
@@ -179,6 +190,13 @@ func upgrade(ctx context.Context, db *sql.DB) error {
 				return fmt.Errorf("%w (%s, pid %d); restart it with the new version (`vario service restart`) or stop it, then try again", ErrUpgradeBlocked, l.Command, l.PID)
 			}
 		}
+	}
+	switch {
+	case legacyTables == 0:
+		if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
+			return err
+		}
+	case version < 1:
 		var rows int
 		if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM queue) + (SELECT COUNT(*) FROM cursors) + (SELECT COUNT(*) FROM fingerprints)`).Scan(&rows); err != nil {
 			return err
@@ -218,6 +236,15 @@ func upgrade(ctx context.Context, db *sql.DB) error {
 				return err
 			}
 		}
+	}
+	// Version 2. Entries queued by an earlier version may have been sent
+	// already (their insert acknowledged, the checkpoint after it not), so
+	// each of them is retried under a new token (see BeginAttempt).
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE queue ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("upgrade spool: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE queue SET sent = 1`); err != nil {
+		return fmt.Errorf("upgrade spool: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return err
@@ -421,10 +448,10 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 }
 
 // insertEntry queues lines for table. The entry's token is the
-// insert_deduplication_token of its delivery: it is derived from the table,
-// the destination's replay identity and the rows, and stored with the entry,
-// so every retry of the entry (a failed or unanswered insert, a restart)
-// carries the same token and ClickHouse stores the rows at most once.
+// insert_deduplication_token of its first delivery attempt: it is derived from
+// the table, the destination's replay identity and the rows, and stored with
+// the entry. Once an insert carrying it may have reached ClickHouse, every
+// later attempt gets a new token first (see BeginAttempt).
 func insertEntry(ctx context.Context, tx *sql.Tx, dest int64, replay, table string, lines [][]byte) error {
 	var raw bytes.Buffer
 	for _, l := range lines {
@@ -498,6 +525,83 @@ func (s *Store) Due(ctx context.Context, now time.Time, maxRows int) ([]Entry, e
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// ErrEntryGone is returned by BeginAttempt when an entry is no longer queued
+// for the selected destination (it was delivered, moved or discarded).
+var ErrEntryGone = errors.New("spool: queue entry is no longer queued")
+
+// BeginAttempt must be called before every insert of entries, and the insert
+// must carry the tokens of the returned entries (same order). In one durable
+// transaction it records that an insert with each entry's token may reach
+// ClickHouse from now on (queue.sent), and first gives every entry for which
+// that was already recorded a new, random token. It returns how many entries
+// got a new token.
+//
+// ClickHouse acknowledges an insert whose insert_deduplication_token it
+// remembers without writing anything, and it remembers tokens after their
+// rows are gone (partitions restored from a backup, REPLACE or DROP
+// PARTITION, ALTER ... DELETE). An entry stays queued after an attempt when
+// the insert failed, its outcome is unknown (a lost response), or the insert
+// was acknowledged but the delivery checkpoint after it was not; a retry
+// under the same token could then be acknowledged without storing a row
+// although the database no longer holds the rows of the earlier attempt, and
+// the checkpoint that follows would remove the entry from the queue. A retry
+// under a new token always stores the rows: if the earlier attempt's rows
+// are still there, ClickHouse holds them twice with the same keys and
+// versions, which ReplacingMergeTree and the *_latest views count once.
+//
+// Recording before sending makes this hold across crashes and restarts: an
+// insert can only have reached ClickHouse with a token whose entry was
+// already marked as sent, so no restart retries an entry under a token that
+// may have been used. Entries whose attempt never left the process are
+// retried under a new token as well, which costs nothing.
+func (s *Store) BeginAttempt(ctx context.Context, entries []Entry) ([]Entry, int, error) {
+	if s.dest == 0 {
+		return nil, 0, ErrNoDestination
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+	out := make([]Entry, len(entries))
+	renewed := 0
+	for i, e := range entries {
+		var token string
+		var sent bool
+		err := tx.QueryRowContext(ctx, `SELECT token, sent FROM queue WHERE id = ? AND destination_id = ?`, e.ID, s.dest).Scan(&token, &sent)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, 0, fmt.Errorf("%w (entry %d)", ErrEntryGone, e.ID)
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		if sent {
+			if token, err = newToken(); err != nil {
+				return nil, 0, err
+			}
+			renewed++
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE queue SET token = ?, sent = 1 WHERE id = ?`, token, e.ID); err != nil {
+			return nil, 0, err
+		}
+		e.Token = token
+		out[i] = e
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	return out, renewed, nil
+}
+
+// newToken returns a random insert token, in the format of the derived ones.
+func newToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // Ack removes delivered entries.
