@@ -163,7 +163,7 @@ func recordVersion(ctx context.Context, a *Admin) (string, error) {
 		return "", nil
 	}
 	return "", a.Exec(ctx, fmt.Sprintf("INSERT INTO %s.%s (key, value) VALUES ('schema_version', '%d'), ('migrated_by', '%s')",
-		quoteIdent(a.database), quoteIdent(MetaTable), SchemaVersion, escapeString("vario "+buildinfo.Version)))
+		quoteIdent(a.database), quoteIdent(MetaTable), SchemaVersion, escapeString("vario "+buildinfo.CurrentVersion())))
 }
 
 // replaceView replaces one of Vario's own outdated views. CREATE OR REPLACE

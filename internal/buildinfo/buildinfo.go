@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/debug"
+	"sync"
 )
 
-// Set with -ldflags "-X github.com/nedanwr/vario/internal/buildinfo.Version=v0.1.0 ...".
+// Set by release builds (make build, make dist) with
+// -ldflags "-X github.com/nedanwr/vario/internal/buildinfo.Version=v0.1.0-beta.1 -X ...Commit=<sha> -X ...Date=<RFC 3339>".
+// The release tag is the single source of the version; it is not written
+// anywhere else in the source tree.
 var (
 	Version = "dev"
 	Commit  = ""
@@ -23,6 +27,9 @@ type Info struct {
 	Modified  bool
 }
 
+// Get returns the build metadata. Values injected with -ldflags take
+// precedence; otherwise the module version (go install ...@vX.Y.Z) and the VCS
+// stamp recorded by the Go toolchain are used.
 func Get() Info {
 	info := Info{
 		Version:   Version,
@@ -71,5 +78,11 @@ func (i Info) String() string {
 	return fmt.Sprintf("vario %s (commit %s, built %s, %s, %s)", i.Version, commit, date, i.GoVersion, i.Platform)
 }
 
+var resolved = sync.OnceValue(Get)
+
+// CurrentVersion is the version reported by `vario version --short`: the
+// injected version, else the module version, else "dev".
+func CurrentVersion() string { return resolved().Version }
+
 // UserAgent identifies Vario to user-configured endpoints only.
-func UserAgent() string { return "vario/" + Version }
+func UserAgent() string { return "vario/" + CurrentVersion() }

@@ -83,7 +83,7 @@ collected for (see 'vario destination').`,
 			}
 			defer release()
 
-			log.Info("vario collector starting", "version", buildinfo.Version, "mode", policy.Mode(), "sources", len(srcs),
+			log.Info("vario collector starting", "version", buildinfo.CurrentVersion(), "mode", policy.Mode(), "sources", len(srcs),
 				"clickhouse", cfg.ClickHouse.URL, "database", cfg.ClickHouse.Database, "user", cfg.ClickHouse.Username)
 			for _, w := range legacyWarnings(cfg) {
 				log.Warn(w)
