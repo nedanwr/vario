@@ -114,17 +114,21 @@ Without an action, `vario destination pending` lists each destination that holds
 - **Re-sending everything**: stop the collector, then `vario backfill --source t3code --force`. After dropping and recreating the database, run `vario migrate` (new destination id), then `vario destination switch`; the collector repopulates the new database by itself. After restoring the database from a backup, run `vario destination switch` as well: the collector then delivers the complete history again (see [A database restored to an earlier state](#a-database-restored-to-an-earlier-state)).
 - **Resetting local state**: stop the collector and delete `state.db*` in the data directory. Undelivered spooled data is lost; the next start re-reads the source's current state (events that T3 Code has already pruned cannot be recovered). Before delivering, the collector checks the database for rows of a later privacy policy generation than the new state and, if there are any, queues everything above them (see [Changing the privacy settings](privacy.md#changing-the-privacy-settings)).
 
-## Upgrading from Vario 0.1
+## Upgrading
 
-Nothing has to be recreated:
+Upgrades between beta releases are applied in place: replace the binary, run `vario migrate` if `vario doctor` or the collector reports that the schema needs it, and restart the service (`vario service restart`). Steps that need more than that are listed in the [changelog](../CHANGELOG.md). Downgrading to an earlier version is not supported.
 
-1. **Local state**: on its first start, the new version converts the spool in place. Queued rows, cursors and fingerprints are kept and assigned to the configured destination. If you change `clickhouse.url` or `clickhouse.database` with `vario config set`, `config edit` or `init` before the collector has run with the new version, the old state is bound to the previous destination first. If you edit the file by hand before that first start, it is assigned to the new settings, as 0.1 would have done. The conversion refuses to run while a collector of the old version still holds the lease; restart the service (`vario service restart`).
-2. **Schema**: a 0.1 schema (version 1) keeps working: the collector delivers to it and warns. Run `vario migrate` once to add `vario_meta`; this records the destination id and, if the collector user lacks `SELECT` on the new table, offers to grant it. The collector binds the id to the existing destination at its next check (no new backfill). Until then a replaced database cannot be detected, which `vario doctor` reports as a warning. The same migration adds `vario_checkpoints` (schema version 3) and offers to grant `SELECT, INSERT` on it; a version 2 schema is upgraded the same way and keeps its destination id. The collector writes its first delivery checkpoint at its next start, without reading any source again; until then a database restored to an earlier state cannot be detected, which is reported as a warning too.
+### Upgrading from a development build
+
+Installations built from source before the first beta (`v0.1.0-beta.1`) used an earlier local state format and schema version 1 or 2. They are upgraded in place and nothing has to be recreated:
+
+1. **Local state**: on its first start, the new version converts the spool in place. Queued rows, cursors and fingerprints are kept and assigned to the configured destination. If you change `clickhouse.url` or `clickhouse.database` with `vario config set`, `config edit` or `init` before the collector has run with the new version, the old state is bound to the previous destination first. If you edit the file by hand before that first start, it is assigned to the new settings, as the earlier build would have done. The conversion refuses to run while a collector of the old version still holds the lease; restart the service (`vario service restart`).
+2. **Schema**: a schema of version 1 (created by the earliest development builds) keeps working: the collector delivers to it and warns. Run `vario migrate` once to add `vario_meta`; this records the destination id and, if the collector user lacks `SELECT` on the new table, offers to grant it. The collector binds the id to the existing destination at its next check (no new backfill). Until then a replaced database cannot be detected, which `vario doctor` reports as a warning. The same migration adds `vario_checkpoints` (schema version 3) and offers to grant `SELECT, INSERT` on it; a version 2 schema is upgraded the same way and keeps its destination id. The collector writes its first delivery checkpoint at its next start, without reading any source again; until then a database restored to an earlier state cannot be detected, which is reported as a warning too.
 3. **Credentials**: the existing user and password stay in place as the operational credentials. If that account has administrative privileges (common when one account was used for everything), `vario doctor` and the collector log say so. Run `vario init`, choose guided setup and "Create a dedicated Vario user" to switch to a restricted account; Vario does not change or revoke anything on the old account.
 4. **Policy generations**: on its first sync with this version, the collector re-reads every source in full and queues every record and the event history once more, under the first policy generation (see [Changing the privacy settings](privacy.md#changing-the-privacy-settings)). The rows replace the existing ones in the `*_latest` views; nothing is counted twice. The collector's user needs `SELECT` on the eight tables, which `vario migrate` and `vario init` already grant.
 5. **`create_database`**: ignored; set it to `false` (`vario config set clickhouse.create_database false`) or delete the line with `vario config edit` to silence the warning. Databases are created by `vario init` or `vario migrate`.
 
-A service installed by 0.1 keeps working after the upgrade without reinstalling. It runs the old binary until it is restarted (`vario service restart`), and the plist only references the configuration file.
+A service installed by a development build keeps working after the upgrade without reinstalling. It runs the old binary until it is restarted (`vario service restart`), and the plist only references the configuration file.
 
 ## Background service
 
@@ -168,7 +172,9 @@ Linux (systemd user units) and Windows service installation are **not implemente
 ## Current limitations
 
 - T3 Code is the only supported source.
-- Service installation is implemented for macOS only.
+- Service installation is implemented for macOS only (no systemd unit or Windows service).
+- Release binaries are not signed, and the macOS binaries are not notarized. CI runs the tests on Linux only; the macOS and Windows binaries are cross-compiled.
+- Beta releases may change the configuration, command-line interface and schema; downgrades are not supported (see [Upgrading](#upgrading)).
 - Credentials are stored in a `0600` file, not in the OS keychain.
 - Clusters: no `ON CLUSTER` provisioning and no replicated schema management; untested (see [Managed services, external authentication and clusters](clickhouse.md#managed-services-external-authentication-and-clusters)).
 - Users created by Vario use `sha256_hash ... SALT` password authentication, verified with ClickHouse 24.8 and 25.8; other versions are untested. LDAP, Kerberos, certificate, SSH-key and other external identities are not provisioned; existing ones can be selected, but Vario authenticates only with a user name and password.

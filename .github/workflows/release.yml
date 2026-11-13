@@ -1,6 +1,8 @@
 # Publishes a GitHub Release when a maintainer pushes a version tag (vX.Y.Z or
 # vX.Y.Z-prerelease) that points to a commit on master. Pull requests and
 # branch pushes never trigger this workflow, and it never creates tags.
+# Prerelease tags (e.g. v0.1.0-beta.1) are published as GitHub prereleases.
+# The release notes start with the tag's section of CHANGELOG.md, which must exist.
 name: Release
 
 on:
@@ -60,6 +62,24 @@ jobs:
             exit 1
           fi
           echo "$TAG -> $GITHUB_SHA (on master)"
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v=${TAG#v}
+          mkdir -p "$RUNNER_TEMP/notes"
+          # The section starts at "## [<version>]" (optionally followed by a
+          # date) and ends before the next "## " heading.
+          awk -v h="## [$v]" '
+            index($0, h) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md >"$RUNNER_TEMP/notes/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no section '## [$v]' (or it is empty)."
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -121,6 +141,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish release
     needs: build
@@ -139,6 +167,12 @@ jobs:
         with:
           name: release-files
           path: dist
+
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
 
       - name: Verify checksums
         working-directory: dist
@@ -159,7 +193,7 @@ jobs:
       - name: Create draft release with assets
         working-directory: dist
         run: |
-          args=(--verify-tag --draft --generate-notes --title "Vario $TAG")
+          args=(--verify-tag --draft --notes-file ../notes/release-notes.md --generate-notes --title "Vario $TAG")
           if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
           gh release create "$TAG" "${args[@]}" vario_* checksums.txt
 

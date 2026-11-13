@@ -56,16 +56,27 @@ Releases are published by the **Release** workflow (`.github/workflows/release.y
 | Linux   | amd64, arm64  | `vario_<version>_linux_<arch>.tar.gz`  |
 | Windows | amd64, arm64  | `vario_<version>_windows_<arch>.zip`   |
 
-Each archive contains a single directory with the executable, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`. Tags follow [Semantic Versioning](https://semver.org) with a `v` prefix: `v0.1.0`, `v1.2.3`, or a prerelease like `v0.2.0-rc.1` (published as a GitHub prerelease). The tag is embedded in the binary, so `vario version` reports it along with the commit.
+Each archive contains a single directory with the executable, `LICENSE`, `README.md`, and `THIRD_PARTY_LICENSES.txt`, and nothing else. Tags follow [Semantic Versioning](https://semver.org) with a `v` prefix: `v0.1.0`, `v1.2.3`, or a prerelease like `v0.1.0-beta.1` or `v0.2.0-rc.1`. A tag with a prerelease part (anything after `-`) is published as a GitHub prerelease, which GitHub never marks as the latest release. Build metadata (`+...`) is not accepted.
 
-Before publishing, the workflow checks that the tag is valid SemVer and points to a commit in `master`'s history, then runs vet and tests and builds all archives and `checksums.txt` from a clean module cache. A separate job, the only one with write access, uploads them to a draft release with generated release notes, checks the upload, and then publishes the release. If a release or draft for the tag already exists, the workflow stops without changing it; to publish again, delete the release and re-run the workflow.
+### Versioning
 
-To release, merge the changes into `master`, then tag the merged commit and push the tag:
+The tag is the only place the version is defined. `make build` and `make dist` (`scripts/dist.sh`) embed it with `-ldflags -X` into `internal/buildinfo` together with the full commit hash and the build date (for `make dist`, the commit time, which keeps builds reproducible). `vario version` prints all three, plus the Go version and platform; `vario version --short` prints only the version. Without injected values (`go build`, `go run`), the version is `dev` and the commit and date come from the VCS stamp of the Go toolchain; `go install ...@<tag>` reports the module version. A build from a modified working tree reports the commit with `-dirty`. The release workflow refuses to publish unless the Linux binary reports exactly `vario <tag> (commit <first 12 characters of the commit>, ...`.
+
+### Publishing
+
+Before publishing, the workflow checks that the tag is valid SemVer, points to a commit in `master`'s history, and has a section `## [<version without v>]` in `CHANGELOG.md`; then it runs vet and tests and builds all archives and `checksums.txt` from a clean module cache. A separate job, the only one with write access, uploads them to a draft release whose notes are that changelog section followed by GitHub's generated notes, checks the upload, and then publishes the release. If a release or draft for the tag already exists, the workflow stops without changing it; to publish again, delete the release and re-run the workflow.
+
+To release:
+
+1. On `develop`, add the version's section to `CHANGELOG.md` and update any version mentioned in the README and `docs/getting-started.md` (the install examples name the current release).
+2. Check locally: `make lint test`, the ClickHouse integration tests on 24.8 and 25.8 (`make integration`), and a release build (`rm -rf dist && make dist VERSION=v0.1.0-beta.1`, then `dist/.../vario version`).
+3. Merge `develop` into `master` through a pull request and wait for the Build workflow to pass.
+4. Tag the merged commit on `master` and push the tag:
 
 ```bash
 git switch master && git pull --ff-only
-git tag -a v0.1.0 -m "Vario v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.0-beta.1 -m "Vario v0.1.0-beta.1"
+git push origin v0.1.0-beta.1
 ```
 
-Builds are reproducible: given the same commit and Go version, `make dist VERSION=v0.1.0` produces the same binaries (the embedded build date is the commit time).
+Builds are reproducible: given the same commit and Go version, `make dist VERSION=v0.1.0-beta.1` produces the same binaries (the embedded build date is the commit time).

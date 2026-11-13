@@ -4,18 +4,21 @@ Install Vario, connect it to ClickHouse and collect your first data. Configurati
 
 ## Install and build
 
-Prebuilt binaries for macOS, Linux and Windows (amd64 and arm64) are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases), together with a `checksums.txt` file. Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Code signing](#code-signing).
+Prebuilt binaries for macOS, Linux and Windows (amd64 and arm64) are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases), together with a `checksums.txt` file. Beta versions such as `v0.1.0-beta.1` are published as GitHub pre-releases, so the "Latest release" link does not point to them; pick the version from the releases list. Each archive contains the executable, `LICENSE`, `README.md` and `THIRD_PARTY_LICENSES.txt`; the documentation linked from the README is on GitHub. The background service is available on macOS only (see [Background service](operations.md#background-service)). Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Code signing](#code-signing).
 
 To build from source, you need Go 1.25 or newer. The binary is a standalone executable with no CGO and no runtime dependencies.
 
 ```bash
 git clone https://github.com/nedanwr/vario.git
 cd vario
-make build            # writes bin/vario with version information
+git checkout v0.1.0-beta.1   # optional: a released version instead of the latest master
+make build                   # writes bin/vario with version information
 # or: go build -o bin/vario ./cmd/vario
 ```
 
-Cross-compile with `GOOS`/`GOARCH`, e.g. `GOOS=linux GOARCH=arm64 make build`.
+Cross-compile with `GOOS`/`GOARCH`, e.g. `GOOS=linux GOARCH=arm64 make build`. `make build` takes the version from `git describe` (the tag on a released commit) and embeds it with the commit and build date; a plain `go build` reports `dev`. `go install github.com/nedanwr/vario/cmd/vario@v0.1.0-beta.1` also works and reports the version, but not the commit or build date.
+
+Check what you installed with `vario version`, which prints for example `vario v0.1.0-beta.1 (commit 0123456789ab, built 2026-11-13T12:00:00Z, go1.25.5, darwin/arm64)`; `vario version --short` prints only the version.
 
 ## Verifying downloads
 

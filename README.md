@@ -4,7 +4,7 @@
 
 Vario is a lightweight, cross-platform command-line tool for AI observability. It reads the local data of AI applications on your machine (read-only), normalizes it, and delivers it to a ClickHouse database you control.
 
-> **Status:** v0.1 (development). The T3 Code → ClickHouse pipeline is functional. Interfaces and the ClickHouse schema may still change before a tagged release.
+> **Status: public beta (`v0.1.0-beta.1`).** Vario collects from T3 Code into self-hosted ClickHouse. The configuration, command-line interface and ClickHouse schema may still change between betas; schema changes ship as additive migrations (`vario migrate`), and anything that needs manual action is listed in the [changelog](CHANGELOG.md). Downgrades are not supported.
 
 ## What it collects
 
@@ -15,25 +15,25 @@ Vario is a lightweight, cross-platform command-line tool for AI observability. I
 
 Vario runs as a single process, in the foreground or as a per-user background service. Data is buffered in a local spool, so collection survives network outages, ClickHouse downtime, and reboots. Delivery is at-least-once; the provided views count each record once.
 
-## Supported integrations
+## Support
 
-| Source                                    | Status                                            |
-| ----------------------------------------- | ------------------------------------------------- |
-| T3 Code (`~/.t3/userdata/statev2.sqlite`) | Supported: backfill, continuous sync, token usage |
-| Codex CLI, Claude Code, OpenCode          | Not implemented                                   |
-
-The background service is implemented for macOS only; on Linux and Windows, run `vario run` under your own supervisor.
+|              | Supported in this beta                                                                                                                         |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source       | **T3 Code** (`~/.t3/userdata/statev2.sqlite`): backfill, continuous sync, token usage. No other source is supported.                            |
+| ClickHouse   | Self-hosted **24.8 LTS** and **25.8 LTS**, over HTTP(S). ClickHouse Cloud, other managed services and clusters are untested.                    |
+| Platforms    | macOS, Linux, Windows (amd64, arm64). The background service (`vario service`) is **macOS only**; elsewhere, run `vario run` under your own supervisor. |
 
 ## Install
 
-Download the archive for your platform (macOS, Linux, Windows; amd64 and arm64) from [GitHub Releases](https://github.com/nedanwr/vario/releases), [verify its checksum](docs/getting-started.md#verifying-downloads), and put `vario` on your `PATH`. Binaries are not signed; see [Code signing](docs/getting-started.md#code-signing).
+Download the archive for your platform (macOS, Linux, Windows; amd64 and arm64) from [GitHub Releases](https://github.com/nedanwr/vario/releases) (beta builds are marked as pre-releases), [verify its checksum](docs/getting-started.md#verifying-downloads), and put `vario` on your `PATH`. Binaries are not signed; see [Code signing](docs/getting-started.md#code-signing). `vario version` prints the version, commit and build date.
 
 Or build from source with Go 1.25 or newer (no CGO, no runtime dependencies):
 
 ```bash
 git clone https://github.com/nedanwr/vario.git
 cd vario
-make build            # writes bin/vario
+git checkout v0.1.0-beta.1   # optional: a released version instead of the latest master
+make build                   # writes bin/vario with version information
 ```
 
 ## Quick start
@@ -102,6 +102,7 @@ Vario detects when its ClickHouse database is **replaced** (dropped and recreate
 | [Operations](docs/operations.md)                  | Sync, destinations, rollback detection, delivery, recovery, upgrades, service, troubleshooting, limitations |
 | [Architecture](docs/architecture.md)              | Design decisions and internals                                                               |
 | [Development](docs/development.md)                | Tests, project layout, CI, releases                                                          |
+| [Changelog](CHANGELOG.md)                         | Changes, beta compatibility and known limitations per release                               |
 
 Every option is documented in [`config.example.toml`](config.example.toml).
 
