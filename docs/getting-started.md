@@ -4,7 +4,33 @@ Install Vario, connect it to ClickHouse and collect your first data. Configurati
 
 ## Install and build
 
-Prebuilt binaries for macOS, Linux and Windows (amd64 and arm64) are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases), together with a `checksums.txt` file. Beta versions such as `v0.1.0-beta.1` are published as GitHub pre-releases, so the "Latest release" link does not point to them; pick the version from the releases list. Each archive contains the executable, `LICENSE`, `README.md` and `THIRD_PARTY_LICENSES.txt`; the documentation linked from the README is on GitHub. The background service is available on macOS only (see [Background service](operations.md#background-service)). Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Code signing](#code-signing).
+The quickest way is the installer, which downloads from [GitHub Releases](https://github.com/nedanwr/vario/releases):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.sh | sh      # macOS, Linux
+```
+
+```powershell
+irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex           # Windows (PowerShell 5.1 or 7)
+```
+
+It detects your OS and CPU (amd64 or arm64), installs the newest **beta** (the default channel; found through the GitHub API), checks the archive's SHA-256 checksum against the release's `checksums.txt`, and checks that the binary runs before it replaces anything. Defaults:
+
+| | macOS, Linux (`install.sh`) | Windows (`install.ps1`) |
+| --- | --- | --- |
+| Install directory | `~/.local/bin` | `%LOCALAPPDATA%\Programs\Vario` |
+| `PATH` | printed instructions if the directory is missing; startup files are never edited | added to your user `PATH` (`-NoModifyPath` to skip) |
+
+No administrator rights are needed, and the installer never touches `~/.vario` or installs or starts the background service. Re-running it upgrades an existing installation in place. It does nothing if that version is already installed, and refuses to downgrade. Options (`install.sh` / `install.ps1`, or the environment variable):
+
+- `--version v0.1.0-beta.1` / `-Version`, `VARIO_VERSION`: install a specific version (this also avoids the GitHub API, which allows 60 anonymous requests an hour per address)
+- `--channel stable` / `-Channel`, `VARIO_CHANNEL`: follow the stable channel once there is a stable release
+- `--install-dir DIR` / `-InstallDir`, `VARIO_INSTALL_DIR`: another directory
+- `--force` / `-Force`: reinstall the same version or downgrade
+
+Pass options through the pipe with `sh -s --`, e.g. `curl -fsSL https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.sh | sh -s -- --version v0.1.0-beta.1`. On Windows, set the environment variable first: `$env:VARIO_VERSION = 'v0.1.0-beta.1'; irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex`. Details are in [Distribution](distribution.md#installers).
+
+To download manually, prebuilt archives for macOS, Linux and Windows (amd64 and arm64) and a `checksums.txt` file are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases); beta versions are GitHub pre-releases there. For example, `https://github.com/nedanwr/vario/releases/download/v0.1.0-beta.1/vario_0.1.0-beta.1_linux_amd64.tar.gz`. Each archive contains the executable, `LICENSE`, `README.md` and `THIRD_PARTY_LICENSES.txt`; the documentation linked from the README is on GitHub. The background service is available on macOS only (see [Background service](operations.md#background-service)). Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Code signing](#code-signing).
 
 To build from source, you need Go 1.25 or newer. The binary is a standalone executable with no CGO and no runtime dependencies.
 
@@ -22,7 +48,7 @@ Check what you installed with `vario version`, which prints for example `vario v
 
 ## Verifying downloads
 
-Download `checksums.txt` from the same release, place it next to the archive, and run:
+The installers do this for you. For a manual download, get `checksums.txt` from the same release (e.g. `https://github.com/nedanwr/vario/releases/download/v0.1.0-beta.1/checksums.txt`), place it next to the archive, and run:
 
 ```bash
 sha256sum --check --ignore-missing checksums.txt         # Linux
@@ -33,7 +59,7 @@ On Windows (PowerShell), compare the output of `Get-FileHash vario_<version>_win
 
 ## Code signing
 
-Release binaries are **not signed**. The macOS binaries are not notarized, so Gatekeeper may refuse to run a binary downloaded through a browser; after verifying the checksum, remove the quarantine attribute (`xattr -d com.apple.quarantine vario`). Windows SmartScreen may also warn about the unsigned executable.
+Release binaries are **not signed**, and the macOS binaries are not notarized. Binaries installed with `install.sh` or `install.ps1` are downloaded without the quarantine attribute (macOS) or Mark of the Web (Windows), so they normally run without a prompt. An archive downloaded through a **browser** is quarantined: Gatekeeper may refuse to run the binary. After verifying the checksum, remove the quarantine attribute (`xattr -d com.apple.quarantine vario`). Windows SmartScreen may also warn about the unsigned executable. A checksum detects corrupted downloads but does not prove who published the file; see [Security notes](distribution.md#security-notes-and-limitations).
 
 ## Quick start
 

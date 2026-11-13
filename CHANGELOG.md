@@ -16,6 +16,7 @@ First public beta. Vario is usable for day-to-day collection, but it has not yet
 - **Destination safety**: a ClickHouse database that was replaced or restored from a backup, or a changed URL or database name, stops delivery until you decide with `vario destination switch`; queued rows are never sent to the wrong database.
 - **Background service on macOS**: `vario service install` sets up a per-user LaunchAgent.
 - **Release archives** for macOS, Linux and Windows (amd64 and arm64) with SHA-256 checksums and reproducible builds. `vario version` reports the version, commit and build date.
+- **Installers**: `curl -fsSL https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.sh | sh` (macOS, Linux) and `irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex` (Windows) install the newest beta, or a given `--version`, from GitHub Releases. They verify checksums, install per user without administrator rights, and never touch the configuration or the background service. Each GitHub Release also carries the archives, `checksums.txt` and both installers.
 
 ### Support
 

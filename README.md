@@ -25,7 +25,21 @@ Vario runs as a single process, in the foreground or as a per-user background se
 
 ## Install
 
-Download the archive for your platform (macOS, Linux, Windows; amd64 and arm64) from [GitHub Releases](https://github.com/nedanwr/vario/releases) (beta builds are marked as pre-releases), [verify its checksum](docs/getting-started.md#verifying-downloads), and put `vario` on your `PATH`. Binaries are not signed; see [Code signing](docs/getting-started.md#code-signing). `vario version` prints the version, commit and build date.
+macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex
+```
+
+The installer picks the build for your OS and CPU, installs the current beta from [GitHub Releases](https://github.com/nedanwr/vario/releases), verifies its SHA-256 checksum, and puts `vario` in a per-user directory (`~/.local/bin`; `%LOCALAPPDATA%\Programs\Vario` on Windows). It needs no administrator rights, never touches your configuration and never starts the background service. Add `--version v0.1.0-beta.1` (`-Version` on Windows) for a specific version; see [Installing](docs/getting-started.md#install-and-build) for all options. `vario version` prints the version, commit and build date.
+
+You can also download the archive for your platform (macOS, Linux, Windows; amd64 and arm64) from [GitHub Releases](https://github.com/nedanwr/vario/releases), [verify its checksum](docs/getting-started.md#verifying-downloads), and put `vario` on your `PATH`. Binaries are not signed; see [Code signing](docs/getting-started.md#code-signing).
 
 Or build from source with Go 1.25 or newer (no CGO, no runtime dependencies):
 
@@ -102,6 +116,7 @@ Vario detects when its ClickHouse database is **replaced** (dropped and recreate
 | [Operations](docs/operations.md)                  | Sync, destinations, rollback detection, delivery, recovery, upgrades, service, troubleshooting, limitations |
 | [Architecture](docs/architecture.md)              | Design decisions and internals                                                               |
 | [Development](docs/development.md)                | Tests, project layout, CI, releases                                                          |
+| [Distribution](docs/distribution.md)              | Download URLs, installers, release workflow, moving to a custom domain                       |
 | [Changelog](CHANGELOG.md)                         | Changes, beta compatibility and known limitations per release                               |
 
 Every option is documented in [`config.example.toml`](config.example.toml).
