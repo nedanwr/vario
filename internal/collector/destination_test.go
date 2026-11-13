@@ -83,10 +83,21 @@ func TestDestinationSwitchIsolatesCursorsAndFingerprints(t *testing.T) {
 	oldCursor, _, _ := h.store.Cursor(ctx, h.src.ID())
 
 	// Nothing is queued, so a new destination is accepted automatically, and it
-	// has no cursor: the source is read again in full for it.
+	// has no cursor: the source is read again in full for it. It is a database
+	// of its own: one that holds the rows delivered to the other destination
+	// (two destinations without destination ids for the same database) has its
+	// policy generation verified anew at each switch.
 	opts := h.opts
 	opts.Database = "vario_b"
-	b := h.collector(t, opts)
+	sinkB := newSink()
+	onB := func() *Collector {
+		c := New(h.store, sinkB, []sources.Source{h.src}, opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if _, err := c.Prepare(ctx, true); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	b := onB()
 	if _, ok, _ := h.store.Cursor(ctx, h.src.ID()); ok {
 		t.Fatal("a new destination must not inherit the previous destination's cursor")
 	}
@@ -108,7 +119,7 @@ func TestDestinationSwitchIsolatesCursorsAndFingerprints(t *testing.T) {
 	}
 
 	// A collector restarted on destination B continues where B left off.
-	b2 := h.collector(t, opts)
+	b2 := onB()
 	if res, err := b2.Snapshot(ctx, h.src, false, false); err != nil || res.Enqueued != 0 {
 		t.Fatalf("restart on destination B must keep its fingerprints: %+v %v", res, err)
 	}

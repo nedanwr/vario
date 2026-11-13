@@ -446,13 +446,22 @@ func (s *Store) Replace(ctx context.Context, id int64, serverID string) (Destina
 
 // MovePending re-binds every entry queued for destination from to
 // destination to, so it is delivered there, and returns the number of rows
-// moved. Cursors and fingerprints are not moved: to keeps its own
-// synchronization state.
+// moved. Cursors and fingerprints are not moved.
 //
 // The cursors and fingerprints of from describe those rows as sent to from,
 // which they now never will be. They are therefore deleted in the same
 // transaction (see invalidateSync), so that from receives a full backfill if
 // it is ever used again instead of resuming past the rows it did not get.
+//
+// The fingerprints of to no longer describe what its database will hold
+// either: a moved row may have been queued under an earlier policy
+// generation than rows to already has, but under a later one than to's
+// newest row of the same record (privacy settings changed back), so it would
+// become the latest version, and to's fingerprints would keep the next
+// re-read from queueing the record again. to is therefore reset in the same
+// transaction (see requireResync): its next sync re-reads every source in
+// full and queues every record again under the current generation, which
+// outranks every moved row.
 func (s *Store) MovePending(ctx context.Context, from, to int64) (int64, error) {
 	if from == to {
 		return 0, nil
@@ -464,7 +473,8 @@ func (s *Store) MovePending(ctx context.Context, from, to int64) (int64, error) 
 		return 0, fmt.Errorf("spool: destination %d cannot receive queued rows", to)
 	}
 	// Reset the retry schedule: earlier failures concerned the old destination.
-	return s.takePending(ctx, from, `UPDATE queue SET destination_id = ?, attempts = 0, next_attempt_at = 0, last_error = '' WHERE destination_id = ?`, to, from)
+	return s.takePending(ctx, from, func(tx *sql.Tx) error { return requireResync(ctx, tx, to) },
+		`UPDATE queue SET destination_id = ?, attempts = 0, next_attempt_at = 0, last_error = '' WHERE destination_id = ?`, to, from)
 }
 
 // DiscardPending deletes every entry queued for a destination and returns
@@ -473,13 +483,14 @@ func (s *Store) MovePending(ctx context.Context, from, to int64) (int64, error) 
 // delivered, so the destination is no longer synchronized up to its cursor
 // and receives a full backfill if it is used again.
 func (s *Store) DiscardPending(ctx context.Context, id int64) (int64, error) {
-	return s.takePending(ctx, id, `DELETE FROM queue WHERE destination_id = ?`, id)
+	return s.takePending(ctx, id, nil, `DELETE FROM queue WHERE destination_id = ?`, id)
 }
 
 // takePending removes the queue entries of destination id with stmt and, if
-// there were any, invalidates the destination's synchronization state, in
-// one transaction. It returns the number of rows the entries held.
-func (s *Store) takePending(ctx context.Context, id int64, stmt string, args ...any) (int64, error) {
+// there were any, invalidates the destination's synchronization state and
+// runs also (if not nil), in one transaction. It returns the number of rows
+// the entries held.
+func (s *Store) takePending(ctx context.Context, id int64, also func(*sql.Tx) error, stmt string, args ...any) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -499,6 +510,11 @@ func (s *Store) takePending(ctx context.Context, id int64, stmt string, args ...
 	}
 	if err := invalidateSync(ctx, tx, id); err != nil {
 		return 0, err
+	}
+	if also != nil {
+		if err := also(tx); err != nil {
+			return 0, err
+		}
 	}
 	return n.Int64, tx.Commit()
 }

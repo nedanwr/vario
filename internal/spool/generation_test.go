@@ -281,3 +281,180 @@ func TestVerifyLineage(t *testing.T) {
 		}
 	})
 }
+
+// fingerprintCount is the number of fingerprints of destination dest.
+func fingerprintCount(t *testing.T, s *Store, dest int64) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM fingerprints WHERE destination_id = ?`, dest).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// syncedUnder completes a re-read of "src" for the selected destination
+// under fingerprint fp, as the final commit of a snapshot does.
+func syncedUnder(t *testing.T, s *Store, fp string, force bool) {
+	t.Helper()
+	g, err := s.EnsureGeneration(ctx, CommitOptions{PolicyFingerprint: fp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := "c"
+	if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "", 1)}, &cur, CommitOptions{PolicyFingerprint: fp, Force: force, SnapshotGeneration: g}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Moving queued rows into a synchronized destination resets it: rows of an
+// earlier generation could otherwise become the latest of records its
+// fingerprints keep the next re-read from queueing again.
+func TestMovePendingResetsTarget(t *testing.T) {
+	s, _ := open(t, 0)
+	b := s.dest
+	syncedUnder(t, s, "metrics", false) // generation 1
+	if _, _, err := s.VerifyLineage(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	a := use(t, s, testEndpoint, "other").Configured.ID
+	if _, err := s.Commit(ctx, "src", []model.Record{msg("m1", "secret", 1)}, nil, CommitOptions{PolicyFingerprint: "full"}); err != nil {
+		t.Fatal(err)
+	}
+	use(t, s, testEndpoint, "vario")
+	syncedUnder(t, s, "metrics", false) // generation 3; its fingerprint is unchanged, so m1 is skipped
+	if need, _, _ := s.NeedsResync(ctx, "src", "metrics"); need {
+		t.Fatal("B is synchronized")
+	}
+	replay, _ := s.Replay(ctx, b)
+	cursor, _, _ := s.Cursor(ctx, "src")
+
+	if n, err := s.MovePending(ctx, a, b); err != nil || n != 1 {
+		t.Fatalf("move: %d %v", n, err)
+	}
+	if need, force, _ := s.NeedsResync(ctx, "src", "metrics"); !need || !force {
+		t.Fatalf("B needs a forced re-read: %v %v", need, force)
+	}
+	if fingerprintCount(t, s, b) != 0 {
+		t.Fatal("B's fingerprints must be deleted")
+	}
+	if cur, ok, _ := s.Cursor(ctx, "src"); !ok || cur != cursor {
+		t.Fatal("B keeps its cursor")
+	}
+	if r, _ := s.Replay(ctx, b); r == replay {
+		t.Fatal("B's re-read is a replay and needs a new replay identity")
+	}
+	// The forced re-read queues m1 again under generation 3, above the moved row.
+	syncedUnder(t, s, "metrics", true)
+	vs := queuedVersions(t, s)
+	if model.Generation(vs["m1"]) != 3 {
+		t.Fatalf("latest queued m1 of generation %d", model.Generation(vs["m1"]))
+	}
+	if need, _, _ := s.NeedsResync(ctx, "src", "metrics"); need {
+		t.Fatal("the forced re-read completes it")
+	}
+
+	// Nothing to move: B is left alone.
+	if n, err := s.MovePending(ctx, a, b); err != nil || n != 0 {
+		t.Fatalf("empty move: %d %v", n, err)
+	}
+	if need, _, _ := s.NeedsResync(ctx, "src", "metrics"); need {
+		t.Fatal("an empty move must not reset B")
+	}
+}
+
+// A re-read that was running when its destination was reset (and may have
+// skipped records by the deleted fingerprints) does not complete it; only a
+// forced one does.
+func TestResetDuringRereadNeedsForcedReread(t *testing.T) {
+	s, _ := open(t, 0)
+	syncedUnder(t, s, "A", false)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireResync(ctx, tx, s.dest); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	syncedUnder(t, s, "A", false)
+	if need, force, _ := s.NeedsResync(ctx, "src", "A"); !need || !force {
+		t.Fatalf("a non-forced re-read must not complete the reset: %v %v", need, force)
+	}
+	syncedUnder(t, s, "A", true)
+	if need, _, _ := s.NeedsResync(ctx, "src", "A"); need {
+		t.Fatal("a forced re-read completes it")
+	}
+}
+
+// F2: when one destination's check starts a generation (the local state was
+// restored from an older copy), the other destinations' verifications are
+// withdrawn, and a destination checked without a verification is reset.
+func TestVerifyLineageAcrossDestinations(t *testing.T) {
+	setup := func(t *testing.T) (s *Store, a, b int64) {
+		s, _ = open(t, 0)
+		a = s.dest
+		syncedUnder(t, s, "metrics", false)
+		if _, _, err := s.VerifyLineage(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		b = use(t, s, testEndpoint, "b").Configured.ID
+		syncedUnder(t, s, "metrics", false)
+		if _, _, err := s.VerifyLineage(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		use(t, s, testEndpoint, "vario")
+		return s, a, b
+	}
+	t.Run("tie", func(t *testing.T) {
+		s, _, b := setup(t)
+		// A's database holds generation 2 of the lost history; B's holds 3.
+		if raised, g, err := s.VerifyLineage(ctx, 2); err != nil || !raised || g != 3 {
+			t.Fatalf("A: %v %d %v", raised, g, err)
+		}
+		s.SelectDestination(b)
+		if raised, g, err := s.VerifyLineage(ctx, 3); err != nil || !raised || g != 4 {
+			t.Fatalf("B's verification is stale: the tie must start a generation: %v %d %v", raised, g, err)
+		}
+		if fingerprintCount(t, s, b) != 0 {
+			t.Fatal("B's fingerprints must be deleted")
+		}
+	})
+	t.Run("gap", func(t *testing.T) {
+		s, _, b := setup(t)
+		if raised, g, err := s.VerifyLineage(ctx, 3); err != nil || !raised || g != 4 {
+			t.Fatalf("A: %v %d %v", raised, g, err)
+		}
+		s.SelectDestination(b)
+		// B's database holds generation 2 of the lost history, below the spool's 4.
+		if raised, g, err := s.VerifyLineage(ctx, 2); err != nil || raised || g != 4 {
+			t.Fatalf("B: %v %d %v", raised, g, err)
+		}
+		if fingerprintCount(t, s, b) != 0 {
+			t.Fatal("B's fingerprints must be deleted")
+		}
+		if need, force, _ := s.NeedsResync(ctx, "src", "metrics"); !need || !force {
+			t.Fatalf("B needs a forced re-read: %v %v", need, force)
+		}
+		// Verified now: a later check of B keeps its state.
+		syncedUnder(t, s, "metrics", true)
+		if _, _, err := s.VerifyLineage(ctx, 4); err != nil {
+			t.Fatal(err)
+		}
+		if need, _, _ := s.NeedsResync(ctx, "src", "metrics"); need || fingerprintCount(t, s, b) == 0 {
+			t.Fatal("a verified destination keeps its fingerprints and re-read")
+		}
+	})
+	t.Run("own generation", func(t *testing.T) {
+		// Without a restore nothing changes for a verified destination.
+		s, a, b := setup(t)
+		if raised, _, err := s.VerifyLineage(ctx, 1); err != nil || raised || fingerprintCount(t, s, a) == 0 {
+			t.Fatalf("A: %v %v", raised, err)
+		}
+		s.SelectDestination(b)
+		if raised, _, err := s.VerifyLineage(ctx, 1); err != nil || raised || fingerprintCount(t, s, b) == 0 {
+			t.Fatalf("B: %v %v", raised, err)
+		}
+	})
+}

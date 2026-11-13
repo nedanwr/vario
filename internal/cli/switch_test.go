@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nedanwr/vario/internal/config"
+	"github.com/nedanwr/vario/internal/privacy"
 	"github.com/nedanwr/vario/internal/spool"
 )
 
@@ -108,6 +109,93 @@ func TestDestinationSwitchResetsPreviousStateWhenRowsLeaveIt(t *testing.T) {
 			}
 			if out := vario(t, "", "destination").stdout; strings.Contains(out, "sources with a cursor 1") == reset {
 				t.Fatalf("after %s: %s", flag, out)
+			}
+		})
+	}
+}
+
+// Rows moved into a destination that is already synchronized (by `destination
+// switch --move-pending` or `destination pending --move`) reset it: its next
+// sync re-reads every source in full, forced, so that the moved rows, which
+// may be of earlier privacy settings, cannot stay the latest version of
+// records its fingerprints would skip (F1).
+func TestMoveIntoSynchronizedDestinationResetsIt(t *testing.T) {
+	for _, how := range []string{"switch", "pending"} {
+		t.Run(how, func(t *testing.T) {
+			_, ch := replacementFixture(t)
+			cfgPath := os.Getenv(config.EnvConfig)
+			useFakeService(t, &fakeService{})
+			migrateAsAdmin(t)
+			// A complete re-read (with the event history) synchronizes the destination.
+			if r := vario(t, "", "backfill", "--source", "t3code", "--force"); r.code != 0 || ch.inserted("vario", "messages") == 0 {
+				t.Fatalf("backfill: %+v", r)
+			}
+			if r := vario(t, "", "config", "set", "clickhouse.database", "other"); r.code != 0 {
+				t.Fatalf("config set: %+v", r)
+			}
+			if r := vario(t, "", "destination", "switch", "--keep-pending"); r.code != 0 {
+				t.Fatalf("switch to other: %+v", r)
+			}
+			if r := vario(t, "", "backfill", "--source", "t3code", "--no-deliver"); r.code != 0 || spooled(t) == "0" {
+				t.Fatalf("queue for other: %+v", r)
+			}
+			if r := vario(t, "", "config", "set", "clickhouse.database", "vario"); r.code != 0 {
+				t.Fatalf("config set: %+v", r)
+			}
+			needs := func() (need, force bool) {
+				t.Helper()
+				cfg, err := config.Load(cfgPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				store, err := openStore(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				d, ok, err := store.Lookup(context.Background(), cfg.ClickHouse.Endpoint(), "vario")
+				if err != nil || !ok {
+					t.Fatalf("lookup: %v %v", ok, err)
+				}
+				store.SelectDestination(d.ID)
+				policy, err := privacy.New(cfg.Privacy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				srcs, err := buildSources(cfg, policy, "t3code")
+				if err != nil || len(srcs) != 1 {
+					t.Fatalf("sources: %v %v", srcs, err)
+				}
+				defer srcs[0].Close()
+				need, force, err = store.NeedsResync(context.Background(), srcs[0].ID(), policy.Fingerprint())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return need, force
+			}
+			if how == "switch" {
+				if r := vario(t, "", "destination", "switch", "--move-pending", "--yes"); r.code != 0 {
+					t.Fatalf("switch --move-pending: %+v", r)
+				}
+			} else {
+				if r := vario(t, "", "destination", "switch", "--keep-pending"); r.code != 0 {
+					t.Fatalf("switch --keep-pending: %+v", r)
+				}
+				if _, force := needs(); force {
+					t.Fatal("keeping the rows must not reset the destination")
+				}
+				if r := vario(t, "", "destination", "pending", "2", "--move", "--yes"); r.code != 0 {
+					t.Fatalf("pending --move: %+v", r)
+				}
+			}
+			if need, force := needs(); !need || !force {
+				t.Fatalf("the destination the rows were moved to needs a forced re-read: need %v force %v", need, force)
+			}
+			if r := vario(t, "", "backfill", "--source", "t3code", "--force"); r.code != 0 || spooled(t) != "0" {
+				t.Fatalf("delivery after the move: %+v", r)
+			}
+			if need, _ := needs(); need {
+				t.Fatal("the backfill completes the re-read")
 			}
 		})
 	}

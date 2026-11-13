@@ -449,8 +449,16 @@ func (s *Store) Commit(ctx context.Context, sourceID string, recs []model.Record
 			return res, err
 		}
 		if opts.SnapshotGeneration != 0 {
-			if err := kvPut(ctx, tx, syncedKey(s.dest, sourceID), strconv.FormatUint(opts.SnapshotGeneration, 10)); err != nil {
+			// A non-forced re-read does not complete one that was invalidated
+			// while it ran (see requireResync).
+			cur, _, _, err := kvGet(ctx, tx, syncedKey(s.dest, sourceID))
+			if err != nil {
 				return res, err
+			}
+			if opts.Force || cur != resyncPending {
+				if err := kvPut(ctx, tx, syncedKey(s.dest, sourceID), strconv.FormatUint(opts.SnapshotGeneration, 10)); err != nil {
+					return res, err
+				}
 			}
 		}
 	}
