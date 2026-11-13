@@ -58,6 +58,9 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Test installers
+        run: scripts/release/test-installers.sh
+
       - name: Build release archives (all targets)
         run: make dist VERSION="ci-${GITHUB_SHA::12}"
 
