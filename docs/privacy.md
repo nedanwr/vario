@@ -1,0 +1,36 @@
+# Privacy and security
+
+Read this before enabling `messages` or `full` collection. Credential storage is described under [Credentials](configuration.md#configuration-file) and [Access model](clickhouse.md#access-model-administrative-and-operational-credentials).
+
+Vario handles potentially sensitive content. Transcripts and command output can contain credentials, private files, and proprietary source code.
+
+- **Collection modes** (shown in the configuration and in `vario status`):
+  - `metrics` (default): token usage, models, timings, tool names, statuses, exit codes, and content sizes. No message text, conversation or project titles, workspace paths, tool inputs/outputs, or file names. Identifiers (conversation, message, project ids) are exported as-is.
+  - `messages`: adds user/assistant message text, conversation and project titles, workspace paths, branch names, linked pull requests, attachment metadata, and changed file names.
+  - `full`: adds command and tool inputs/outputs, reasoning text, file diffs, web searches, raw event payloads and metadata, and every other source field.
+- Every mode exports the machine's host name and the source database path (`sources` table) so installations can be told apart. Raw source events outside `full` mode carry only their type, ids, timestamp and a fixed allow-list of operational metadata keys; outside `full` mode, unknown source fields are dropped.
+- `messages` and `full` require `allow_sensitive_content = true`, which `vario init` only sets after you type `yes`.
+- **Redaction** runs before data is written to the spool, on every exported text field and kept JSON attribute. Built-in rules cover private keys, Anthropic/OpenAI/AWS/GitHub/Slack/Stripe/Google keys, JWTs, `Authorization` headers (bearer, basic and others), credentials in URLs and connection strings, and assignments to credential-named keys (`password=`, `DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY=`, `"apiKey": "..."`, `token: ...`), including inside JSON. Add your own with `extra_redaction_patterns`. Redaction counts are recorded per row.
+- **What redaction does not do**: it matches known formats and credential-named assignments. It does not detect secrets without a recognizable shape or name (for example a bare random password in prose, or a key pasted on its own), personal data, or proprietary code. Treat `messages` and `full` data in ClickHouse as sensitive, and protect it accordingly.
+- Long fields are truncated at `max_field_bytes` and flagged.
+- Logs contain counts, identifiers, and error summaries, never message contents or credentials. ClickHouse errors that echo row data are sanitized.
+- Local files: the configuration, password file, spool database (including its `-wal`/`-shm` files) and log files are created with mode `0600`, and directories Vario creates with `0700`. Passwords are sent only in the `X-ClickHouse-Key` header; HTTP redirects are never followed, so they cannot be forwarded to another host. Administrative passwords are kept only in memory for the command that asked for them. A user created by Vario is defined with a salted SHA-256 hash computed locally; the password itself is never part of a statement, and hashes are removed from error messages.
+- **No telemetry.** Vario sends data only to the ClickHouse endpoint you configure.
+- Source databases are opened read-only and are never modified.
+
+## Changing the privacy settings
+
+Changing `mode`, `redact_secrets`, `extra_redaction_patterns` or `max_field_bytes` starts a new *policy generation*. On its next sync the collector re-reads every source in full, event history included, and queues every record again under the new settings (for each destination, when it is next used). Every stored row carries its generation in the top bits of `version`, so a row produced under newer settings always outranks every row produced under earlier ones in `ReplacingMergeTree`. This holds even for rows of the earlier settings that were still queued, retried after a failed or unacknowledged insert, moved to another destination with `vario destination switch --move-pending` or `vario destination pending --move` (the destination they are moved to is then re-read in full, so its records are queued again under the current settings), or sent after a restart: whatever order they arrive in, they never become the latest version again. This works in both directions: raising the mode makes the newly allowed content the latest version just as lowering it removes it.
+
+**What is guaranteed (logical latest records).** Once the re-read has been delivered, the `*_latest`, `token_usage_daily` and `tool_usage` views, and any query using `FINAL` or `argMax(..., version)`, show for every record that still exists in the source only what the current settings allow. Token totals and record counts are unaffected, because each record is still counted once.
+
+**What is not guaranteed (physical retention).** Changing the settings does not erase anything:
+
+- Earlier versions of each row stay in the base tables until ClickHouse merges them, and plain `SELECT`s on the base tables (without `FINAL`) can return them. They also remain in backups, replicas, exports and anything else that copied the data before.
+- Until the re-read has been delivered (for example while ClickHouse is unreachable), the latest version of each record is still the one collected under the earlier settings.
+- A record that no longer exists in the source (a message or item hard-deleted from T3 Code) cannot be read again: its latest row stays as it was collected, and a row of it still queued under the earlier settings is delivered as it was.
+- Likewise, source events that T3 Code has already pruned from its event log cannot be read again: their `raw_events` rows cannot be re-sanitized and stay as they were collected (or, if still queued, are delivered as they were).
+
+To purge content collected under earlier settings after the re-read has been delivered, delete it in ClickHouse yourself, for example with `OPTIMIZE TABLE vario.messages FINAL` (and likewise for the other tables), which merges each row down to its latest version, or by dropping the tables and re-sending with `vario migrate` and `vario backfill --source t3code --force`. Backups need to be handled separately.
+
+The generation is kept in the local state. If `state.db` is deleted or restored from an older copy, the collector notices at its first check of the database that it holds rows of a later generation than the local state, starts a generation above them and re-reads every source in full, before it delivers anything. Up to 1023 generations are available. The counter is kept in the local state and can never fall below the highest generation a database holds, so after the last one the collector stops with an error and neither a new database nor new local state alone is enough: stop the collector, deliver what is queued (or accept losing it), configure a new, empty database and run `vario migrate` for it, then delete `state.db*` in the data directory (see [Recovery](operations.md#recovery)). The next start reads every source in full into the new database under generation 1. The old database cannot be delivered to again; events T3 Code has already pruned exist only there.

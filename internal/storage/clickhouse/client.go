@@ -1,0 +1,396 @@
+// Package clickhouse delivers records to ClickHouse over its HTTP(S) interface.
+//
+// The HTTP interface is used instead of the native protocol because it needs no
+// driver dependency, works through standard TLS terminators and proxies, and
+// is available on every self-hosted and managed ClickHouse deployment.
+package clickhouse
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/nedanwr/vario/internal/buildinfo"
+	"github.com/nedanwr/vario/internal/config"
+	"github.com/nedanwr/vario/internal/model"
+)
+
+// Client is a connection to one database as one ClickHouse user. The
+// operational client (New) is what the collector uses: it only inspects the
+// schema and inserts rows. Operations that change databases, users,
+// privileges or the schema are methods of Admin.
+type Client struct {
+	base     *url.URL
+	database string
+	user     string
+	password string
+	http     *http.Client
+}
+
+// New creates a client for the configured (operational) user. The password
+// is sent only in request headers.
+func New(cfg config.ClickHouseConfig, password string) (*Client, error) {
+	u, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse url: %w", err)
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.TLSInsecureSkipVerify} //nolint:gosec // explicit user opt-in
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read ca_file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("ca_file contains no PEM certificates")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig:       tlsCfg,
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          2,
+		IdleConnTimeout:       60 * time.Second,
+		ResponseHeaderTimeout: cfg.Timeout.Duration,
+		ForceAttemptHTTP2:     true,
+	}
+	return &Client{
+		base:     u,
+		database: cfg.Database,
+		user:     cfg.Username,
+		password: password,
+		http: &http.Client{
+			Transport: transport,
+			Timeout:   cfg.Timeout.Duration,
+			// ClickHouse never redirects. Following one would forward the
+			// X-ClickHouse-Key header to the redirect target (Go only strips
+			// standard auth headers) and could downgrade https to http.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}, nil
+}
+
+func (c *Client) Database() string { return c.database }
+
+// WithDatabase returns a client for another database on the same connection
+// and user (used while choosing a database during setup).
+func (c *Client) WithDatabase(db string) *Client {
+	n := *c
+	n.database = db
+	return &n
+}
+
+// User returns the ClickHouse user the client authenticates as.
+func (c *Client) User() string { return c.user }
+
+// Error is a ClickHouse or transport failure with a sanitized message.
+type Error struct {
+	Status    int
+	Code      int
+	Message   string
+	Transient bool
+}
+
+func (e *Error) Error() string {
+	switch {
+	case e.Code != 0:
+		return fmt.Sprintf("clickhouse error %d (HTTP %d): %s", e.Code, e.Status, e.Message)
+	case e.Status != 0:
+		return fmt.Sprintf("clickhouse HTTP %d: %s", e.Status, e.Message)
+	default:
+		return "clickhouse: " + e.Message
+	}
+}
+
+// IsTransient reports whether retrying the same request may succeed without user action.
+func IsTransient(err error) bool {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Transient
+	}
+	return true
+}
+
+var (
+	codeRe     = regexp.MustCompile(`^Code: (\d+)\. `)
+	dataLeakRe = regexp.MustCompile(`(?i)(: \(at row|before: |row \d+:|parsed text:).*`)
+)
+
+// sanitize keeps ClickHouse error text short and strips echoed row data so that
+// conversation content never reaches logs or the spool's error column.
+func sanitize(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	msg = dataLeakRe.ReplaceAllString(msg, " [row data omitted]")
+	if len(msg) > 300 {
+		msg = msg[:300] + "..."
+	}
+	return msg
+}
+
+// Transient ClickHouse error codes: timeouts, overload, too many parts, memory limits, readonly replicas.
+var transientCodes = map[int]bool{159: true, 164: true, 202: true, 203: true, 209: true, 210: true, 241: true, 242: true, 252: true, 285: true, 319: true, 425: true}
+
+func (c *Client) do(ctx context.Context, method string, params url.Values, body io.Reader, gzipped bool) ([]byte, error) {
+	u := *c.base
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/"
+	u.RawQuery = params.Encode()
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-ClickHouse-User", c.user)
+	if c.password != "" {
+		req.Header.Set("X-ClickHouse-Key", c.password)
+	}
+	req.Header.Set("User-Agent", buildinfo.UserAgent())
+	if gzipped {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, &Error{Message: sanitizeTransport(err), Transient: true}
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, &Error{Status: resp.StatusCode, Message: "read response: " + err.Error(), Transient: true}
+	}
+	if resp.StatusCode == http.StatusOK {
+		return data, nil
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, &Error{Status: resp.StatusCode, Message: "unexpected redirect (not followed; check clickhouse.url)"}
+	}
+	e := &Error{Status: resp.StatusCode, Message: sanitize(string(data))}
+	if code := resp.Header.Get("X-ClickHouse-Exception-Code"); code != "" {
+		e.Code, _ = strconv.Atoi(code)
+	} else if m := codeRe.FindStringSubmatch(string(data)); m != nil {
+		e.Code, _ = strconv.Atoi(m[1])
+	}
+	e.Transient = resp.StatusCode >= 500 && e.Code == 0 || resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode == http.StatusServiceUnavailable || transientCodes[e.Code]
+	return nil, e
+}
+
+func sanitizeTransport(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Op + ": " + ue.Err.Error()
+	}
+	return err.Error()
+}
+
+// Ping checks that the HTTP endpoint is reachable (no authentication involved).
+func (c *Client) Ping(ctx context.Context) error {
+	u := *c.base
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/ping"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", buildinfo.UserAgent())
+	resp, err := c.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &Error{Message: sanitizeTransport(err), Transient: true}
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+	if resp.StatusCode != http.StatusOK {
+		return &Error{Status: resp.StatusCode, Message: "unexpected ping response", Transient: true}
+	}
+	return nil
+}
+
+// Exec runs a statement that returns no rows.
+func (c *Client) Exec(ctx context.Context, query string) error {
+	_, err := c.do(ctx, http.MethodPost, url.Values{}, strings.NewReader(query), false)
+	return err
+}
+
+// Query runs a SELECT and decodes rows from ClickHouse's JSON output format.
+func (c *Client) Query(ctx context.Context, query string, rows any) error {
+	return c.query(ctx, query, rows, nil)
+}
+
+// query is Query with additional settings.
+func (c *Client) query(ctx context.Context, query string, rows any, settings url.Values) error {
+	params := url.Values{}
+	for k, v := range settings {
+		params[k] = v
+	}
+	params.Set("default_format", "JSON")
+	params.Set("output_format_json_quote_64bit_integers", "0")
+	data, err := c.do(ctx, http.MethodPost, params, strings.NewReader(query), false)
+	if err != nil {
+		return err
+	}
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return fmt.Errorf("decode clickhouse response: %w", err)
+	}
+	return json.Unmarshal(env.Data, rows)
+}
+
+// ServerVersion returns the ClickHouse server version and verifies authentication.
+func (c *Client) ServerVersion(ctx context.Context) (string, error) {
+	var rows []struct {
+		V string `json:"v"`
+	}
+	if err := c.Query(ctx, "SELECT version() AS v", &rows); err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", errors.New("empty version response")
+	}
+	return rows[0].V, nil
+}
+
+// Insert sends a gzip-compressed JSONEachRow body. The deduplication token makes
+// a retried insert of the same batch idempotent at the block level; row-level
+// correctness additionally relies on ReplacingMergeTree versions.
+func (c *Client) Insert(ctx context.Context, table string, gzBody []byte, token string) error {
+	_, err := c.do(ctx, http.MethodPost, c.insertParams(table, token), bytes.NewReader(gzBody), true)
+	return err
+}
+
+// insertParams are the query and settings of every delivery. The access
+// probe uses the same ones, so that a settings profile or constraint that
+// forbids one of these settings fails the probe as it would fail delivery.
+func (c *Client) insertParams(table, token string) url.Values {
+	params := url.Values{}
+	params.Set("query", fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", quoteIdent(c.database), quoteIdent(table)))
+	params.Set("input_format_skip_unknown_fields", "1")
+	params.Set("input_format_null_as_default", "1")
+	params.Set("date_time_input_format", "best_effort")
+	params.Set("async_insert", "0")
+	if token != "" {
+		params.Set("insert_deduplication_token", token)
+	}
+	return params
+}
+
+// probeInsert sends an INSERT without rows, with the same settings as a
+// delivery. ClickHouse authenticates the user, applies the session's
+// settings profile and constraints, checks the INSERT privilege and the
+// readonly setting, and rejects an exhausted quota before it reads any
+// data, so this verifies that the user may insert into the table without
+// writing anything. Limits that depend on the data itself (quotas on
+// written bytes, disk space, memory) are not exercised.
+func (c *Client) probeInsert(ctx context.Context, table string) error {
+	_, err := c.do(ctx, http.MethodPost, c.insertParams(table, "vario-access-probe"), strings.NewReader(""), false)
+	return err
+}
+
+// ReadCheckpoint returns the highest delivery checkpoint the database holds
+// for writer, and whether it holds one at all. It only reads.
+//
+// select_sequential_consistency makes the read see every acknowledged insert
+// on engines that share or replicate data between replicas; it has no effect
+// on a single server. A session that may not change the setting reads
+// without it.
+func (c *Client) ReadCheckpoint(ctx context.Context, writer string) (seq uint64, found bool, err error) {
+	var rows []struct {
+		Seq uint64 `json:"seq"`
+		N   uint64 `json:"n"`
+	}
+	q := fmt.Sprintf("SELECT max(seq) AS seq, count() AS n FROM %s.%s WHERE writer_id = '%s'",
+		quoteIdent(c.database), quoteIdent(CheckpointTable), escapeString(writer))
+	err = c.query(ctx, q, &rows, url.Values{"select_sequential_consistency": {"1"}})
+	var e *Error
+	if errors.As(err, &e) && (e.Code == codeReadonly || e.Code == codeSettingLimit || e.Code == codeUnknownSetting) {
+		rows = nil
+		err = c.query(ctx, q, &rows, nil)
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if len(rows) != 1 {
+		return 0, false, errors.New("unexpected checkpoint response")
+	}
+	return rows[0].Seq, rows[0].N > 0, nil
+}
+
+// WriteCheckpoint inserts delivery checkpoint seq for writer, with the
+// settings of a delivery (in particular a synchronous insert, so that the
+// acknowledgement means the row was written). Every checkpoint is a new row
+// with a higher sequence number; a repeated write is never deduplicated away.
+func (c *Client) WriteCheckpoint(ctx context.Context, writer string, seq uint64) error {
+	body, err := json.Marshal(struct {
+		Writer string `json:"writer_id"`
+		Seq    uint64 `json:"seq"`
+	}{writer, seq})
+	if err != nil {
+		return err
+	}
+	_, err = c.do(ctx, http.MethodPost, c.insertParams(CheckpointTable, ""), bytes.NewReader(append(body, '\n')), false)
+	return err
+}
+
+// MaxVersion returns the highest version any row of the given sources holds
+// in Vario's tables (0 if there is none). It only reads. The collector
+// derives the highest policy generation the database holds from it (see
+// spool.VerifyLineage).
+func (c *Client) MaxVersion(ctx context.Context, sourceIDs []string) (uint64, error) {
+	if len(sourceIDs) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(sourceIDs))
+	for i, id := range sourceIDs {
+		ids[i] = "'" + escapeString(id) + "'"
+	}
+	in := strings.Join(ids, ", ")
+	parts := make([]string, len(model.Tables))
+	for i, t := range model.Tables {
+		parts[i] = fmt.Sprintf("SELECT max(version) AS v FROM %s.%s WHERE source_id IN (%s)", quoteIdent(c.database), quoteIdent(t), in)
+	}
+	var rows []struct {
+		V uint64 `json:"v"`
+	}
+	q := "SELECT max(v) AS v FROM (" + strings.Join(parts, " UNION ALL ") + ")"
+	if err := c.query(ctx, q, &rows, url.Values{"select_sequential_consistency": {"1"}}); err != nil {
+		var e *Error
+		if !errors.As(err, &e) || (e.Code != codeReadonly && e.Code != codeSettingLimit && e.Code != codeUnknownSetting) {
+			return 0, err
+		}
+		rows = nil
+		if err := c.query(ctx, q, &rows, nil); err != nil {
+			return 0, err
+		}
+	}
+	if len(rows) != 1 {
+		return 0, errors.New("unexpected response to the version query")
+	}
+	return rows[0].V, nil
+}
+
+// quoteIdent quotes an identifier for use in SQL. Every identifier Vario puts
+// into a statement (databases, tables, users) goes through it.
+func quoteIdent(s string) string {
+	return "`" + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), "`", "``") + "`"
+}

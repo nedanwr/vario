@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans:
+    "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+  --font-mono:
+    "Fragment Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Palette: black, two inks, two hairlines, one accent. */
+  --color-black: #000000;
+  --color-ink: #f2f2ef;
+  --color-muted: #8c8c88;
+  --color-faint: #5c5c59;
+  --color-line: #1c1c1c;
+  --color-line-strong: #2c2c2b;
+  --color-accent: #f5b33f;
+
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* The page column: one left edge shared by every section. */
+@utility shell {
+  margin-inline: auto;
+  width: 100%;
+  max-width: 74rem;
+  padding-inline: 1.5rem;
+  @media (width >= 40rem) {
+    padding-inline: 2.5rem;
+  }
+  @media (width >= 64rem) {
+    padding-inline: 3.5rem;
+  }
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    background-color: var(--color-black);
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--color-black);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 1.0625rem;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::selection {
+    background-color: var(--color-accent);
+    color: var(--color-black);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+
+  code,
+  kbd,
+  pre {
+    font-family: var(--font-mono);
+    font-feature-settings: normal;
+  }
+}
+
+@layer components {
+  /* Text links: quiet by default, accent on hover. */
+  .link {
+    color: var(--color-muted);
+    text-decoration-line: underline;
+    text-decoration-color: var(--color-line-strong);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 0.25em;
+    transition:
+      color 160ms var(--ease-out-quint),
+      text-decoration-color 160ms var(--ease-out-quint);
+  }
+  .link:hover {
+    color: var(--color-ink);
+    text-decoration-color: var(--color-accent);
+  }
+
+  .nav-link {
+    color: var(--color-muted);
+    transition: color 160ms var(--ease-out-quint);
+  }
+  .nav-link:hover {
+    color: var(--color-ink);
+  }
+
+  /* Inline code in running text. */
+  .code {
+    font-family: var(--font-mono);
+    font-size: 0.875em;
+    color: var(--color-ink);
+    letter-spacing: -0.01em;
+  }
+
+  /* Long commands scroll sideways; a fade marks hidden overflow. */
+  .command-scroll {
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .command-scroll::-webkit-scrollbar {
+    display: none;
+  }
+  .command-scroll[data-fade] {
+    mask-image: linear-gradient(
+      to right,
+      #000 calc(100% - 2.5rem),
+      transparent 100%
+    );
+  }
+}
+
+/* The single orchestrated moment: the hero settles in on load. */
+@media (prefers-reduced-motion: no-preference) {
+  .rise {
+    animation: rise 900ms var(--ease-out-quint) both;
+    animation-delay: calc(var(--i, 0) * 90ms + 60ms);
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(0.75rem);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}

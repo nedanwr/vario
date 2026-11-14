@@ -1,0 +1,468 @@
+# Publishes a release when a maintainer pushes a version tag (vX.Y.Z or
+# vX.Y.Z-prerelease) that points to a commit on master. Pull requests and
+# branch pushes never trigger this workflow, and it never creates tags.
+#
+# Users download from GitHub Releases for now: the installers' DEFAULT_SOURCE
+# is "github". When it is changed to DOWNLOAD_BASE_URL (our own domain on
+# Cloudflare R2), the r2 and promote jobs switch on; until then they are
+# skipped and no Cloudflare credentials are needed.
+#
+#   build    verify the tag and the installers' download source, run the
+#            checks, build every archive once
+#   r2       (mirror only) upload those archives, checksums.txt and the
+#            installers to R2 (immutable releases/<tag>/ paths) and verify them
+#            through the public download domain
+#   publish  GitHub Release with the same archives, checksums.txt, install.sh
+#            and install.ps1, uploaded as a draft, verified, then published.
+#            Prerelease tags (e.g. v0.1.0-beta.1) are published as GitHub
+#            prereleases. The installers find a channel's newest release among
+#            published releases, so publishing is what moves the channel. The
+#            release notes start with the tag's section of CHANGELOG.md, which
+#            must exist.
+#   promote  (mirror only) move channels/beta.txt (and channels/stable.txt for
+#            stable tags) forward to this tag and publish the root installers
+#   verify   install the published release with its own installers on Linux,
+#            macOS and Windows (PowerShell 5.1 and 7), straight from GitHub
+#
+# Every job is safe to re-run. See docs/distribution.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Vario's own download domain (Cloudflare R2), used once the installers'
+  # DEFAULT_SOURCE is set to it; see docs/distribution.md.
+  DOWNLOAD_BASE_URL: https://vario.nedanwr.dev
+
+jobs:
+  build:
+    name: Verify and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      mirror: ${{ steps.source.outputs.mirror }}
+    steps:
+      - name: Validate tag
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [ "$REF_TYPE" != tag ] || ! [[ $TAG =~ $semver ]]; then
+            echo "::error::'$TAG' is not a release tag (expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE)."
+            exit 1
+          fi
+          if [[ $TAG == *-* ]]; then
+            echo "prerelease=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out (full history for the master check)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag is on master
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tag_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          if [ "$tag_commit" != "$GITHUB_SHA" ] || [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $TAG now points to $tag_commit, but this run was started for $GITHUB_SHA."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/master; then
+            echo "::error::Tag $TAG points to $GITHUB_SHA, which is not in the history of master."
+            exit 1
+          fi
+          echo "$TAG -> $GITHUB_SHA (on master)"
+
+      - name: Check the installers' download source
+        id: source
+        run: |
+          sh_source=$(sed -n "s/^DEFAULT_SOURCE='\(.*\)'\$/\1/p" scripts/install.sh)
+          ps_source=$(sed -n "s/^\$DefaultSource = '\(.*\)'\$/\1/p" scripts/install.ps1)
+          sh_repo=$(sed -n "s/^GITHUB_REPO='\(.*\)'\$/\1/p" scripts/install.sh)
+          ps_repo=$(sed -n "s/^\$GitHubRepo = '\(.*\)'\$/\1/p" scripts/install.ps1)
+          if [ -z "$sh_source" ] || [ "$sh_source" != "$ps_source" ]; then
+            echo "::error::install.sh (DEFAULT_SOURCE='$sh_source') and install.ps1 (\$DefaultSource='$ps_source') must default to the same download source."
+            exit 1
+          fi
+          if [ "$sh_repo" != "$GITHUB_REPOSITORY" ] || [ "$ps_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::The installers download from $sh_repo / $ps_repo, but this is $GITHUB_REPOSITORY."
+            exit 1
+          fi
+          case $sh_source in
+            github) mirror=false ;;
+            "$DOWNLOAD_BASE_URL") mirror=true ;;
+            *)
+              echo "::error::The installers default to '$sh_source'; expected github or $DOWNLOAD_BASE_URL."
+              exit 1
+              ;;
+          esac
+          echo "Installers download from: $sh_source"
+          echo "mirror=$mirror" >>"$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v=${TAG#v}
+          mkdir -p "$RUNNER_TEMP/notes"
+          # The section starts at "## [<version>]" (optionally followed by a
+          # date) and ends before the next "## " heading.
+          awk -v h="## [$v]" '
+            index($0, h) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md >"$RUNNER_TEMP/notes/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no section '## [$v]' (or it is empty)."
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # build from a clean cache; no cache poisoning of release builds
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Vet
+        run: |
+          for goos in linux darwin windows; do
+            echo "go vet (GOOS=$goos)"
+            GOOS=$goos go vet ./...
+          done
+
+      - name: Test
+        run: make test
+
+      - name: Test installers
+        run: scripts/release/test-installers.sh
+
+      - name: Build release archives
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make dist VERSION="$TAG" COMMIT="$GITHUB_SHA"
+
+      - name: Check archives
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          v=${TAG#v}
+          expected="checksums.txt
+          vario_${v}_darwin_amd64.tar.gz
+          vario_${v}_darwin_arm64.tar.gz
+          vario_${v}_linux_amd64.tar.gz
+          vario_${v}_linux_arm64.tar.gz
+          vario_${v}_windows_amd64.zip
+          vario_${v}_windows_arm64.zip"
+          actual=$(printf '%s\n' * | LC_ALL=C sort)
+          if [ "$actual" != "$(echo "$expected" | sed 's/^ *//' | LC_ALL=C sort)" ]; then
+            echo "::error::Unexpected release files:"
+            echo "$actual"
+            exit 1
+          fi
+          sha256sum --check --strict checksums.txt
+          tar -xzf "vario_${v}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
+          out=$("$RUNNER_TEMP/vario_${v}_linux_amd64/vario" version)
+          echo "$out"
+          case $out in
+            "vario $TAG (commit ${GITHUB_SHA::12},"*) ;;
+            *) echo "::error::Binary reports the wrong version."; exit 1 ;;
+          esac
+
+      - name: Upload release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload installers and publishing script
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publish-tools
+          path: |
+            scripts/install.sh
+            scripts/install.ps1
+            scripts/release/r2-publish.sh
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  r2:
+    name: Upload to R2
+    needs: build
+    if: needs.build.outputs.mirror == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Holds the R2 credentials. Restrict it to tags matching v* (Settings >
+    # Environments > release > Deployment branches and tags).
+    environment: release
+    permissions: {} # no repository access; artifacts come from this run
+    env:
+      TAG: ${{ github.ref_name }}
+      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist
+
+      - name: Download installers and publishing script
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publish-tools
+          path: tools
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check --strict checksums.txt
+
+      - name: Upload and verify release files
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          INSTALLERS_DIR: tools
+        run: |
+          aws --version
+          bash tools/release/r2-publish.sh upload
+
+  publish:
+    name: Publish release
+    needs: [build, r2]
+    # r2 is skipped while users download from GitHub.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.r2.result == 'success' || needs.r2.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist
+
+      - name: Download installers
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publish-tools
+          path: tools
+
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Assemble release assets
+        run: |
+          (cd dist && sha256sum --check --strict checksums.txt)
+          mkdir assets
+          cp dist/* assets/
+          cp tools/install.sh tools/install.ps1 assets/
+          # What every copy of the release must match, byte for byte.
+          (cd assets && sha256sum -- * | LC_ALL=C sort -k2) >"$RUNNER_TEMP/assets.sha256"
+          cat "$RUNNER_TEMP/assets.sha256"
+
+      - name: Check for an existing release
+        id: existing
+        run: |
+          if gh release view "$TAG" --json isDraft,url >release.json 2>gh.err; then
+            if [ "$(jq -r .isDraft release.json)" = true ]; then
+              echo "::error::A draft release for $TAG already exists: $(jq -r .url release.json). Nothing was changed. Delete it manually to republish."
+              exit 1
+            fi
+            # Published by an earlier attempt of this run: accept it only if its
+            # assets are exactly the files built now.
+            mkdir published
+            gh release download "$TAG" --dir published
+            if [ "$(cd published && printf '%s\n' * | LC_ALL=C sort)" = "$(cd assets && printf '%s\n' * | LC_ALL=C sort)" ] &&
+              (cd published && sha256sum --check --strict --quiet "$RUNNER_TEMP/assets.sha256"); then
+              echo "::notice::Release $TAG is already published with identical assets; nothing to do."
+              echo "exists=true" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::Release $TAG is already published with different assets: $(jq -r .url release.json). Nothing was changed."
+            exit 1
+          fi
+          if ! grep -qi 'not found' gh.err; then
+            cat gh.err
+            echo "::error::Could not check for an existing release."
+            exit 1
+          fi
+          echo "exists=false" >>"$GITHUB_OUTPUT"
+
+      - name: Create draft release with assets
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          args=(--verify-tag --draft --notes-file notes/release-notes.md --generate-notes --title "Vario $TAG")
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}" assets/*
+
+      - name: Verify uploaded assets
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          uploaded=$(gh release view "$TAG" --json assets --jq '.assets[] | select(.state == "uploaded") | .name' | LC_ALL=C sort)
+          local_files=$(cd assets && printf '%s\n' * | LC_ALL=C sort)
+          if [ "$uploaded" != "$local_files" ]; then
+            echo "::error::Uploaded assets do not match; the release was left as a draft."
+            diff <(echo "$local_files") <(echo "$uploaded") || true
+            exit 1
+          fi
+          # Read every asset back and compare it with what was built.
+          mkdir uploaded
+          gh release download "$TAG" --dir uploaded
+          if ! (cd uploaded && sha256sum --check --strict "$RUNNER_TEMP/assets.sha256"); then
+            echo "::error::Uploaded assets differ from the built files; the release was left as a draft."
+            exit 1
+          fi
+
+      - name: Publish release
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json url --jq .url
+
+  promote:
+    name: Promote channels
+    needs: [build, r2, publish]
+    if: needs.build.outputs.mirror == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions: {}
+    # Channels are shared by all tags: never move them from two runs at once.
+    concurrency:
+      group: release-channels
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.ref_name }}
+      R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: dist
+
+      - name: Download installers and publishing script
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publish-tools
+          path: tools
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check --strict checksums.txt
+
+      - name: Move channels and root installers
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          INSTALLERS_DIR: tools
+        run: bash tools/release/r2-publish.sh promote
+
+  verify:
+    name: Install check (${{ matrix.os }})
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions: {} # public downloads only
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    env:
+      TAG: ${{ github.ref_name }}
+      # The installers attached to this release; they default to the same
+      # source as the ones users run from the repository.
+      ASSETS: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}
+    steps:
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dir=$RUNNER_TEMP/vario-bin
+          curl -fsSL --proto '=https' "$ASSETS/install.sh" | sh -s -- --version "$TAG" --install-dir "$dir"
+          got=$("$dir/vario" version --short)
+          [ "$got" = "$TAG" ] || { echo "::error::installed vario reports '$got', want $TAG"; exit 1; }
+          "$dir/vario" version
+          test ! -e "$HOME/.vario" || { echo "::error::the installer created ~/.vario"; exit 1; }
+
+      - name: Resolve the beta channel with install.sh
+        if: runner.os == 'Linux'
+        # Uses an anonymous GitHub API request, which shares a rate limit with
+        # everything else on this runner's address; a failure here is reported
+        # but does not fail the release.
+        continue-on-error: true
+        shell: bash
+        run: |
+          curl -fsSL --proto '=https' "$ASSETS/install.sh" | sh -s -- --install-dir "$RUNNER_TEMP/vario-beta" | tee beta.txt
+          grep -E '^Installing Vario v[^ ]+ \(beta channel\)' beta.txt
+
+      - name: Install with install.ps1 (Windows PowerShell 5.1, -File)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSVersionTable.PSVersion.ToString()
+          Invoke-WebRequest -UseBasicParsing -Uri "$env:ASSETS/install.ps1" -OutFile "$env:RUNNER_TEMP\install.ps1"
+          $dir = Join-Path $env:RUNNER_TEMP 'vario-ps51'
+          & powershell -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\install.ps1" -Version $env:TAG -InstallDir $dir -NoModifyPath
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed ($LASTEXITCODE)" }
+          $got = & "$dir\vario.exe" version --short
+          if ($got -ne $env:TAG) { throw "installed vario reports '$got', want $env:TAG" }
+          & "$dir\vario.exe" version
+
+      - name: Install with install.ps1 (PowerShell 7, irm | iex)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSVersionTable.PSVersion.ToString()
+          $dir = Join-Path $env:RUNNER_TEMP 'vario-ps7'
+          $env:VARIO_VERSION = $env:TAG
+          $env:VARIO_INSTALL_DIR = $dir
+          $env:VARIO_NO_MODIFY_PATH = '1'
+          irm "$env:ASSETS/install.ps1" | iex
+          $got = & "$dir\vario.exe" version --short
+          if ($got -ne $env:TAG) { throw "installed vario reports '$got', want $env:TAG" }
+          if (Test-Path (Join-Path $env:USERPROFILE '.vario')) { throw "the installer created .vario" }

@@ -1,0 +1,30 @@
+---
+import Install from "./Install.astro";
+---
+
+<section
+  aria-labelledby="hero-title"
+  class="shell pt-[clamp(4.5rem,13vh,9.5rem)] pb-[clamp(6rem,16vh,11rem)]"
+>
+  <h1
+    id="hero-title"
+    class="rise -ml-[0.035em] text-[clamp(3.25rem,12.4vw,9.5rem)] leading-[0.9] font-medium tracking-[-0.052em] text-balance text-ink"
+  >
+    Observe
+    <br />
+    everything AI.
+  </h1>
+
+  <p
+    class="rise mt-[clamp(1.75rem,4vw,2.75rem)] max-w-[34rem] text-[clamp(1.125rem,1.6vw,1.3125rem)] leading-[1.5] text-pretty text-muted"
+    style="--i: 1"
+  >
+    Vario is an open-source command-line tool that collects your AI
+    conversations, token usage and execution telemetry into a ClickHouse
+    database you control.
+  </p>
+
+  <div class="rise mt-[clamp(2.75rem,6vw,4.5rem)] max-w-[61rem]" style="--i: 2">
+    <Install />
+  </div>
+</section>
