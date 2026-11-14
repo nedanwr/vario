@@ -1,0 +1,41 @@
+---
+import { DOCS_URL } from "../config/distribution";
+
+const steps = [
+  { command: "vario init", comment: "connect ClickHouse, choose sources" },
+  { command: "vario run", comment: "start collecting" },
+];
+---
+
+<section
+  aria-labelledby="start-title"
+  class="shell grid grid-cols-1 gap-x-10 gap-y-10 py-[clamp(6rem,14vw,10rem)] md:grid-cols-12 md:items-baseline"
+>
+  <div class="md:col-span-5">
+    <h2
+      id="start-title"
+      class="text-[clamp(2.25rem,5.2vw,4rem)] leading-none font-medium tracking-[-0.045em] text-ink"
+    >
+      Get started
+    </h2>
+  </div>
+
+  <div class="max-w-[34rem] md:col-span-7">
+    <pre class="overflow-x-auto text-[0.9375rem] leading-[2] sm:text-base">{
+        steps.map((step) => (
+          <code class="block whitespace-pre"><span class="text-accent select-none" aria-hidden="true">$ </span><span class="text-ink">{step.command.padEnd(12)}</span><span class="hidden text-faint select-none sm:inline"># {step.comment}</span></code>
+        ))
+      }</pre>
+
+    <p class="mt-8 leading-relaxed text-pretty text-muted">
+      <code class="code">init</code> walks you through the setup: connecting to
+      ClickHouse, creating the database, choosing what to collect and selecting
+      your sources. <code class="code">run</code> then collects continuously.
+      Background services, migrations and queries are covered in the{" "}
+      <a class="link" href={DOCS_URL}>
+        documentation
+      </a>
+      .
+    </p>
+  </div>
+</section>

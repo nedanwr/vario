@@ -1,0 +1,27 @@
+---
+import { DOCS_URL, REPO_URL } from "../config/distribution";
+---
+
+<header class="shell flex h-18 items-center justify-between sm:h-22">
+  <a
+    href="/"
+    class="-mx-1 px-1 text-[1.3125rem] leading-none font-semibold tracking-[-0.04em] text-ink"
+    aria-label="Vario, home"
+  >
+    vario
+  </a>
+  <nav aria-label="Primary">
+    <ul class="flex items-center gap-6 text-[0.9375rem] sm:gap-8">
+      <li>
+        <a class="nav-link" href={DOCS_URL}>
+          Documentation
+        </a>
+      </li>
+      <li>
+        <a class="nav-link" href={REPO_URL}>
+          GitHub
+        </a>
+      </li>
+    </ul>
+  </nav>
+</header>

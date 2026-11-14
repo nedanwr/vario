@@ -1,0 +1,105 @@
+---
+import "../styles/global.css";
+import sansUrl from "@fontsource-variable/instrument-sans/files/instrument-sans-latin-wght-normal.woff2?url";
+import monoUrl from "@fontsource/fragment-mono/files/fragment-mono-latin-400-normal.woff2?url";
+import { SITE } from "../config/site";
+import { REPO_URL } from "../config/distribution";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const { title = SITE.title, description = SITE.description } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+
+// Self-hosted, Latin subset only; both files are preloaded.
+const fontFaces = `
+@font-face {
+  font-family: "Instrument Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 700;
+  src: url(${sansUrl}) format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Fragment Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url(${monoUrl}) format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}`;
+
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: SITE.name,
+  description,
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "macOS, Linux, Windows",
+  license: "https://www.apache.org/licenses/LICENSE-2.0",
+  url: canonical,
+  codeRepository: REPO_URL,
+  offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+};
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <meta name="theme-color" content="#000000" />
+    <meta name="color-scheme" content="dark" />
+
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="sitemap" href="/sitemap.xml" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={SITE.name} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+
+    <link
+      rel="preload"
+      href={sansUrl}
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href={monoUrl}
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <style is:inline set:html={fontFaces} />
+
+    <script
+      is:inline
+      type="application/ld+json"
+      set:html={JSON.stringify(jsonLd)}
+    />
+  </head>
+  <body class="min-h-dvh">
+    <a
+      href="#main"
+      class="sr-only rounded-md bg-ink px-3 py-2 text-sm text-black focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50"
+    >
+      Skip to content
+    </a>
+    <slot />
+  </body>
+</html>
