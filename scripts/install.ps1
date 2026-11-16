@@ -227,14 +227,41 @@ function Get-Asset([string]$Src, [string]$Tag, [string]$File, [string]$OutFile) 
     Get-Download (Get-AssetUrl $Src $Tag $File) $OutFile -FollowRedirects:($Src -ceq 'github')
 }
 
+# Runs `vario version --short` and returns its first line, or '' if the binary
+# does not start, fails or hangs. Uses System.Diagnostics.Process rather than
+# `& $Exe ... | Select-Object -First 1`: stopping a native pipeline early leaves
+# $LASTEXITCODE unset or non-zero on PowerShell 7 (and unset is an error under
+# StrictMode), and 2> with $ErrorActionPreference = 'Stop' throws on Windows
+# PowerShell 5.1 whenever the program writes to stderr.
 function Get-ReportedVersion([string]$Exe) {
     # Only reachable when the installer is tested with pwsh on Linux or macOS,
     # where Expand-Archive and Copy-Item drop the executable bit.
     if ([Environment]::OSVersion.Platform -eq 'Unix') { chmod 0755 $Exe 2>$null }
+    $p = $null
     try {
-        $out = & $Exe version --short 2>$null | Select-Object -First 1
-        if ($LASTEXITCODE -eq 0 -and $out) { return ([string]$out).Trim() }
-    } catch { }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.Arguments = 'version --short'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        # Read both streams asynchronously so neither can fill up and block.
+        $stdout = $p.StandardOutput.ReadToEndAsync()
+        $null = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit(30000)) {
+            try { $p.Kill() } catch { }
+            return ''
+        }
+        $p.WaitForExit() # flushes the redirected streams
+        if ($p.ExitCode -ne 0) { return '' }
+        $line = @($stdout.Result -split '\r?\n' | Where-Object { $_.Trim() }) | Select-Object -First 1
+        if ($line) { return ([string]$line).Trim() }
+    } catch {
+    } finally {
+        if ($p) { $p.Dispose() }
+    }
     return ''
 }
 
