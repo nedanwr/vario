@@ -42,7 +42,7 @@ To read the installer before running it: `curl -fsSLO https://raw.githubusercont
 
 - **The raw installer URL is stable.** It serves `scripts/install.sh` from `master`, which only changes through a release merge. GitHub caches it for about five minutes. After the move to a custom domain it keeps working, because the installer on `master` will then download from the new domain.
 - **Do not link `releases/latest/download/...`.** GitHub's "latest" release skips prereleases, and every beta is a prerelease, so it returns 404 until the first stable release.
-- **The website** uses the two install commands above and links to `https://github.com/nedanwr/vario/releases` for manual downloads, until the custom domain exists. Avoid building archive URLs on the website. If it must, follow the pattern above with an explicit tag.
+- **The website** shows the two install commands above and the archive URLs of the newest published beta-channel release, built from the pattern above. It never hard-codes a version: every build looks the release up through the GitHub API (`website/src/config/release.ts`, same rules as the installers), and the release workflow redeploys the site once a release is verified. `VARIO_RELEASE_TAG` overrides the lookup; `GITHUB_TOKEN` authenticates it. A failed lookup fails the build, so the deployed site keeps its previous version.
 
 ## Channels
 
@@ -121,6 +121,7 @@ The default is the `DEFAULT_SOURCE` constant (`$DefaultSource` in PowerShell), c
 | `publish` | after `build` (and `r2`, if it ran)      | `contents: write`            | Creates a **draft** GitHub Release with the archives, `checksums.txt`, `install.sh` and `install.ps1`. It checks the asset list, downloads every asset back and compares its SHA-256 with the build, then publishes. Prerelease tags become GitHub prereleases. |
 | `promote` | mirror only                              | none (environment `release`) | Moves the mirror's channel files. Skipped while the installers use `github`.                                                                               |
 | `verify`  | after `publish`                          | none                         | Installs the published release with its own attached installers on `ubuntu-24.04`, `macos-15` and `windows-2025`, the last with both Windows PowerShell 5.1 (`-File`) and PowerShell 7 (`irm \| iex`). It checks that `vario version --short` reports the tag and that `.vario` was not created. On Linux it also resolves the beta channel; that step is non-blocking because of API rate limits. |
+| `website` | after every `verify` job passed          | `contents: read` (environment `release`) | Builds the website, which looks up the newest published release, checks that it links this tag (beta-channel tags only), and deploys it to Cloudflare with `wrangler deploy`. A failed release never reaches the site. |
 
 - **One build.** `publish` attaches exactly the files that `build` produced and tested. The installers attached to a release are the scripts at the tagged commit.
 - **The installers decide the source.** `build` reads `DEFAULT_SOURCE` from `install.sh` and `$DefaultSource` from `install.ps1`.
@@ -130,7 +131,7 @@ The default is the `DEFAULT_SOURCE` constant (`$DefaultSource` in PowerShell), c
   - Any other value stops the release.
 - **Channels move when the release is published.** Until `publish` succeeds there is no new published release, so `curl … | sh` keeps installing the previous one. A failure while uploading leaves a draft, which anonymous users cannot see.
 - **No silent overwrite.** An existing draft stops the run. An existing published release is accepted on a re-run only if its assets are identical, by name and SHA-256, to the new build; otherwise the run stops without changing it.
-- **`verify` runs after publication.** If it fails, the release is already public. Fix the problem in a new version, and delete or edit the broken release by hand if needed.
+- **`verify` runs after publication.** If it fails, the release is already public. Fix the problem in a new version, and delete or edit the broken release by hand if needed. The website is not redeployed, so it keeps showing the previous release until a newer one is verified (or the site is deployed again from `master`, which also looks the release up).
 
 ### Re-runs
 
@@ -140,13 +141,22 @@ The default is the `DEFAULT_SOURCE` constant (`$DefaultSource` in PowerShell), c
 | `publish` failed after creating a draft                | Delete the draft release, then **Re-run failed jobs**.                                                                        |
 | `publish` failed after publishing (e.g. at the last step) | **Re-run failed jobs**. The published release is accepted if its assets are identical.                                     |
 | `verify` failed                                        | Read the log. If the cause is GitHub flakiness, **Re-run failed jobs**; otherwise fix it in a new version.                     |
+| `website` failed                                       | The release is fine. Check the Cloudflare credentials, then **Re-run failed jobs**.                                             |
 | "already published with different assets"              | A rebuild produced different bytes. Published releases are never replaced; investigate, then release a new version.           |
 
 Prefer **Re-run failed jobs** over **Re-run all jobs**: it reuses the original build artifacts. The build is reproducible for the same Go version and runner tools, so a full re-run normally produces identical archives anyway.
 
 ## Repository setup
 
-Nothing is needed beyond the defaults for GitHub distribution: no secrets, variables or environments. Recommended:
+GitHub distribution needs no secrets. The `website` job deploys the site with Cloudflare credentials from the **`release`** environment (Settings → Environments):
+
+- **Deployment branches and tags**: *Selected branches and tags*, with a **tag** rule `v*`.
+- **Secret** `CLOUDFLARE_API_TOKEN`: an API token with *Account → Workers Scripts → Edit* for the account that hosts the `vario` Worker.
+- **Variable** `CLOUDFLARE_ACCOUNT_ID`.
+
+Without them, everything else is published and verified, and only `website` fails. The site is also deployed by Cloudflare's Git integration on every push to `master`; that build looks the release up too, and can be given a `GITHUB_TOKEN` build variable (a fine-grained token with no permissions) to avoid the anonymous API rate limit it shares with other Cloudflare builds.
+
+Recommended:
 
 1. **Workflow permissions** (Settings → Actions → General): *Read repository contents permission*. The workflow requests `contents: write` only for the `publish` job.
 2. **Tag ruleset** (Settings → Rules → Rulesets → New tag ruleset): target `v*`, restrict creation, update and deletion to maintainers. Anyone who can push a `v*` tag on `master` can publish.
@@ -157,7 +167,7 @@ Nothing is needed beyond the defaults for GitHub distribution: no secrets, varia
 Follow [Development → Releases](development.md#releases) for the changelog, checks and the `master` merge. Specific to distribution:
 
 1. Locally, run `scripts/release/test-installers.sh`.
-2. Merge to `master`, then push the tag (`git push origin v0.1.0-beta.1`) and watch the run. All `verify` jobs should pass.
+2. Merge to `master`, then push the tag (`git push origin v0.1.0-beta.1`) and watch the run. All `verify` jobs should pass, and `website` then deploys the site showing the new release. The website needs no edit for a release.
 3. Afterwards, on clean accounts:
 
    ```bash

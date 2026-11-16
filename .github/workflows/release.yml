@@ -5,7 +5,8 @@
 # Users download from GitHub Releases for now: the installers' DEFAULT_SOURCE
 # is "github". When it is changed to DOWNLOAD_BASE_URL (our own domain on
 # Cloudflare R2), the r2 and promote jobs switch on; until then they are
-# skipped and no Cloudflare credentials are needed.
+# skipped and no R2 credentials are needed. The website job needs Cloudflare
+# credentials for the website in the release environment.
 #
 #   build    verify the tag and the installers' download source, run the
 #            checks, build every archive once
@@ -23,6 +24,8 @@
 #            stable tags) forward to this tag and publish the root installers
 #   verify   install the published release with its own installers on Linux,
 #            macOS and Windows (PowerShell 5.1 and 7), straight from GitHub
+#   website  once every install check passed, rebuild the website (which looks
+#            up the newest published release) and deploy it to Cloudflare
 #
 # Every job is safe to re-run. See docs/distribution.md.
 name: Release
@@ -466,3 +469,58 @@ jobs:
           $got = & "$dir\vario.exe" version --short
           if ($got -ne $env:TAG) { throw "installed vario reports '$got', want $env:TAG" }
           if (Test-Path (Join-Path $env:USERPROFILE '.vario')) { throw "the installer created .vario" }
+
+  website:
+    name: Deploy website
+    needs: verify
+    # Only once every install check passed, so a broken release never reaches
+    # the site. The site looks up the newest published release itself
+    # (website/src/config/release.ts); this job only rebuilds and deploys it.
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Holds CLOUDFLARE_API_TOKEN (Workers Scripts: Edit) and the
+    # CLOUDFLARE_ACCOUNT_ID variable.
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Set up pnpm
+        # Uses the version pinned by packageManager in package.json.
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm build
+
+      - name: Check the site shows this release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Releases outside the beta channel (e.g. alpha) are not shown.
+          case $TAG in *-*) case ${TAG#*-} in beta*|rc*) ;; *) exit 0 ;; esac ;; esac
+          grep -q "releases/download/$TAG/" dist/index.html ||
+            { echo "::error::The built site does not link $TAG."; exit 1; }
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec wrangler deploy

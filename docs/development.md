@@ -48,7 +48,7 @@ The workflow has read-only repository access and uses no secrets. The ClickHouse
 
 The build for macOS and Windows is **cross-compiled** on Linux (Vario is pure Go with `CGO_ENABLED=0`, including its SQLite driver). This proves the code compiles and links for each platform, but the tests run only on Linux, and the macOS and Windows binaries are not executed in CI.
 
-The **Build website** workflow (`.github/workflows/build-website.yml`) runs on the same pull requests, but only when `website/` (or the workflow itself) changes. It installs the site's dependencies with pnpm (`--frozen-lockfile`) and checks that the Astro site builds (`pnpm build`).
+The **Build website** workflow (`.github/workflows/build-website.yml`) runs on the same pull requests, but only when `website/` (or the workflow itself) changes. It installs the site's dependencies with pnpm (`--frozen-lockfile`) and checks that the Astro site builds (`pnpm build`). The build looks up the newest published release through the GitHub API, so it needs network access; set `VARIO_RELEASE_TAG` (e.g. `VARIO_RELEASE_TAG=v0.1.0-beta.1 pnpm build`) to build offline. After each release, the Release workflow redeploys the site (see [Distribution](distribution.md#release-workflow)).
 
 ## Releases
 
