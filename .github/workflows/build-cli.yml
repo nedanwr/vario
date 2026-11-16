@@ -1,23 +1,24 @@
-# Verifies pull requests into master and every push to master (including merges).
+# Verifies pull requests into develop and master. Every change reaches master
+# through a pull request from develop, so merges are not built again.
 # Runs tests and vet, then cross-compiles and packages every release target.
 # Cross-compilation proves the code builds for each platform; it does not run
-# the binaries there.
-name: Build
+# the binaries there. Changes only to website/ are checked by build-website.yml
+# instead.
+name: Build CLI
 
 on:
   pull_request:
-    branches: [master]
+    branches: [develop, master]
     types: [opened, synchronize, reopened]
-  push:
-    branches: [master]
+    paths-ignore: ["website/**"]
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.event.pull_request.number || github.ref }}
-  # Cancel superseded PR runs; let every push to master finish.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: build-cli-${{ github.event.pull_request.number }}
+  # A new push to the pull request supersedes the run in progress.
+  cancel-in-progress: true
 
 jobs:
   build:

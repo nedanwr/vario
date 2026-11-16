@@ -2,6 +2,14 @@
 
 Notable changes to Vario are listed here. Versions follow [Semantic Versioning](https://semver.org); before 1.0, and especially between beta releases, minor versions and prereleases may contain incompatible changes, which are always called out in this file.
 
+## [0.1.0-beta.2]
+
+Fixes the Windows installer on PowerShell 7. Vario itself is unchanged from 0.1.0-beta.1; no migration or configuration change is needed.
+
+### Fixed
+
+- `install.ps1` failed on PowerShell 7 with "the downloaded binary does not run on this system or reports ''". Windows PowerShell 5.1 was not affected. The `install.ps1` attached to the 0.1.0-beta.1 release still has the bug; use the installer from `master` or this release.
+
 ## [0.1.0-beta.1]
 
 First public beta. Vario is usable for day-to-day collection, but it has not yet been run widely outside its development environment. Expect rough edges and report problems at <https://github.com/nedanwr/vario/issues>.
@@ -51,4 +59,5 @@ First public beta. Vario is usable for day-to-day collection, but it has not yet
 
 The full list is in [docs/operations.md](https://github.com/nedanwr/vario/blob/master/docs/operations.md#current-limitations).
 
+[0.1.0-beta.2]: https://github.com/nedanwr/vario/releases/tag/v0.1.0-beta.2
 [0.1.0-beta.1]: https://github.com/nedanwr/vario/releases/tag/v0.1.0-beta.1

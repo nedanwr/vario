@@ -37,7 +37,7 @@ The module path is `github.com/nedanwr/vario`, derived from the `origin` remote.
 
 ## Continuous integration
 
-The **Build** workflow (`.github/workflows/build.yml`) runs on pull requests targeting `master` (when opened, updated with new commits, or reopened) and on every push to `master`, including merges. It does not run for pushes to other branches. On one Ubuntu runner, it:
+The **Build CLI** workflow (`.github/workflows/build-cli.yml`) runs on pull requests targeting `develop` or `master` (when opened, updated with new commits, or reopened), unless the change touches only `website/`. Every change reaches `master` through a pull request from `develop`, so pushes and merges are not built again. On one Ubuntu runner, it:
 
 1. verifies module checksums (`go mod verify`) and `gofmt` formatting,
 2. runs `go vet ./...` for Linux, macOS and Windows,
@@ -47,6 +47,8 @@ The **Build** workflow (`.github/workflows/build.yml`) runs on pull requests tar
 The workflow has read-only repository access and uses no secrets. The ClickHouse integration tests are not part of it; run them locally with `make integration`.
 
 The build for macOS and Windows is **cross-compiled** on Linux (Vario is pure Go with `CGO_ENABLED=0`, including its SQLite driver). This proves the code compiles and links for each platform, but the tests run only on Linux, and the macOS and Windows binaries are not executed in CI.
+
+The **Build website** workflow (`.github/workflows/build-website.yml`) runs on the same pull requests, but only when `website/` (or the workflow itself) changes. It installs the site's dependencies with pnpm (`--frozen-lockfile`) and checks that the Astro site builds (`pnpm build`). The build looks up the newest published release through the GitHub API, so it needs network access; set `VARIO_RELEASE_TAG` (e.g. `VARIO_RELEASE_TAG=v0.1.0-beta.1 pnpm build`) to build offline. After each release, the Release workflow redeploys the site (see [Distribution](distribution.md#release-workflow)).
 
 ## Releases
 

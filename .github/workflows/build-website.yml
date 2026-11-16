@@ -1,0 +1,49 @@
+# Verifies that the website (website/) builds, for pull requests into develop
+# and master that change it. The Go code is checked by build-cli.yml.
+name: Build website
+
+on:
+  pull_request:
+    branches: [develop, master]
+    types: [opened, synchronize, reopened]
+    paths: ["website/**", ".github/workflows/build-website.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-website-${{ github.event.pull_request.number }}
+  # A new push to the pull request supersedes the run in progress.
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build website
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Set up pnpm
+        # Uses the version pinned by packageManager in package.json.
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        env:
+          # Authenticates the site's release lookup (website/src/config/release.ts).
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm build
