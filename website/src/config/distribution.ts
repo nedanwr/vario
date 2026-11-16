@@ -1,12 +1,7 @@
-/**
- * Every distribution URL the website shows is built here.
- *
- * Mirrors the "Download source" block of scripts/install.sh and
- * scripts/install.ps1 (see docs/distribution.md). When Vario moves to its own
- * download domain (Cloudflare R2), change INSTALLER_BASE_URL and
- * ASSET_BASE_URL below, together with the installers' DEFAULT_SOURCE, and the
- * whole site follows.
- */
+// Keep in sync with the "Download source" block of scripts/install.sh and
+// scripts/install.ps1 when moving to Vario's own download domain.
+
+import { resolveReleaseTag, type Channel } from "./release.ts";
 
 export const GITHUB_REPO = "nedanwr/vario";
 export const REPO_URL = `https://github.com/${GITHUB_REPO}`;
@@ -16,28 +11,14 @@ export const LICENSE_URL = `${REPO_URL}/blob/master/LICENSE`;
 export const LICENSE_NAME = "Apache-2.0";
 export const RELEASES_URL = `${REPO_URL}/releases`;
 
-/**
- * Where the installer scripts are served from. They follow `master`, so the
- * command never changes between releases.
- * Future: e.g. "https://install.<domain>".
- */
 const INSTALLER_BASE_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/master/scripts`;
 
-/**
- * Where a release's files live: `${ASSET_BASE_URL}/<tag>/<file>`.
- * Future (R2 mirror layout): "https://<download-domain>/releases".
- */
 const ASSET_BASE_URL = `${REPO_URL}/releases/download`;
 
-/**
- * The current release. Set `published` to true only once the GitHub Release
- * for `tag` is live with all its assets; until then the site links no
- * archives and offers only the installers.
- */
+const RELEASE_CHANNEL: Channel = "beta";
 export const RELEASE = {
-  tag: "v0.1.0-beta.1",
-  channel: "beta",
-  published: false,
+  tag: await resolveReleaseTag(GITHUB_REPO, RELEASE_CHANNEL),
+  channel: RELEASE_CHANNEL,
 } as const;
 
 export type PlatformId = "unix" | "windows";
@@ -102,9 +83,7 @@ function assetUrl(file: string): string {
   return `${ASSET_BASE_URL}/${RELEASE.tag}/${file}`;
 }
 
-/** Release archives for a platform, or none while the release is unpublished. */
 export function archivesFor(platform: PlatformId): Archive[] {
-  if (!RELEASE.published) return [];
   const version = RELEASE.tag.replace(/^v/, "");
   return ARCHIVE_TARGETS[platform].map(({ os, arch, label }) => {
     const ext = os === "windows" ? "zip" : "tar.gz";

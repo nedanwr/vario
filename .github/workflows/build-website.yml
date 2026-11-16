@@ -43,4 +43,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        env:
+          # Authenticates the site's release lookup (website/src/config/release.ts).
+          GITHUB_TOKEN: ${{ github.token }}
         run: pnpm build
