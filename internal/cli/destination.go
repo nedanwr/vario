@@ -395,7 +395,7 @@ func (a *app) destinationSwitch(ctx context.Context, action pendingAction, yes b
 	}
 	fmt.Fprintf(w, "✓ active destination: %s\n", target)
 	if target.Cursors == 0 {
-		fmt.Fprintln(w, "  It has no synchronization state yet: the next `vario run` (or `vario backfill --source t3code`) reads every source in full for it.")
+		fmt.Fprintln(w, "  It has no synchronization state yet: the next `vario run` (or `vario backfill --source <kind>`) reads every source in full for it.")
 	}
 	a.serviceNotice(cfg.Path(), true)
 	return nil
@@ -445,7 +445,7 @@ func acceptRollback(ctx context.Context, w io.Writer, cfg *config.Config, store 
 	}
 	_ = store.SetKV(ctx, "delivery.last_error", "") // the suspension it reported is over
 	fmt.Fprintln(w, "✓ accepted the restored database: its cursors and fingerprints were reset")
-	fmt.Fprintln(w, "  The next `vario run` (or `vario backfill --source t3code`) reads every source again in full and delivers the complete history.")
+	fmt.Fprintln(w, "  The next `vario run` (or `vario backfill --source <kind>`) reads every source again in full and delivers the complete history.")
 	fmt.Fprintln(w, "  Rows the database still has are sent again with the same keys and versions, so the *_latest and usage views count each record once.")
 	if target.Pending > 0 {
 		fmt.Fprintf(w, "  %d queued rows are kept and delivered to it as well.\n", target.Pending)

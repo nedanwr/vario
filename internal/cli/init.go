@@ -12,7 +12,6 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/nedanwr/vario/internal/config"
-	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
 
@@ -29,6 +28,8 @@ type initOptions struct {
 	allowSensitive bool
 	t3Path         string
 	noT3           bool
+	claudePath     string
+	noClaude       bool
 	skipCheck      bool
 	dataDir        string
 
@@ -96,6 +97,8 @@ with 'vario migrate'.`,
 	f.BoolVar(&o.allowSensitive, "allow-sensitive-content", false, "confirm collecting conversation content (required for messages/full)")
 	f.StringVar(&o.t3Path, "t3code-path", "", "path to T3 Code's statev2.sqlite")
 	f.BoolVar(&o.noT3, "no-t3code", false, "do not enable the T3 Code source")
+	f.StringVar(&o.claudePath, "claudecode-path", "", "Claude Code's configuration directory (~/.claude) or its projects directory")
+	f.BoolVar(&o.noClaude, "no-claudecode", false, "do not enable the Claude Code source")
 	f.BoolVar(&o.skipCheck, "skip-connection-check", false, "do not verify the operational ClickHouse login")
 	f.StringVar(&o.dataDir, "data-dir", "", "directory for the spool and state (default ~/.vario/data)")
 	return cmd
@@ -286,8 +289,9 @@ func (w *wizard) unsavedUsers() []string {
 func (w *wizard) welcome() {
 	w.printf(`Welcome to Vario — observe everything AI.
 
-Vario reads AI activity recorded by applications on this computer (currently
-T3 Code): token usage and, if you choose, conversations and tool executions.
+Vario reads AI activity recorded by applications on this computer (T3 Code
+and Claude Code): token usage and, if you choose, conversations and tool
+executions.
 It stores that data in a ClickHouse database you choose, and nowhere else.
 Vario sends no telemetry to its developers. You decide what is collected and
 where it goes, and can change both later with `+"`vario config`"+`.
@@ -489,10 +493,28 @@ accordingly.
 
 func (w *wizard) stepSources() error {
 	w.printf("Data sources\n\n")
-	sc, configured := w.cfg.Source(config.SourceT3Code)
-	candidates := t3code.DefaultPaths()
-	if w.o.t3Path != "" {
-		p, err := config.ExpandPath(w.o.t3Path)
+	if err := w.stepSource(lookupKindMust(config.SourceT3Code), w.o.t3Path, true); err != nil {
+		return err
+	}
+	// Claude Code is only offered when it is installed, configured or named.
+	return w.stepSource(lookupKindMust(config.SourceClaudeCode), w.o.claudePath, false)
+}
+
+func lookupKindMust(kind string) sourceKind {
+	k, ok := lookupKind(kind)
+	if !ok {
+		panic("unknown source kind " + kind)
+	}
+	return k
+}
+
+// stepSource offers to enable one source. With always unset, a source that
+// is neither detected nor configured is only listed.
+func (w *wizard) stepSource(k sourceKind, flagPath string, always bool) error {
+	sc, configured := w.cfg.Source(k.kind)
+	candidates := k.defaults()
+	if flagPath != "" {
+		p, err := config.ExpandPath(flagPath)
 		if err != nil {
 			return withCode(ExitUsage, err)
 		}
@@ -501,24 +523,27 @@ func (w *wizard) stepSources() error {
 		candidates = append([]string{sc.Path}, candidates...)
 	}
 	found := ""
-	for _, d := range t3code.Detect(w.ctx, candidates) {
+	for _, d := range k.detect(w.ctx, candidates) {
 		if d.Compatible {
 			found = d.Path
 			break
 		}
 	}
 	if found != "" {
-		w.printf("  [x] T3 Code — detected at %s\n\n", config.DisplayPath(found))
+		w.printf("  [x] %s — detected at %s\n\n", k.name, config.DisplayPath(found))
 	} else {
-		w.printf("  [ ] T3 Code — not detected in the default location\n\n")
+		w.printf("  [ ] %s — not detected in the default location\n\n", k.name)
+		if !always && !configured && flagPath == "" {
+			return nil
+		}
 	}
 	enableDef := found != ""
 	if configured {
 		enableDef = sc.Enabled
 	}
-	label := "Enable T3 Code?"
+	label := "Enable " + k.name + "?"
 	if found == "" {
-		label = "Enable T3 Code anyway (for example at a custom path)?"
+		label = "Enable " + k.name + " anyway (for example at a custom path)?"
 	}
 	enable, err := w.p.confirm(label, enableDef)
 	if err != nil {
@@ -529,7 +554,7 @@ func (w *wizard) stepSources() error {
 			sc.Enabled = false
 			w.cfg.UpsertSource(sc)
 		}
-		w.printf("\nNo source enabled. Add one later with `vario sources add t3code --path <statev2.sqlite>`.\n\n")
+		w.printf("\n%s not enabled. Add it later with `vario sources add %s --path <path>`.\n\n", k.name, k.kind)
 		return nil
 	}
 	def := found
@@ -539,8 +564,12 @@ func (w *wizard) stepSources() error {
 	if configured && sc.Path != "" && (found == "" || found == sc.Path) {
 		def = sc.Path
 	}
+	label = k.name + " database path"
+	if k.kind == config.SourceClaudeCode {
+		label = k.name + " data directory"
+	}
 	for {
-		p, err := w.p.ask("T3 Code database path", config.DisplayPath(def))
+		p, err := w.p.ask(label, config.DisplayPath(def))
 		if err != nil {
 			return err
 		}
@@ -548,7 +577,7 @@ func (w *wizard) stepSources() error {
 			w.printf("  %v\n", err)
 			continue
 		}
-		d := t3code.Detect(w.ctx, []string{p})[0]
+		d := k.detect(w.ctx, []string{p})[0]
 		if !d.Compatible {
 			w.printf("  %s: %s\n", config.DisplayPath(p), d.Detail)
 			keep, err := w.p.confirm("  Use this path anyway? Vario will read it once it exists", false)
@@ -559,8 +588,10 @@ func (w *wizard) stepSources() error {
 				def = p
 				continue
 			}
+		} else {
+			p = d.Path
 		}
-		w.cfg.UpsertSource(config.SourceConfig{Kind: config.SourceT3Code, Enabled: true, Path: p})
+		w.cfg.UpsertSource(config.SourceConfig{Kind: k.kind, Enabled: true, Path: p})
 		w.printf("\n")
 		return nil
 	}
@@ -651,26 +682,36 @@ func (w *wizard) runNonInteractive() error {
 
 func (w *wizard) nonInteractiveSources(fresh bool) error {
 	o := w.o
-	switch {
-	case o.noT3:
-		if sc, ok := w.cfg.Source(config.SourceT3Code); ok {
-			sc.Enabled = false
-			w.cfg.UpsertSource(sc)
-		}
-	case o.t3Path != "":
-		p, err := config.ExpandPath(o.t3Path)
-		if err != nil {
-			return withCode(ExitUsage, err)
-		}
-		d := t3code.Detect(w.ctx, []string{p})[0]
-		printDetection(w.out, d)
-		w.cfg.UpsertSource(config.SourceConfig{Kind: config.SourceT3Code, Enabled: true, Path: p})
-	case fresh:
-		for _, d := range t3code.Detect(w.ctx, t3code.DefaultPaths()) {
+	for _, x := range []struct {
+		kind string
+		path string
+		off  bool
+	}{{config.SourceT3Code, o.t3Path, o.noT3}, {config.SourceClaudeCode, o.claudePath, o.noClaude}} {
+		k := lookupKindMust(x.kind)
+		switch {
+		case x.off:
+			if sc, ok := w.cfg.Source(k.kind); ok {
+				sc.Enabled = false
+				w.cfg.UpsertSource(sc)
+			}
+		case x.path != "":
+			p, err := config.ExpandPath(x.path)
+			if err != nil {
+				return withCode(ExitUsage, err)
+			}
+			d := k.detect(w.ctx, []string{p})[0]
 			printDetection(w.out, d)
 			if d.Compatible {
-				w.cfg.UpsertSource(config.SourceConfig{Kind: config.SourceT3Code, Enabled: true, Path: d.Path})
-				break
+				p = d.Path
+			}
+			w.cfg.UpsertSource(config.SourceConfig{Kind: k.kind, Enabled: true, Path: p})
+		case fresh:
+			for _, d := range visibleDetections(k.detect(w.ctx, k.defaults())) {
+				printDetection(w.out, d)
+				if d.Compatible {
+					w.cfg.UpsertSource(config.SourceConfig{Kind: k.kind, Enabled: true, Path: d.Path})
+					break
+				}
 			}
 		}
 	}

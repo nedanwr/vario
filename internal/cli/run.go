@@ -58,7 +58,7 @@ collected for (see 'vario destination').`,
 			}
 			srcs, _ := buildSources(cfg, policy, "")
 			if len(srcs) == 0 {
-				return withCode(ExitUsage, errors.New("no enabled sources; run `vario sources add t3code`"))
+				return withCode(ExitUsage, errors.New("no enabled sources; run `vario sources` to discover them and `vario sources add <kind>` to enable one"))
 			}
 			defer func() {
 				for _, s := range srcs {

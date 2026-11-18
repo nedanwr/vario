@@ -1143,9 +1143,14 @@ func (w *wizard) saveAndFinish() error {
 		w.printf("  vario migrate                    # create or update Vario's schema (administrative credentials)\n")
 	}
 	w.printf("  vario doctor\n")
-	if _, ok := w.cfg.Source(config.SourceT3Code); ok {
-		w.printf("  vario backfill --source t3code\n")
-	} else {
+	backfills := 0
+	for _, sc := range w.cfg.Sources {
+		if sc.Enabled {
+			w.printf("  vario backfill --source %s\n", sc.Kind)
+			backfills++
+		}
+	}
+	if backfills == 0 {
 		w.printf("  vario sources detect\n")
 	}
 	w.printf("  vario run\n")
