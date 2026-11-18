@@ -177,7 +177,12 @@ func TestUpgradeFromVersion1MarksQueuedEntriesSent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	// Closes the store reopened below, too.
+	defer func() {
+		if s != nil {
+			s.Close()
+		}
+	}()
 	var version int
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
 		t.Fatalf("version %d %v", version, err)

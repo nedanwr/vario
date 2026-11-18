@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -60,7 +61,7 @@ func TestServiceAndCLIShareStateDirectory(t *testing.T) {
 		if r := init(); r.code != 0 {
 			t.Fatalf("%s init: %+v", name, r)
 		}
-		if !strings.Contains(readFile(t, cfgPath), `data_dir = "`+want+`"`) {
+		if !strings.Contains(readFile(t, cfgPath), "data_dir = "+tomlQuoted(want)) {
 			t.Fatalf("%s init must write the data directory explicitly:\n%s", name, readFile(t, cfgPath))
 		}
 		if r := runAsService(t, cfgPath, "config", "get", "collector.data_dir"); strings.TrimSpace(r.stdout) != want {
@@ -129,3 +130,7 @@ func TestServiceInstallRefusesAmbiguousStateDirectory(t *testing.T) {
 		t.Fatalf("doctor: %s", r.stdout)
 	}
 }
+
+// tomlQuoted is how the configuration file spells a path (backslashes are
+// escaped, so Windows paths do not appear verbatim).
+func tomlQuoted(s string) string { return strconv.Quote(s) }

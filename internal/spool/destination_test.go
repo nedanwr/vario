@@ -74,7 +74,12 @@ func TestLegacySpoolIsUpgradedWithoutLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	// Closes the store reopened below, too.
+	defer func() {
+		if s != nil {
+			s.Close()
+		}
+	}()
 	ds, err := s.Destinations(ctx)
 	if err != nil || len(ds) != 1 || !ds[0].Legacy() || ds[0].Pending != 3 || ds[0].Cursors != 1 {
 		t.Fatalf("legacy state must be kept in a legacy destination: %+v %v", ds, err)

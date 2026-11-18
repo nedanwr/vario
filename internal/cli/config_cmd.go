@@ -164,6 +164,7 @@ file's comments. Examples:
   vario config set clickhouse.username vario
   vario config set clickhouse.database vario
   vario config set sources.t3code.path ~/.t3/userdata/statev2.sqlite
+  vario config set sources.claudecode.enabled true
 
 The password cannot be set here (shell arguments end up in history and
 process lists); use 'vario config set-password'.
@@ -404,8 +405,11 @@ func editorCommand() ([]string, error) {
 }
 
 // splitWords splits s like a POSIX shell would split words, supporting single
-// and double quotes and backslash escapes, without any expansion.
-func splitWords(s string) ([]string, error) {
+// and double quotes and backslash escapes, without any expansion. On Windows
+// a backslash is a path separator, never an escape.
+func splitWords(s string) ([]string, error) { return splitWordsFor(s, runtime.GOOS == "windows") }
+
+func splitWordsFor(s string, windows bool) ([]string, error) {
 	var words []string
 	var cur strings.Builder
 	inWord := false
@@ -427,11 +431,15 @@ func splitWords(s string) ([]string, error) {
 			case '"':
 				quote = 0
 			case '\\':
-				escaped = true
+				if windows {
+					cur.WriteRune(r)
+				} else {
+					escaped = true
+				}
 			default:
 				cur.WriteRune(r)
 			}
-		case r == '\\' && runtime.GOOS != "windows":
+		case r == '\\' && !windows:
 			escaped, inWord = true, true
 		case r == '\'' || r == '"':
 			quote, inWord = r, true
