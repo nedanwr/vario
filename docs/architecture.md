@@ -43,6 +43,12 @@ ClickHouse   (schema, users and grants: `vario init` / `vario migrate`, admin)
 - Partition keys use only immutable values. Conversation-scoped tables are partitioned by `toYYYYMM(conversation_created_at)` so all versions of a row share a partition and replace each other. Rows whose conversation is missing from the source fall back to 1970-01.
 - `raw_events` is keyed by `(source_id, sequence, event_id)`. Events are re-sent with a newer version when a snapshot is repeated; `raw_events_latest` collapses them.
 
+## Claude Code: incremental transcript reading
+
+- Transcripts are append-only JSONL. The cursor keeps, per file, the consumed byte offset (at a line boundary), hashes of the first line and of the bytes before the offset (replacement/truncation detection), and the parse state needed to continue mid-file. Idle files keep only offset and hashes; a resumed one is re-read silently to rebuild state.
+- Record versions are a monotonic millisecond clock stored in the cursor; every batch of one read gets a higher version, so later revisions of a tool call or response always win.
+- Details and token mapping: [Claude Code](claude-code.md).
+
 ## Token usage semantics (validated against real T3 Code data)
 
 - `turnTokenUsage` is the provider-reported consumption of a turn. In every observed record `inputTokens >= cachedInputTokens + cacheCreationTokens` and `outputTokens >= reasoningTokens`: cache and reasoning counts are subsets. Vario stores them as reported and never adds them together. It derives `uncached_input_tokens` only when input, cached and cache-creation are all reported and consistent.

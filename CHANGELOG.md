@@ -2,6 +2,14 @@
 
 Notable changes to Vario are listed here. Versions follow [Semantic Versioning](https://semver.org); before 1.0, and especially between beta releases, minor versions and prereleases may contain incompatible changes, which are always called out in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Claude Code source** (`claudecode`): collects Claude Code's local session transcripts (`~/.claude/projects`, or `$CLAUDE_CONFIG_DIR`), including subagent transcripts, into the existing tables: conversations, runs, messages, tool calls, reasoning, API errors, compactions, raw events and token usage per API response (cache reads and writes tracked separately, each response counted once). Enable it with `vario init` (offered when detected) or `vario sources add claudecode`, import history with `vario backfill --source claudecode`. No schema migration is needed. See [docs/claude-code.md](docs/claude-code.md).
+- `vario sources` without a subcommand shows every supported source, whether it is installed and how it is configured. `vario doctor` checks Claude Code transcripts for unreadable files and malformed lines and mentions detected but unconfigured sources.
+- `vario init` flags `--claudecode-path` and `--no-claudecode`.
+
 ## [0.1.0-beta.2]
 
 Fixes the Windows installer on PowerShell 7. Vario itself is unchanged from 0.1.0-beta.1; no migration or configuration change is needed.

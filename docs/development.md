@@ -26,6 +26,7 @@ internal/config/           configuration file, validation, paths, in-place editi
 internal/collector/        sync loop, snapshot/reconcile, delivery
 internal/sources/          source interface
 internal/sources/t3code/   T3 Code adapter (read-only SQLite)
+internal/sources/claudecode/ Claude Code adapter (read-only JSONL transcripts)
 internal/spool/            local durable queue, cursors, fingerprints, destinations, lease
 internal/storage/clickhouse/ HTTP client, schema inspection, migrations, provisioning (admin)
 internal/privacy/          collection modes and redaction

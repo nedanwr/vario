@@ -70,6 +70,7 @@ vario init                      # interactive setup: ClickHouse access, database
 vario migrate                   # create Vario's schema, if init did not (administrative credentials)
 vario doctor                    # check configuration, source access, ClickHouse
 vario backfill --source t3code  # import existing history
+vario backfill --source claudecode  # likewise for Claude Code, if enabled
 vario run                       # collect continuously in the foreground (Ctrl-C to stop)
 vario service install           # or: run in the background at login (macOS)
 vario status                    # cursor, spool, delivery and service state

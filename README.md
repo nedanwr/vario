@@ -4,7 +4,7 @@
 
 Vario is a lightweight, cross-platform command-line tool for AI observability. It reads the local data of AI applications on your machine (read-only), normalizes it, and delivers it to a ClickHouse database you control.
 
-> **Status: public beta (`v0.1.0-beta.2`).** Vario collects from T3 Code into self-hosted ClickHouse. The configuration, command-line interface and ClickHouse schema may still change between betas; schema changes ship as additive migrations (`vario migrate`), and anything that needs manual action is listed in the [changelog](CHANGELOG.md). Downgrades are not supported.
+> **Status: public beta (`v0.1.0-beta.2`).** Vario collects from T3 Code and Claude Code into self-hosted ClickHouse. The configuration, command-line interface and ClickHouse schema may still change between betas; schema changes ship as additive migrations (`vario migrate`), and anything that needs manual action is listed in the [changelog](CHANGELOG.md). Downgrades are not supported.
 
 ## What it collects
 
@@ -19,7 +19,7 @@ Vario runs as a single process, in the foreground or as a per-user background se
 
 |              | Supported in this beta                                                                                                                         |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Source       | **T3 Code** (`~/.t3/userdata/statev2.sqlite`): backfill, continuous sync, token usage. No other source is supported.                            |
+| Sources      | **T3 Code** (`~/.t3/userdata/statev2.sqlite`) and **Claude Code** (`~/.claude/projects` session transcripts, see [Claude Code](docs/claude-code.md)): backfill, continuous sync, token usage. |
 | ClickHouse   | Self-hosted **24.8 LTS** and **25.8 LTS**, over HTTP(S). ClickHouse Cloud, other managed services and clusters are untested.                    |
 | Platforms    | macOS, Linux, Windows (amd64, arm64). The background service (`vario service`) is **macOS only**; elsewhere, run `vario run` under your own supervisor. |
 
@@ -56,7 +56,7 @@ make build                   # writes bin/vario with version information
 vario init                      # guided setup: ClickHouse access, database, user, collection mode, sources
 vario migrate                   # create Vario's schema, if init did not (administrative credentials)
 vario doctor                    # check configuration, source access, ClickHouse
-vario backfill --source t3code  # import existing history
+vario backfill --source t3code  # import existing history (and/or --source claudecode)
 vario run                       # collect continuously in the foreground (Ctrl-C to stop)
 vario service install           # or: run in the background at login (macOS)
 vario status                    # cursor, spool, delivery and service state
@@ -111,6 +111,7 @@ Vario detects when its ClickHouse database is **replaced** (dropped and recreate
 | ------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | [Getting started](docs/getting-started.md)        | Installation, checksums, `vario init`, interrupted setup, first collection                   |
 | [Configuration](docs/configuration.md)            | All commands, exit codes, `~/.vario/` layout, `vario config`, credentials                    |
+| [Claude Code](docs/claude-code.md)                | Claude Code discovery, backfill, token accounting, subagents, limitations                    |
 | [Privacy and security](docs/privacy.md)           | Collection modes, redaction and its limits, local file permissions, purging data             |
 | [ClickHouse](docs/clickhouse.md)                  | Requirements, permissions, access checks, schema, migrations, example queries                |
 | [Operations](docs/operations.md)                  | Sync, destinations, rollback detection, delivery, recovery, upgrades, service, troubleshooting, limitations |

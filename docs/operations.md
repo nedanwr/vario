@@ -171,7 +171,7 @@ Linux (systemd user units) and Windows service installation are **not implemente
 
 ## Current limitations
 
-- T3 Code is the only supported source.
+- T3 Code and Claude Code are the supported sources. Claude Code's limitations are listed in [Claude Code](claude-code.md#known-limitations).
 - Service installation is implemented for macOS only (no systemd unit or Windows service).
 - Release binaries are not signed, and the macOS binaries are not notarized. CI runs the tests on Linux only; the macOS and Windows binaries are cross-compiled.
 - Beta releases may change the configuration, command-line interface and schema; downgrades are not supported (see [Upgrading](#upgrading)).
