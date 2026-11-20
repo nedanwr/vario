@@ -214,12 +214,16 @@ type normalizer struct {
 	// quiet is set while lines that were already collected are read again
 	// only to rebuild the parse state (see fileState.Compact).
 	quiet bool
+	// usageOnly is set while a line of a subagent run by T3 Code is read:
+	// only its usage is collected (see harness.go).
+	usageOnly bool
 }
 
 func (n *normalizer) add(r model.Record) {
-	if !n.quiet {
-		n.b.add(r)
+	if n.quiet || (n.usageOnly && r.Table != model.TableProviderTurns) {
+		return
 	}
+	n.b.add(r)
 }
 
 func newNormalizer(s *Source, t transcript, fst *fileState, b *batcher) *normalizer {
@@ -329,6 +333,19 @@ func (n *normalizer) line(off int64, raw []byte) {
 		}
 	}
 
+	// Lines run by T3 Code are collected from T3 Code; of its subagents'
+	// lines only the usage is collected here (see harness.go).
+	if h.Entrypoint != "" {
+		n.fst.Own = lineOwner(string(h.Entrypoint), n.fst.SDK)
+	}
+	n.usageOnly = false
+	if n.fst.Own == HarnessT3Code {
+		if !sub {
+			return
+		}
+		n.usageOnly = true
+	}
+
 	var msg *message
 	if h.Type == "user" || h.Type == "assistant" {
 		var m message
@@ -405,7 +422,7 @@ func (n *normalizer) line(off int64, raw []byte) {
 		st.Branch = n.policyText(string(h.GitBranch))
 	}
 	n.applyTitles(st, &h)
-	if !n.quiet {
+	if !n.quiet && !n.usageOnly {
 		n.dirty[conv] = true
 	}
 
@@ -788,6 +805,15 @@ func (n *normalizer) providerTurn(conv string, st *convState, r *responseState) 
 	if st.Sub != nil {
 		t.UsageScope = "subagent"
 	}
+	attrs := map[string]any{}
+	if n.usageOnly {
+		// The conversation and run are T3 Code's; only this usage is here.
+		t.RunID = ""
+		attrs["harness"] = HarnessT3Code
+		if st.Agent != "" {
+			attrs["agentId"] = st.Agent
+		}
+	}
 	if r.Model != "" {
 		t.Models = []string{r.Model}
 		t.ModelSource = "usage"
@@ -798,7 +824,6 @@ func (n *normalizer) providerTurn(conv string, st *convState, r *responseState) 
 	default:
 		t.Status, t.UsageStatus = "completed", "complete"
 	}
-	attrs := map[string]any{}
 	if r.Stop != "" {
 		attrs["stopReason"] = r.Stop
 	}

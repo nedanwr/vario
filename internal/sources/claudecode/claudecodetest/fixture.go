@@ -76,6 +76,8 @@ type Session struct {
 	parent  string
 	prompt  string
 	Version string
+	// Entrypoint is recorded on every line with one (default "cli").
+	Entrypoint string
 }
 
 // EncodeProject returns the directory name Claude Code uses for a working directory.
@@ -90,7 +92,7 @@ func (f *Fixture) Session(cwd string) *Session {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	return &Session{f: f, Path: filepath.Join(dir, id+".jsonl"), ID: id, Cwd: cwd, Version: DefaultVersion}
+	return &Session{f: f, Path: filepath.Join(dir, id+".jsonl"), ID: id, Cwd: cwd, Version: DefaultVersion, Entrypoint: "cli"}
 }
 
 // Subagent creates the transcript of a subagent of s spawned by the tool
@@ -101,7 +103,7 @@ func (s *Session) Subagent(agentID, toolUseID string) *Session {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		s.f.t.Fatal(err)
 	}
-	sub := &Session{f: s.f, Path: filepath.Join(dir, "agent-"+agentID+".jsonl"), ID: s.ID, Cwd: s.Cwd, agent: agentID, Version: s.Version}
+	sub := &Session{f: s.f, Path: filepath.Join(dir, "agent-"+agentID+".jsonl"), ID: s.ID, Cwd: s.Cwd, agent: agentID, Version: s.Version, Entrypoint: s.Entrypoint}
 	meta := map[string]any{"agentType": "Explore", "isBuiltIn": true, "description": "Survey " + SubagentMarker,
 		"toolUseId": toolUseID, "spawnDepth": 1, "model": DefaultModel, "effort": "high", "finished": false}
 	b, _ := json.Marshal(meta)
@@ -114,13 +116,13 @@ func (s *Session) Subagent(agentID, toolUseID string) *Session {
 // LegacySidechain returns a writer for subagent lines interleaved in the
 // session's own transcript, as earlier Claude Code versions wrote them.
 func (s *Session) LegacySidechain(agentID string) *Session {
-	return &Session{f: s.f, Path: s.Path, ID: s.ID, Cwd: s.Cwd, agent: agentID, Version: s.Version}
+	return &Session{f: s.f, Path: s.Path, ID: s.ID, Cwd: s.Cwd, agent: agentID, Version: s.Version, Entrypoint: s.Entrypoint}
 }
 
 // LegacyAgentFile returns a writer for a subagent transcript stored next to
 // the session as agent-<id>.jsonl, as earlier Claude Code versions wrote them.
 func (s *Session) LegacyAgentFile(agentID string) *Session {
-	return &Session{f: s.f, Path: filepath.Join(filepath.Dir(s.Path), "agent-"+agentID+".jsonl"), ID: s.ID, Cwd: s.Cwd, agent: agentID, Version: s.Version}
+	return &Session{f: s.f, Path: filepath.Join(filepath.Dir(s.Path), "agent-"+agentID+".jsonl"), ID: s.ID, Cwd: s.Cwd, agent: agentID, Version: s.Version, Entrypoint: s.Entrypoint}
 }
 
 // Line encodes a transcript line.
@@ -158,7 +160,7 @@ func (s *Session) base(typ string) map[string]any {
 	u := s.f.ID()
 	m := map[string]any{
 		"type": typ, "uuid": u, "parentUuid": nilIfEmpty(s.parent), "timestamp": s.f.now(), "sessionId": s.ID,
-		"isSidechain": s.agent != "", "userType": "external", "entrypoint": "cli", "cwd": s.Cwd,
+		"isSidechain": s.agent != "", "userType": "external", "entrypoint": s.Entrypoint, "cwd": s.Cwd,
 		"version": s.Version, "gitBranch": DefaultBranch,
 	}
 	if s.agent != "" {
@@ -315,6 +317,18 @@ func (s *Session) Attachment() string {
 	m["attachment"] = map[string]any{"type": "file", "filename": "/work/" + PathMarker + "/notes.md", "content": PromptMarker}
 	return Line(m)
 }
+
+// DeferredTools returns the attachment listing the tools a session can load
+// on demand, which names the tools of its MCP servers.
+func (s *Session) DeferredTools(names ...string) string {
+	m := s.base("attachment")
+	m["attachment"] = map[string]any{"type": "deferred_tools_delta", "addedNames": names, "addedLines": names,
+		"removedNames": []any{}, "pendingMcpServers": []any{}, "failedMcpServers": []any{}}
+	return Line(m)
+}
+
+// T3CodeTools are tool names of T3 Code's MCP server.
+var T3CodeTools = []string{"WebFetch", "mcp__t3-code__delegate_task", "mcp__t3-code__send_to_user"}
 
 func (s *Session) CustomTitle(t string) string {
 	return Line(map[string]any{"type": "custom-title", "customTitle": t, "sessionId": s.ID})

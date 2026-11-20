@@ -164,6 +164,24 @@ func TestEnableClaudeCodeForExistingT3User(t *testing.T) {
 	if !strings.Contains(r.stdout, "1 line(s) in 1 transcript(s) are not valid JSON") || strings.Contains(r.stdout, cct.PromptMarker) {
 		t.Fatalf("doctor with a malformed line: %+v", r)
 	}
+	// Sessions run by T3 Code are collected from T3 Code; doctor warns
+	// when it is not enabled.
+	t3 := cf.Session(cct.DefaultCwd)
+	t3.Entrypoint = "t3-code"
+	t3.Append(t3.DeferredTools(cct.T3CodeTools...))
+	t3.Conversation("t3")
+	r = vario(t, "", "doctor")
+	if !strings.Contains(r.stdout, "1 session(s) run by T3 Code are collected from T3 Code") {
+		t.Fatalf("doctor with a T3 Code session: %+v", r)
+	}
+	if r := vario(t, "", "config", "set", "sources.t3code.enabled", "false"); r.code != 0 {
+		t.Fatalf("disable t3code: %+v", r)
+	}
+	r = vario(t, "", "doctor")
+	if !strings.Contains(r.stdout, "1 session(s) were run by T3 Code; they are collected from T3 Code, which is not enabled") ||
+		!strings.Contains(r.stdout, "vario sources add t3code") {
+		t.Fatalf("doctor with T3 Code disabled: %+v", r)
+	}
 }
 
 func TestDoctorSuggestsDetectedClaudeCode(t *testing.T) {

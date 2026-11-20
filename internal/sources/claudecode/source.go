@@ -267,7 +267,7 @@ func (s *Source) Snapshot(ctx context.Context, prevCursor string, includeHistory
 			fst.compact(t, time.Now())
 			continue
 		}
-		if err := s.readFile(ctx, t, fst, b, false); err != nil {
+		if err := s.readFile(ctx, t, fst, cur.Files[parentRel(t)], b, false); err != nil {
 			return "", err
 		}
 	}
@@ -324,7 +324,7 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 			break
 		}
 		before := *fst
-		if err := s.readFile(ctx, t, fst, b, true); err != nil {
+		if err := s.readFile(ctx, t, fst, cur.Files[parentRel(t)], b, true); err != nil {
 			return sources.ChangeSet{}, err
 		}
 		if fst.Off != before.Off || fst.Size != before.Size || fst.MTime != before.MTime || fst.Epoch != before.Epoch {
@@ -415,7 +415,7 @@ const (
 // it stops after the line at which the batcher reached its limit (in
 // Changes, whose records are returned as one batch); otherwise it hands on
 // complete batches as it goes.
-func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, b *batcher, bounded bool) error {
+func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, parent *fileState, b *batcher, bounded bool) error {
 	f, err := openShared(t.path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -438,6 +438,15 @@ func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, b *
 			*fst = fileState{Epoch: fst.Epoch + 1}
 		}
 	}
+	if fst.Own == "" {
+		ok, err := attribute(f, t, fst, parent, st.ModTime())
+		if err != nil {
+			return fmt.Errorf("read %s: %w", t.rel, err)
+		}
+		if !ok {
+			return nil // read once the lines that decide it are written
+		}
+	}
 	n := newNormalizer(s, t, fst, b)
 	start := fst.Off
 	// A compacted file is read from the start to rebuild its parse state;
@@ -446,6 +455,9 @@ func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, b *
 	if fst.Compact {
 		replayTo, start, fst.Compact = fst.Off, 0, false
 		n.quiet = true
+		if fst.Own0 != "" {
+			fst.Own = fst.Own0
+		}
 	}
 	if _, err := f.Seek(start, io.SeekStart); err != nil {
 		return fmt.Errorf("seek %s: %w", t.rel, err)

@@ -123,7 +123,7 @@ administrative credentials and confirmation.`,
 				}
 				c.ok("%s: %s (%s, read-only access verified)", sc.Kind, d.Path, d.Detail)
 				if sc.Kind == config.SourceClaudeCode {
-					checkClaudeCode(ctx, c, d.Path)
+					checkClaudeCode(ctx, c, cfg, d.Path)
 				}
 				a.checkSourceError(ctx, c, cfg, sc)
 			}
@@ -192,7 +192,7 @@ administrative credentials and confirmation.`,
 
 // checkClaudeCode reads every transcript once (read-only) and reports files
 // it cannot read and lines it cannot parse. No transcript content is printed.
-func checkClaudeCode(ctx context.Context, c *checker, root string) {
+func checkClaudeCode(ctx context.Context, c *checker, cfg *config.Config, root string) {
 	rep, err := claudecode.Inspect(ctx, root)
 	if err != nil {
 		c.fail("claudecode: cannot list transcripts: %v", err)
@@ -219,6 +219,16 @@ func checkClaudeCode(ctx context.Context, c *checker, root string) {
 		}
 	}
 	c.ok("claudecode: %d transcript(s), %d line(s) checked (Claude Code %s)", rep.Files, rep.Lines, versions)
+	if rep.T3Sessions+rep.T3Subagents > 0 {
+		// These sessions are attributed to T3 Code whether or not it is
+		// collected, so that no work is counted by both sources.
+		if t3, ok := cfg.Source(config.SourceT3Code); ok && t3.Enabled {
+			c.info("claudecode: %d session(s) run by T3 Code are collected from T3 Code (their subagents' usage from here)", rep.T3Sessions)
+		} else {
+			c.warn("claudecode: %d session(s) were run by T3 Code; they are collected from T3 Code, which is not enabled, so only their subagents' usage is collected", rep.T3Sessions)
+			c.hint("Run `vario sources add t3code` to collect them (see docs/claude-code.md).")
+		}
+	}
 }
 
 // checkSourceError reports the last synchronization error the collector recorded for a source.

@@ -124,6 +124,10 @@ type Report struct {
 	Versions   []string
 	// Recognized counts lines of the record types the collector maps.
 	Recognized int64
+	// T3Sessions and T3Subagents count the session and subagent
+	// transcripts with lines run by T3 Code, which are collected from T3
+	// Code (see harness.go).
+	T3Sessions, T3Subagents int
 }
 
 // Inspect reads every transcript once (read-only) and reports unreadable
@@ -137,6 +141,7 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 		return r, err
 	}
 	versions := map[string]bool{}
+	sdk := map[string]string{}
 	for _, t := range files {
 		if err := ctx.Err(); err != nil {
 			return r, err
@@ -149,6 +154,16 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 			}
 			continue
 		}
+		var parent *fileState
+		if p, ok := sdk[parentRel(t)]; ok {
+			parent = &fileState{SDK: p}
+		}
+		attr := &fileState{}
+		if hi, err := scanHead(io.NewSectionReader(f, 0, 1<<62)); err == nil {
+			attr.SDK, attr.Own, _ = hi.attribution(parent.sdk(), true)
+		}
+		sdk[t.rel] = attr.SDK
+		t3 := false
 		br := bufio.NewReaderSize(f, 256<<10)
 		bad := int64(0)
 		for {
@@ -169,14 +184,21 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 			}
 			r.Lines++
 			var h struct {
-				Type    lstr `json:"type"`
-				Version lstr `json:"version"`
+				Type       lstr `json:"type"`
+				Version    lstr `json:"version"`
+				Entrypoint lstr `json:"entrypoint"`
 			}
 			if line[0] != '{' || json.Unmarshal(line, &h) != nil {
 				if complete {
 					bad++
 				}
 				continue
+			}
+			if h.Entrypoint != "" {
+				attr.Own = lineOwner(string(h.Entrypoint), attr.SDK)
+			}
+			if attr.Own == HarnessT3Code {
+				t3 = true
 			}
 			switch h.Type {
 			case "user", "assistant", "system":
@@ -187,6 +209,11 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 			}
 		}
 		f.Close()
+		if t3 && t.main {
+			r.T3Sessions++
+		} else if t3 {
+			r.T3Subagents++
+		}
 		if bad > 0 {
 			r.Bad += bad
 			r.BadFiles = append(r.BadFiles, t.rel)

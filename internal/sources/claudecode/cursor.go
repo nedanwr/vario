@@ -91,6 +91,14 @@ type fileState struct {
 	// the file grows again, its lines up to Off are read again, emitting
 	// nothing, to rebuild the parse state.
 	Compact bool `json:"z,omitempty"`
+	// SDK is the harness running the file's T3 Code and Agent SDK lines
+	// (HarnessT3Code, or ownSelf for none) and Own the owner of the last line read that had
+	// an entrypoint (see harness.go). Both are empty until the file is
+	// attributed; it is not read before. Own0 is the owner of the file's
+	// first lines, from which a compacted file is replayed.
+	SDK  string `json:"sdk,omitempty"`
+	Own  string `json:"own,omitempty"`
+	Own0 string `json:"own0,omitempty"`
 }
 
 // idleAfter is how long a transcript must be unmodified before its parse

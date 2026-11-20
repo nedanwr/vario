@@ -367,8 +367,12 @@ func TestSubagentsAreLinkedConversations(t *testing.T) {
 // Reading transcripts in arbitrary increments, including partial lines,
 // yields exactly the rows of a single full read.
 func TestIncrementalReadsMatchFullRead(t *testing.T) {
+	incrementalMatchesFull(t, func(f *cct.Fixture) { buildCorpus(t, f) })
+}
+
+func incrementalMatchesFull(t *testing.T, build func(*cct.Fixture)) {
 	ref := cct.New(t)
-	buildCorpus(t, ref)
+	build(ref)
 	files := map[string]string{}
 	err := filepath.Walk(ref.Root, func(p string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {

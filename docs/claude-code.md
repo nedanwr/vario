@@ -76,7 +76,28 @@ Anthropic reports `input_tokens` without cache reads and writes. Vario's columns
 
 ### Subagents
 
-Each subagent transcript is its own conversation with `relationship = 'subagent'`, `parent_conversation_id` and `root_conversation_id` set to the session, and the agent id, agent type and spawning tool call (`parentToolUseId`, the `event_id` of the parent's `Agent` tool call) in `attributes`. Its responses are provider turns with `usage_scope = 'subagent'`; the session's own are `main_agent`. Claude Code records each API call once, in the transcript of the agent that made it, so summing all provider turns gives total usage without double counting. Usage summaries Claude Code reports in an `Agent` tool result are not turned into provider turns.
+Each subagent transcript is its own conversation with `relationship = 'subagent'`, `parent_conversation_id` and `root_conversation_id` set to the session, and the agent id, agent type and spawning tool call (`parentToolUseId`, the `event_id` of the parent's `Agent` tool call) in `attributes`. Its responses are provider turns with `usage_scope = 'subagent'`; the session's own are `main_agent`. Claude Code records each API call once, in the transcript of the agent that made it, so within this source summing all provider turns counts each call once. Usage summaries Claude Code reports in an `Agent` tool result are not turned into provider turns. For sessions run by T3 Code, see below.
+
+## Sessions run by T3 Code
+
+T3 Code runs Claude through the Claude Agent SDK, so every Claude thread in T3 Code is also a Claude Code transcript on disk. Vario collects T3 Code from its own database, so collecting those transcripts here as well would count the same work twice. Instead, each piece of work is collected once, from the source that records it:
+
+| Work | Collected from |
+| --- | --- |
+| Claude Code sessions (terminal, IDE, any other Agent SDK application) | Claude Code, in full |
+| T3 Code threads: conversation, runs, messages, tool calls, main-agent usage | T3 Code |
+| Subagents Claude starts inside a T3 Code thread: their token usage | Claude Code, as provider turns only (`usage_scope = 'subagent'`, `"harness":"t3code"` and the agent id in `attributes`, no `run_id`) |
+| The same subagents' conversation, messages and tool calls | T3 Code (a child thread) |
+
+T3 Code's database records each thread's main-agent usage (it matches the transcript's main-agent responses exactly) but not the usage of subagents, which is why only their usage is taken from the transcripts. Those provider turns have a `conversation_id` (`<session id>/agent-<agent id>`) with no conversation row in this source.
+
+**How sessions are recognized.** A session is T3 Code's if it loaded T3 Code's MCP tools (`mcp__t3-code__*`) before its first response; every T3 Code thread does. Its lines from T3 Code's entrypoint (`t3-code`), or from the Agent SDK entrypoint (`sdk-ts`) that earlier T3 Code builds wrote, are then T3 Code's, and a subagent follows its session. The entrypoint alone does not decide: T3 Code sets it in the environment of the Claude it runs, so a `claude` that Claude itself starts from a shell command inherits `t3-code`, although T3 Code knows nothing of that session. Such sessions, and Agent SDK sessions of other applications, are collected as Claude Code. Lines without an entrypoint (titles, queue operations) follow the last line that had one. A T3 Code session later resumed in the terminal (`claude --resume`) is collected from the first terminal line on.
+
+A new transcript is read only once the lines that decide this are written (normally within seconds: the first prompt, or for T3 Code and Agent SDK sessions the first response). One that is still undecided after 10 minutes is attributed with what it has.
+
+**This does not depend on configuration.** Sessions run by T3 Code are attributed to T3 Code even when the T3 Code source is disabled. Neither source can retract rows it has delivered, so switching the attribution with the configuration would count the same work twice. `vario doctor` reports how many sessions were run by T3 Code and warns when T3 Code is not collected (`vario sources add t3code`).
+
+To compare totals across both sources, sum `provider_turns` as usual: each API call is in exactly one source.
 
 ## Distinguishing sources in queries and Grafana
 
@@ -100,9 +121,11 @@ Text that is collected is also kept, already redacted, in the local cursor while
 ## Known limitations
 
 - Only what Claude Code writes locally is available: no subscription quotas, rate limits, billing or account-wide usage, and no usage for sessions on other machines or in claude.ai / Claude Desktop. Claude Code's local cost estimates (`cost-state`) are not collected.
-- Claude Code deletes old transcripts (default 30 days); history older than that cannot be backfilled.
+- Claude Code deletes old transcripts when it starts (`cleanupPeriodDays`, default 30 days); history older than that cannot be backfilled. Keep the collector running, or back up `~/.claude/projects`, to keep it.
+- A T3 Code thread whose session did not load T3 Code's MCP tools would be collected from both sources. Every T3 Code thread seen so far loads them; `vario doctor` counts the sessions attributed to T3 Code.
 - Lines a session copies from another session (forked or resumed sessions that start with the original's lines) are collected only from the original's transcript. If the original was already deleted, those lines are not collected as entities (they remain raw events).
 - Bash exit codes are not recorded by Claude Code; failures are reported by the `is_error` flag of tool results.
 - Rows of a rewritten transcript that no longer exist in it stay in ClickHouse.
 - Projects carry no creation time (Claude Code has no project record).
 - Large prompts copied into request-log lines (`api-request-blob`) are raw events only.
+- If a future T3 Code version records its subagents' usage in its own database, those calls would be counted by both sources until Vario is updated. This was checked against T3 Code's current database, where subagent threads have no provider turns.
