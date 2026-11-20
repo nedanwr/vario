@@ -23,32 +23,32 @@ It detects your OS and CPU (amd64 or arm64), installs the newest **beta** (the d
 
 No administrator rights are needed, and the installer never touches `~/.vario` or installs or starts the background service. Re-running it upgrades an existing installation in place. It does nothing if that version is already installed, and refuses to downgrade. Options (`install.sh` / `install.ps1`, or the environment variable):
 
-- `--version v0.1.0-beta.2` / `-Version`, `VARIO_VERSION`: install a specific version (this also avoids the GitHub API, which allows 60 anonymous requests an hour per address)
+- `--version v0.1.0-beta.3` / `-Version`, `VARIO_VERSION`: install a specific version (this also avoids the GitHub API, which allows 60 anonymous requests an hour per address)
 - `--channel stable` / `-Channel`, `VARIO_CHANNEL`: follow the stable channel once there is a stable release
 - `--install-dir DIR` / `-InstallDir`, `VARIO_INSTALL_DIR`: another directory
 - `--force` / `-Force`: reinstall the same version or downgrade
 
-Pass options through the pipe with `sh -s --`, e.g. `curl -fsSL https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.sh | sh -s -- --version v0.1.0-beta.2`. On Windows, set the environment variable first: `$env:VARIO_VERSION = 'v0.1.0-beta.2'; irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex`. Details are in [Distribution](distribution.md#installers).
+Pass options through the pipe with `sh -s --`, e.g. `curl -fsSL https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.sh | sh -s -- --version v0.1.0-beta.3`. On Windows, set the environment variable first: `$env:VARIO_VERSION = 'v0.1.0-beta.3'; irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex`. Details are in [Distribution](distribution.md#installers).
 
-To download manually, prebuilt archives for macOS, Linux and Windows (amd64 and arm64) and a `checksums.txt` file are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases); beta versions are GitHub pre-releases there. For example, `https://github.com/nedanwr/vario/releases/download/v0.1.0-beta.2/vario_0.1.0-beta.2_linux_amd64.tar.gz`. Each archive contains the executable, `LICENSE`, `README.md` and `THIRD_PARTY_LICENSES.txt`; the documentation linked from the README is on GitHub. The background service is available on macOS only (see [Background service](operations.md#background-service)). Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Code signing](#code-signing).
+To download manually, prebuilt archives for macOS, Linux and Windows (amd64 and arm64) and a `checksums.txt` file are attached to each [GitHub Release](https://github.com/nedanwr/vario/releases); beta versions are GitHub pre-releases there. For example, `https://github.com/nedanwr/vario/releases/download/v0.1.0-beta.3/vario_0.1.0-beta.3_linux_amd64.tar.gz`. Each archive contains the executable, `LICENSE`, `README.md` and `THIRD_PARTY_LICENSES.txt`; the documentation linked from the README is on GitHub. The background service is available on macOS only (see [Background service](operations.md#background-service)). Download the archive for your platform, [verify its checksum](#verifying-downloads), extract it, and put `vario` (`vario.exe` on Windows) on your `PATH`. The macOS binaries are not signed or notarized; see [Code signing](#code-signing).
 
 To build from source, you need Go 1.25 or newer. The binary is a standalone executable with no CGO and no runtime dependencies.
 
 ```bash
 git clone https://github.com/nedanwr/vario.git
 cd vario
-git checkout v0.1.0-beta.2   # optional: a released version instead of the latest master
+git checkout v0.1.0-beta.3   # optional: a released version instead of the latest master
 make build                   # writes bin/vario with version information
 # or: go build -o bin/vario ./cmd/vario
 ```
 
-Cross-compile with `GOOS`/`GOARCH`, e.g. `GOOS=linux GOARCH=arm64 make build`. `make build` takes the version from `git describe` (the tag on a released commit) and embeds it with the commit and build date; a plain `go build` reports `dev`. `go install github.com/nedanwr/vario/cmd/vario@v0.1.0-beta.2` also works and reports the version, but not the commit or build date.
+Cross-compile with `GOOS`/`GOARCH`, e.g. `GOOS=linux GOARCH=arm64 make build`. `make build` takes the version from `git describe` (the tag on a released commit) and embeds it with the commit and build date; a plain `go build` reports `dev`. `go install github.com/nedanwr/vario/cmd/vario@v0.1.0-beta.3` also works and reports the version, but not the commit or build date.
 
-Check what you installed with `vario version`, which prints for example `vario v0.1.0-beta.2 (commit 0123456789ab, built 2026-11-13T12:00:00Z, go1.25.5, darwin/arm64)`; `vario version --short` prints only the version.
+Check what you installed with `vario version`, which prints for example `vario v0.1.0-beta.3 (commit 0123456789ab, built 2026-11-13T12:00:00Z, go1.25.5, darwin/arm64)`; `vario version --short` prints only the version.
 
 ## Verifying downloads
 
-The installers do this for you. For a manual download, get `checksums.txt` from the same release (e.g. `https://github.com/nedanwr/vario/releases/download/v0.1.0-beta.2/checksums.txt`), place it next to the archive, and run:
+The installers do this for you. For a manual download, get `checksums.txt` from the same release (e.g. `https://github.com/nedanwr/vario/releases/download/v0.1.0-beta.3/checksums.txt`), place it next to the archive, and run:
 
 ```bash
 sha256sum --check --ignore-missing checksums.txt         # Linux

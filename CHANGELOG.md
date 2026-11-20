@@ -4,11 +4,28 @@ Notable changes to Vario are listed here. Versions follow [Semantic Versioning](
 
 ## [Unreleased]
 
+## [0.1.0-beta.3]
+
+Adds Claude Code as a second source. No schema migration or configuration change is needed: an existing installation keeps collecting T3 Code as before, and Claude Code is collected only once you enable it (`vario sources add claudecode`; `vario doctor` mentions it when Claude Code is installed).
+
 ### Added
 
 - **Claude Code source** (`claudecode`): collects Claude Code's local session transcripts (`~/.claude/projects`, or `$CLAUDE_CONFIG_DIR`), including subagent transcripts, into the existing tables: conversations, runs, messages, tool calls, reasoning, API errors, compactions, raw events and token usage per API response (cache reads and writes tracked separately, each response counted once). Enable it with `vario init` (offered when detected) or `vario sources add claudecode`, import history with `vario backfill --source claudecode`. No schema migration is needed. See [docs/claude-code.md](docs/claude-code.md).
+- **No double counting with T3 Code.** T3 Code runs Claude through the Agent SDK, so its Claude threads are also Claude Code transcripts. Those threads are collected only from T3 Code. The Claude Code source skips them, and keeps just the token usage of subagents Claude starts inside them, which T3 Code does not record. They are recognized by T3 Code's MCP tools together with T3 Code's entrypoint (`t3-code`, or `sdk-ts` from earlier builds). Terminal sessions, other Agent SDK applications and `claude` sessions that Claude starts from a shell command inside T3 Code (which inherit its entrypoint) are collected in full. This attribution does not depend on whether T3 Code is enabled, and `vario doctor` warns when it is not. See [Sessions run by T3 Code](docs/claude-code.md#sessions-run-by-t3-code).
 - `vario sources` without a subcommand shows every supported source, whether it is installed and how it is configured. `vario doctor` checks Claude Code transcripts for unreadable files and malformed lines and mentions detected but unconfigured sources.
 - `vario init` flags `--claudecode-path` and `--no-claudecode`.
+
+### Privacy
+
+- The collection modes apply to Claude Code as to T3 Code. In the default `metrics` mode no prompt, reply, reasoning, tool input or output, title, branch, path or file name is collected from transcripts. The `session-owner` line (account and organization ids) is never collected, in any mode.
+- As for T3 Code, every mode exports the machine's host name and the transcript directory (`sources` table).
+
+### Known limitations
+
+- Claude Code deletes transcripts older than `cleanupPeriodDays` (30 days by default) when it starts. Older history cannot be backfilled, and work is kept only if Vario collected it before then.
+- After `vario backfill`, the first `vario run` re-reads and re-sends every source in full once. The rows are the same, so the views and totals are unaffected. Earlier betas behave the same way.
+
+The full list is in [docs/claude-code.md](https://github.com/nedanwr/vario/blob/master/docs/claude-code.md#known-limitations).
 
 ## [0.1.0-beta.2]
 
@@ -67,5 +84,6 @@ First public beta. Vario is usable for day-to-day collection, but it has not yet
 
 The full list is in [docs/operations.md](https://github.com/nedanwr/vario/blob/master/docs/operations.md#current-limitations).
 
+[0.1.0-beta.3]: https://github.com/nedanwr/vario/releases/tag/v0.1.0-beta.3
 [0.1.0-beta.2]: https://github.com/nedanwr/vario/releases/tag/v0.1.0-beta.2
 [0.1.0-beta.1]: https://github.com/nedanwr/vario/releases/tag/v0.1.0-beta.1
