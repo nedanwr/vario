@@ -65,7 +65,7 @@ type message struct {
 	Role       lstr            `json:"role"`
 	Content    json.RawMessage `json:"content"`
 	StopReason lstr            `json:"stop_reason"`
-	Usage      *usageJSON      `json:"usage"`
+	Usage      lobj[usageJSON] `json:"usage"`
 }
 
 type usageJSON struct {
@@ -73,17 +73,19 @@ type usageJSON struct {
 	CacheCreationInputTokens lnum `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     lnum `json:"cache_read_input_tokens"`
 	OutputTokens             lnum `json:"output_tokens"`
-	OutputTokensDetails      *struct {
+	// Optional details are decoded on their own, so a malformed one is
+	// ignored without losing the message or its other counts.
+	OutputTokensDetails lobj[struct {
 		ThinkingTokens lnum `json:"thinking_tokens"`
-	} `json:"output_tokens_details"`
-	ServerToolUse *struct {
+	}] `json:"output_tokens_details"`
+	ServerToolUse lobj[struct {
 		WebSearchRequests lnum `json:"web_search_requests"`
 		WebFetchRequests  lnum `json:"web_fetch_requests"`
-	} `json:"server_tool_use"`
-	CacheCreation *struct {
+	}] `json:"server_tool_use"`
+	CacheCreation lobj[struct {
 		Ephemeral5m lnum `json:"ephemeral_5m_input_tokens"`
 		Ephemeral1h lnum `json:"ephemeral_1h_input_tokens"`
-	} `json:"cache_creation"`
+	}] `json:"cache_creation"`
 	ServiceTier lstr `json:"service_tier"`
 	Speed       lstr `json:"speed"`
 }
@@ -120,14 +122,14 @@ func (u *usage) merge(j *usageJSON) {
 	u.CacheCreate = maxPtr(u.CacheCreate, j.CacheCreationInputTokens)
 	u.CacheRead = maxPtr(u.CacheRead, j.CacheReadInputTokens)
 	u.Out = maxPtr(u.Out, j.OutputTokens)
-	if d := j.OutputTokensDetails; d != nil {
+	if d := j.OutputTokensDetails.v; d != nil {
 		u.Thinking = maxPtr(u.Thinking, d.ThinkingTokens)
 	}
-	if s := j.ServerToolUse; s != nil {
+	if s := j.ServerToolUse.v; s != nil {
 		u.WebSearch = maxPtr(u.WebSearch, s.WebSearchRequests)
 		u.WebFetch = maxPtr(u.WebFetch, s.WebFetchRequests)
 	}
-	if c := j.CacheCreation; c != nil {
+	if c := j.CacheCreation.v; c != nil {
 		u.Cache5m = maxPtr(u.Cache5m, c.Ephemeral5m)
 		u.Cache1h = maxPtr(u.Cache1h, c.Ephemeral1h)
 	}
@@ -702,7 +704,7 @@ func (n *normalizer) assistant(conv string, st *convState, h *header, msg *messa
 			}
 			n.add(n.run(conv, st, r))
 		}
-		if msg.Usage != nil {
+		if msg.Usage.v != nil {
 			n.response(conv, st, h, msg, respID, ts)
 		}
 	}
@@ -764,7 +766,7 @@ func (n *normalizer) response(conv string, st *convState, h *header, msg *messag
 	if msg.StopReason != "" {
 		r.Stop = string(msg.StopReason)
 	}
-	r.Usage.merge(msg.Usage)
+	r.Usage.merge(msg.Usage.v)
 	n.add(n.providerTurn(conv, st, r))
 }
 

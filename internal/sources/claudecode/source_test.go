@@ -267,6 +267,34 @@ func TestStreamedUsageSnapshotsAreNotSummed(t *testing.T) {
 	}
 }
 
+func TestMalformedUsageDetailsKeepMessageAndCounts(t *testing.T) {
+	f := cct.New(t)
+	s := f.Session(cct.DefaultCwd)
+	s.Append(s.Prompt("hi"))
+	var line map[string]any
+	if err := json.Unmarshal([]byte(s.Response("msg_bad", cct.DefaultModel, "end_turn", cct.Usage{Input: 3, Output: 5}, cct.Text("reply"))[0]), &line); err != nil {
+		t.Fatal(err)
+	}
+	u := line["message"].(map[string]any)["usage"].(map[string]any)
+	u["output_tokens_details"], u["server_tool_use"], u["cache_creation"] = "bad", 7, []any{1}
+	s.Append(cct.Line(line))
+	d := newDB(t)
+	snapshot(t, New(f.Root, policy(t, config.ModeFull), 100), "", false, d)
+	p := d.turn("msg_bad")
+	if p == nil || u64(p.UncachedInputTokens) != 3 || u64(p.OutputTokens) != 5 || p.ReasoningTokens != nil {
+		t.Fatalf("turn: %+v", p)
+	}
+	found := false
+	for _, r := range d.rows[model.TableMessages] {
+		if m := r.(*model.MessageRow); m.Role == "assistant" && m.Text == "reply" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("assistant message dropped")
+	}
+}
+
 // buildCorpus writes a varied set of transcripts and returns their paths.
 func buildCorpus(t testing.TB, f *cct.Fixture) []*cct.Session {
 	main := f.Session(cct.DefaultCwd)

@@ -70,3 +70,14 @@ func (n *lint) UnmarshalJSON(b []byte) error {
 	}
 	return nil
 }
+
+// lobj is an object of type T, or absent (nil) when the value is not one.
+type lobj[T any] struct{ v *T }
+
+func (o *lobj[T]) UnmarshalJSON(b []byte) error {
+	var v T
+	if b = bytes.TrimSpace(b); len(b) > 0 && b[0] == '{' && json.Unmarshal(b, &v) == nil {
+		o.v = &v
+	}
+	return nil
+}
