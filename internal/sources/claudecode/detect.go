@@ -159,7 +159,7 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 			parent = &fileState{SDK: p}
 		}
 		attr := &fileState{}
-		if hi, err := scanHead(io.NewSectionReader(f, 0, 1<<62)); err == nil {
+		if hi, err := scanHeadAll(f, headInfo{}); err == nil {
 			attr.SDK, attr.Own, _ = hi.attribution(parent.sdk(), true)
 		}
 		sdk[t.rel] = attr.SDK

@@ -99,6 +99,9 @@ type fileState struct {
 	SDK  string `json:"sdk,omitempty"`
 	Own  string `json:"own,omitempty"`
 	Own0 string `json:"own0,omitempty"`
+	// Scan is the progress of attributing the file while that takes more
+	// than one pass.
+	Scan *headScan `json:"scan,omitempty"`
 }
 
 // idleAfter is how long a transcript must be unmodified before its parse

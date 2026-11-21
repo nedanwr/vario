@@ -314,3 +314,59 @@ func firstKey(c cursor) string {
 	}
 	return ""
 }
+
+func TestAttributionScansLongStartsInSteps(t *testing.T) {
+	for name, filler := range map[string][]string{
+		// Lines that end exactly at the step boundary.
+		"lines": {strings.Repeat("x", headScanMax/2-64), strings.Repeat("y", headScanMax/2-64)},
+		// One line that crosses it.
+		"line": {strings.Repeat("x", headScanMax+1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := cct.New(t)
+			s := f.Session(cct.DefaultCwd)
+			s.Entrypoint = "sdk-ts"
+			s.Append(s.Prompt("hello"))
+			for _, x := range filler {
+				s.AppendRaw(`{"type":"progress","data":"` + x + "\"}\n")
+			}
+			tr := transcript{rel: "p/" + s.ID + ".jsonl", main: true, session: s.ID}
+			fst := &fileState{}
+			attr := func() bool {
+				t.Helper()
+				file, err := os.Open(s.Path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				ok, err := attribute(file, tr, fst, nil, time.Now())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return ok
+			}
+
+			// Past the step budget, the tool list is not yet written: wait,
+			// keeping the progress.
+			if attr() {
+				t.Fatalf("attributed before the first response: %+v", fst)
+			}
+			st, _ := os.Stat(s.Path)
+			if fst.Scan == nil || fst.Scan.Off != st.Size() || fst.Scan.Entry != "sdk-ts" {
+				t.Fatalf("progress: %+v (size %d)", fst.Scan, st.Size())
+			}
+
+			s.Append(s.DeferredTools(cct.T3CodeTools...))
+			s.Append(s.Response("msg_1", cct.DefaultModel, "end_turn", cct.Usage{Input: 1, Output: 1}, cct.Text("hi"))...)
+			if !attr() || fst.SDK != HarnessT3Code || fst.Own != HarnessT3Code || fst.Scan != nil {
+				t.Fatalf("sdk %q own %q scan %+v", fst.SDK, fst.Own, fst.Scan)
+			}
+
+			// A file whose scanned bytes changed is scanned from the start.
+			fst = &fileState{Scan: &headScan{Off: 10, Tail: "stale"}}
+			if !attr() || fst.SDK != HarnessT3Code {
+				t.Fatalf("replaced file: %+v", fst)
+			}
+		})
+	}
+}
