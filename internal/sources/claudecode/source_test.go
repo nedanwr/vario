@@ -669,6 +669,39 @@ func TestCompactedFileRebuildsState(t *testing.T) {
 	}
 }
 
+// An untimestamped title at the start of a compacted transcript is placed as
+// during a full read, not at the last timestamp read before compaction.
+func TestCompactedFileReplaysTitleTime(t *testing.T) {
+	f := cct.New(t)
+	s := f.Session(cct.DefaultCwd)
+	s.Append(s.AITitle("t"))
+	s.Conversation("r1")
+	s.Conversation("r2")
+	src := New(f.Root, policy(t, config.ModeMetrics), 100)
+	d := newDB(t)
+	cur := snapshot(t, src, "", false, d)
+	old := mustStat(t, s.Path).ModTime().Add(-2 * idleAfter)
+	if err := os.Chtimes(s.Path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := src.Changes(ctx, cur, 100)
+	if err == nil {
+		cs, err = src.Changes(ctx, cs.Cursor, 100)
+	}
+	if c, _ := parseCursor(cs.Cursor); err != nil || !c.Files[firstKey(c)].Compact {
+		t.Fatalf("not compacted: %v", err)
+	}
+	s.Conversation("r3")
+	drain(t, src, cs.Cursor, 100, d)
+
+	ref := newDB(t)
+	snapshot(t, New(f.Root, policy(t, config.ModeMetrics), 100), "", true, ref)
+	got, want := d.conv(s.ID), ref.conv(s.ID)
+	if got == nil || want == nil || !got.CreatedAt.Equal(want.CreatedAt.Time) {
+		t.Fatalf("conversation after compaction %+v, full read %+v", got, want)
+	}
+}
+
 func mustStat(t testing.TB, p string) os.FileInfo {
 	st, err := os.Stat(p)
 	if err != nil {

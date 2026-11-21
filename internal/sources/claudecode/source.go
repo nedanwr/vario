@@ -497,10 +497,12 @@ func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, par
 	start := fst.Off
 	// A compacted file is read from the start to rebuild its parse state;
 	// lines before the offset were collected already and emit nothing.
-	replayTo, bad := int64(0), fst.Bad
+	replayTo, bad, lastTS := int64(0), fst.Bad, fst.LastTS
 	if fst.Compact {
 		replayTo, start, fst.Compact = fst.Off, 0, false
 		n.quiet = true
+		// Untimestamped lines are placed as during a full read.
+		fst.LastTS = ""
 		if fst.Own0 != "" {
 			fst.Own = fst.Own0
 		}
@@ -578,7 +580,7 @@ func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, par
 	if n.quiet {
 		// The file ended before the replay did (it is checked against the
 		// offset first, so only if it changed meanwhile): keep it compacted.
-		fst.Convs, fst.Compact, fst.Bad = nil, true, bad
+		fst.Convs, fst.Compact, fst.Bad, fst.LastTS = nil, true, bad, lastTS
 		return nil
 	}
 	n.finish()
