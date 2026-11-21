@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nedanwr/vario/internal/config"
 	"github.com/nedanwr/vario/internal/model"
@@ -727,5 +728,32 @@ func TestDetect(t *testing.T) {
 	t.Setenv(EnvConfigDir, f.Config)
 	if p := DefaultPaths(); p[0] != f.Root {
 		t.Fatalf("CLAUDE_CONFIG_DIR not honored: %v", p)
+	}
+}
+
+func TestOversizedFirstLine(t *testing.T) {
+	f := cct.New(t)
+	s := f.Session(cct.DefaultCwd)
+	s.AppendRaw(strings.Repeat("x", maxLine+1) + "\n")
+	s.Append(s.Prompt("go"))
+	s.Append(s.Response("msg_1", cct.DefaultModel, "end_turn", cct.Usage{Input: 1, Output: 1}, cct.Text("x"))...)
+	// Attribution cannot see past the line, so the file must have settled.
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(s.Path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	src := New(f.Root, policy(t, config.ModeMetrics), 100)
+	d := newDB(t)
+	cur := snapshot(t, src, "", false, d)
+	if d.turn("msg_1") == nil {
+		t.Fatal("lines after the oversized line must be read")
+	}
+	s.Append(s.Prompt("again"))
+	cur = drain(t, src, cur, 100, d)
+	c, _ := parseCursor(cur)
+	for _, st := range c.Files {
+		if st.Epoch != 0 || st.Bad != 1 || st.HeadLen != headMax {
+			t.Fatalf("state: epoch %d, bad %d, head %d", st.Epoch, st.Bad, st.HeadLen)
+		}
 	}
 }

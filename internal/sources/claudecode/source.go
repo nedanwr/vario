@@ -492,7 +492,15 @@ func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, par
 			length++ // newline
 		}
 		if off == 0 && !n.quiet {
-			fst.setHead(line, length)
+			head := line
+			if skipped > 0 {
+				// The line was too long to keep: read its prefix again.
+				head = make([]byte, min(length, headMax))
+				if _, err := f.ReadAt(head, 0); err != nil {
+					return fmt.Errorf("read %s: %w", t.rel, err)
+				}
+			}
+			fst.setHead(head, length)
 		}
 		if skipped > 0 {
 			fst.Bad++
