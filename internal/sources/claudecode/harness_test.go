@@ -15,7 +15,7 @@ import (
 // harnessCorpus is a set of sessions run by T3 Code, by Claude Code itself
 // and by other Agent SDK applications.
 type harnessCorpus struct {
-	t3, legacy, app, nested, resumed, cli *cct.Session
+	t3, legacy, app, appFile, nested, resumed, cli *cct.Session
 }
 
 func t3Session(f *cct.Fixture, entry string, marker bool) *cct.Session {
@@ -56,6 +56,11 @@ func buildHarnessCorpus(f *cct.Fixture) harnessCorpus {
 	c.app = t3Session(f, "sdk-ts", false)
 	c.app.Conversation("app")
 	subagentOf(c.app, "appsub", "app")
+	// One whose prompt attaches a file that names T3 Code's tools: only the
+	// tools available to the session count.
+	c.appFile = t3Session(f, "sdk-ts", false)
+	c.appFile.Append(c.appFile.FileAttachment("notes.md", `uses "mcp__t3-code__send_to_user"`))
+	c.appFile.Conversation("appf")
 	// A claude started by Claude in T3 Code (`claude -p` in a shell
 	// command): it inherits T3 Code's entrypoint, but T3 Code knows nothing
 	// of it.
@@ -137,7 +142,7 @@ func TestSessionsRunByT3CodeAreNotCollectedTwice(t *testing.T) {
 		}
 
 		// Everything else is collected in full.
-		for _, id := range []string{"msg_app_1", "msg_app_2", "msg_app_s1", "msg_nest_1", "msg_nest_s2", "msg_r2_1", "msg_r2_2", "msg_cli_1", "msg_cli_s2"} {
+		for _, id := range []string{"msg_app_1", "msg_app_2", "msg_app_s1", "msg_appf_1", "msg_appf_2", "msg_nest_1", "msg_nest_s2", "msg_r2_1", "msg_r2_2", "msg_cli_1", "msg_cli_s2"} {
 			if p := d.turn(id); p == nil || strings.Contains(p.Attributes, "harness") {
 				t.Fatalf("%s: response %s: %+v", mode, id, p)
 			}

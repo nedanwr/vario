@@ -327,6 +327,14 @@ func (s *Session) DeferredTools(names ...string) string {
 	return Line(m)
 }
 
+// FileAttachment returns an attachment line with a file attached to a prompt.
+func (s *Session) FileAttachment(name, content string) string {
+	m := s.base("attachment")
+	m["attachment"] = map[string]any{"type": "file", "filename": name,
+		"content": map[string]any{"type": "text", "file": map[string]any{"filePath": name, "content": content}}}
+	return Line(m)
+}
+
 // T3CodeTools are tool names of T3 Code's MCP server.
 var T3CodeTools = []string{"WebFetch", "mcp__t3-code__delegate_task", "mcp__t3-code__send_to_user"}
 

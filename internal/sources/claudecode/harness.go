@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"slices"
 	"strings"
 	"time"
 )
@@ -49,9 +50,8 @@ const (
 	ownSelf = "-"
 
 	t3Entrypoint = "t3-code"
-	// t3MCPMarker is how T3 Code's MCP tools appear in the attachments that
-	// list the tools available to a session.
-	t3MCPMarker = `"mcp__t3-code__`
+	// t3MCPPrefix starts the names of T3 Code's MCP tools.
+	t3MCPPrefix = "mcp__t3-code__"
 
 	// headScanMax bounds one step of the scan that attributes a transcript.
 	// A longer start is scanned in several steps; a transcript left
@@ -131,7 +131,7 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 		if hi.entry == "" {
 			hi.entry = string(h.Entrypoint)
 		}
-		if h.Type == "attachment" && bytes.Contains(line, []byte(t3MCPMarker)) {
+		if h.Type == "attachment" && bytes.Contains(line, []byte(t3MCPPrefix)) && listsT3Tools(line) {
 			hi.marker = true
 		}
 		if h.Type == "assistant" {
@@ -139,6 +139,35 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 			return hi, nil
 		}
 	}
+}
+
+// listsT3Tools reports whether the attachment line lists T3 Code's MCP tools
+// among the tools available to its session. Only the fields that name tools
+// count: the prefix elsewhere (a file attached to a prompt) does not make a
+// session T3 Code's.
+func listsT3Tools(line []byte) bool {
+	var a struct {
+		Attachment struct {
+			Type     lstr   `json:"type"`
+			Added    []lstr `json:"addedNames"`
+			Readded  []lstr `json:"readdedNames"`
+			Surfaced []lstr `json:"surfacedNames"`
+			Entries  []struct {
+				Name lstr `json:"name"`
+			} `json:"entries"`
+		} `json:"attachment"`
+	}
+	_ = json.Unmarshal(line, &a) // a field of another type leaves the others
+	var names []lstr
+	switch at := a.Attachment; at.Type {
+	case "deferred_tools_delta":
+		names = slices.Concat(at.Added, at.Readded, at.Surfaced)
+	case "deferred_tools_record":
+		for _, e := range at.Entries {
+			names = append(names, e.Name)
+		}
+	}
+	return slices.ContainsFunc(names, func(n lstr) bool { return strings.HasPrefix(string(n), t3MCPPrefix) })
 }
 
 // scanHeadAll continues hi's scan step by step up to the first response or
