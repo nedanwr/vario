@@ -307,6 +307,13 @@ func (n *normalizer) line(off int64, raw []byte) {
 		n.fst.Bad++
 		return
 	}
+	// A session file can contain lines copied from another session (for
+	// example when a conversation is forked or resumed into a new session).
+	// They are collected from their own session's file, never twice, and
+	// leave this file's state alone.
+	if n.t.main && h.SessionID != "" && string(h.SessionID) != n.t.session {
+		return
+	}
 	ts := string(h.Timestamp)
 	if ts != "" && !model.ParseTime(ts).IsZero() {
 		n.fst.LastTS = ts
@@ -356,13 +363,6 @@ func (n *normalizer) line(off int64, raw []byte) {
 		}
 	}
 	n.add(n.rawEvent(off, raw, &h, msg, conv, sub, session, agent))
-
-	// A session file can contain lines copied from another session (for
-	// example when a conversation is forked or resumed into a new session).
-	// They are collected from their own session's file, never twice.
-	if n.t.main && h.SessionID != "" && string(h.SessionID) != n.t.session {
-		return
-	}
 
 	switch h.Type {
 	case "user", "assistant", "system", "custom-title", "ai-title", "summary", "permission-mode", "queue-operation", "attachment":

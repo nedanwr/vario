@@ -690,6 +690,12 @@ func TestForeignSessionLinesAreNotCollectedTwice(t *testing.T) {
 	if d.count(model.TableProviderTurns) != 3 || d.turn("msg_o_1").ConversationID != orig.ID || d.turn("msg_f").ConversationID != fork.ID {
 		t.Fatalf("turns: %v", d.state()[model.TableProviderTurns])
 	}
+	// Each line is recorded once: the copied lines only from the original.
+	origLines := strings.Count(read(t, orig.Path), "\n")
+	forkLines := strings.Count(read(t, fork.Path), "\n")
+	if d.raw != forkLines {
+		t.Fatalf("raw events: %d, want %d (%d copied)", d.raw, forkLines, origLines)
+	}
 }
 
 func TestPrivacyModes(t *testing.T) {
