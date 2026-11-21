@@ -383,3 +383,28 @@ func TestAttributionScansLongStartsInSteps(t *testing.T) {
 		})
 	}
 }
+
+func TestConversationEmittedWhenLastLineIsUsageOnly(t *testing.T) {
+	f := cct.New(t)
+	// A T3 Code session resumed in the terminal, whose file ends with a
+	// T3 Code subagent's response: only its usage is collected, but the
+	// terminal segment's conversation still is.
+	s := t3Session(f, "t3-code", true)
+	s.Conversation("r1")
+	s.Entrypoint = "cli"
+	s.Conversation("r2")
+	sub := s.LegacySidechain("t3sub")
+	sub.Entrypoint = "t3-code"
+	sub.Append(sub.Response("msg_side_1", cct.DefaultModel, "end_turn", cct.Usage{Input: 1, Output: 2}, cct.Text("ok"))...)
+	d := newDB(t)
+	snapshot(t, New(f.Root, policy(t, config.ModeMetrics), 50), "", true, d)
+	if cv := d.conv(s.ID); cv == nil || cv.CreationSource != "cli" {
+		t.Fatalf("resumed session conversation: %+v", cv)
+	}
+	if p := d.turn("msg_side_1"); p == nil || !strings.Contains(p.Attributes, `"harness":"t3code"`) {
+		t.Fatalf("T3 Code subagent usage: %+v", p)
+	}
+	if cv := d.conv(s.ID + "/agent-t3sub"); cv != nil {
+		t.Fatalf("T3 Code subagent conversation collected: %+v", cv)
+	}
+}

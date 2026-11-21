@@ -484,7 +484,9 @@ func (n *normalizer) project(id, cwd string) model.Record {
 	return model.Record{Table: model.TableProjects, Key: id, Row: &pr}
 }
 
-// finish emits the conversations changed since the last call.
+// finish emits the conversations changed since the last call. Only lines
+// that were collected mark a conversation dirty, so its row is emitted
+// whatever kind of line was read last.
 func (n *normalizer) finish() {
 	ids := make([]string, 0, len(n.dirty))
 	for id := range n.dirty {
@@ -493,8 +495,8 @@ func (n *normalizer) finish() {
 	sort.Strings(ids)
 	for _, id := range ids {
 		st := n.fst.Convs[id]
-		if st != nil && st.Created != "" {
-			n.add(n.conversation(id, st))
+		if st != nil && st.Created != "" && !n.quiet {
+			n.b.add(n.conversation(id, st))
 		}
 	}
 	clear(n.dirty)
