@@ -37,6 +37,7 @@ Vario keeps its configuration and local state in **`~/.vario/`** (mode `0700`) o
 | `~/.vario/config.toml`         | Configuration (mode `0600`). No secrets.                                                                                                      |
 | `~/.vario/clickhouse-password` | Operational ClickHouse password (mode `0600`), unless `clickhouse.password_file` points elsewhere. Administrative passwords are never stored. |
 | `~/.vario/data/`               | Spool, cursors, destinations and lease (`collector.data_dir`).                                                                                |
+| `~/.vario/machine-id`          | This machine's identifier (mode `0600`), stored on first use and only ever hashed into Claude Code source IDs, so they and their cursors stay stable. |
 
 **Which file is used.** Every command, the collector, `backfill` and the background service resolve the configuration the same way:
 
