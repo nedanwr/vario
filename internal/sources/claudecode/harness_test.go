@@ -210,6 +210,14 @@ func TestAttributionWaitsForDecidingLines(t *testing.T) {
 		}
 	}
 
+	// A synthetic error (a failed request) is not a response: it decides
+	// nothing.
+	t3.Append(t3.SyntheticError())
+	cur = drain(t, src, cur, 50, d)
+	if got := rowsMentioning(d, t3.ID); len(got) != 0 {
+		t.Fatalf("session attributed on a synthetic error: %v", got)
+	}
+
 	// The first response decides: without T3 Code's tools the session is
 	// another application's, and everything from its start is collected.
 	app.Append(app.Response("msg_a", cct.DefaultModel, "end_turn", cct.Usage{Input: 1, Output: 2}, cct.Text("hi"))...)

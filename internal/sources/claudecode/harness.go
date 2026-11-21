@@ -83,7 +83,7 @@ func harnessEntry(entry string) bool {
 type headInfo struct {
 	entry    string // the first entrypoint
 	marker   bool   // T3 Code's MCP tools were listed before the first response
-	response bool   // a response was reached
+	response bool   // a response (not a synthetic error) was reached
 	end      bool   // the end of the file was reached
 	more     bool   // the scan step ended before the first response or the end
 	next     int64  // where the scan continues: the end of the last complete line
@@ -122,8 +122,12 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 			return hi, nil
 		}
 		var h struct {
-			Type       lstr `json:"type"`
-			Entrypoint lstr `json:"entrypoint"`
+			Type       lstr  `json:"type"`
+			Entrypoint lstr  `json:"entrypoint"`
+			IsAPIError lbool `json:"isApiErrorMessage"`
+			Message    struct {
+				Model lstr `json:"model"`
+			} `json:"message"`
 		}
 		if json.Unmarshal(line, &h) != nil {
 			continue
@@ -134,7 +138,9 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 		if h.Type == "attachment" && bytes.Contains(line, []byte(t3MCPPrefix)) && listsT3Tools(line) {
 			hi.marker = true
 		}
-		if h.Type == "assistant" {
+		// A synthetic error (a failed request) is not a response: the
+		// session's tools may still be listed before its first real one.
+		if h.Type == "assistant" && !h.IsAPIError && h.Message.Model != "<synthetic>" {
 			hi.response = true
 			return hi, nil
 		}
