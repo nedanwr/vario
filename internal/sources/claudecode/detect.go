@@ -168,10 +168,11 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 		bad := int64(0)
 		for {
 			line, complete, skipped, err := readLine(br)
+			if err != nil && err != io.EOF {
+				r.Unreadable = append(r.Unreadable, fmt.Sprintf("%s: %v", t.rel, err))
+				break
+			}
 			if len(line) == 0 && !complete && skipped == 0 {
-				if err != nil && err != io.EOF {
-					r.Unreadable = append(r.Unreadable, fmt.Sprintf("%s: %v", t.rel, err))
-				}
 				break
 			}
 			line = bytes.TrimSpace(line)

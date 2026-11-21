@@ -105,10 +105,10 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 			return hi, nil
 		}
 		line, complete, skipped, err := readLine(br)
+		if err != nil && err != io.EOF {
+			return hi, err
+		}
 		if len(line) == 0 && !complete && skipped == 0 {
-			if err != nil && err != io.EOF {
-				return hi, err
-			}
 			hi.end = true
 			return hi, nil
 		}

@@ -518,10 +518,10 @@ func (s *Source) readFile(ctx context.Context, t transcript, fst *fileState, par
 			return err
 		}
 		line, complete, skipped, err := readLine(r)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("read %s: %w", t.rel, err)
+		}
 		if len(line) == 0 && !complete && skipped == 0 {
-			if err != nil && err != io.EOF {
-				return fmt.Errorf("read %s: %w", t.rel, err)
-			}
 			eof = true
 			break
 		}

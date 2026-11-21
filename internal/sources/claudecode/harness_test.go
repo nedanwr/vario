@@ -2,6 +2,8 @@ package claudecode
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -406,5 +408,42 @@ func TestConversationEmittedWhenLastLineIsUsageOnly(t *testing.T) {
 	}
 	if cv := d.conv(s.ID + "/agent-t3sub"); cv != nil {
 		t.Fatalf("T3 Code subagent conversation collected: %+v", cv)
+	}
+}
+
+// failingReaderAt returns data and then fails with err instead of io.EOF.
+type failingReaderAt struct {
+	data []byte
+	err  error
+}
+
+func (r failingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(r.data)) {
+		return 0, r.err
+	}
+	n := copy(p, r.data[off:])
+	if n < len(p) {
+		return n, r.err
+	}
+	return n, nil
+}
+
+// A read error is reported even when the bytes read before it form a valid
+// JSON value without a newline, which would otherwise be taken as a line.
+func TestScanHeadReportsReadErrorAfterFragment(t *testing.T) {
+	failure := errors.New("disk failure")
+	f := failingReaderAt{data: []byte(`{"type":"assistant","message":{"model":"m"}}`), err: failure}
+	hi, err := scanHead(f, headInfo{})
+	if !errors.Is(err, failure) {
+		t.Fatalf("err = %v, want %v", err, failure)
+	}
+	if hi.response {
+		t.Fatal("fragment before a failed read was treated as a response")
+	}
+
+	// At the end of the file the fragment is still read as before.
+	hi, err = scanHead(failingReaderAt{data: f.data, err: io.EOF}, headInfo{})
+	if err != nil || !hi.response {
+		t.Fatalf("at EOF: response = %v, err = %v; want a response", hi.response, err)
 	}
 }
