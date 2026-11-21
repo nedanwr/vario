@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -789,5 +790,49 @@ func TestOversizedFirstLine(t *testing.T) {
 		if st.Epoch != 0 || st.Bad != 1 || st.HeadLen != headMax {
 			t.Fatalf("state: epoch %d, bad %d, head %d", st.Epoch, st.Bad, st.HeadLen)
 		}
+	}
+}
+
+func TestUnreadableProjectKeepsCursorEntries(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("directory permissions are not enforced")
+	}
+	f := cct.New(t)
+	s := f.Session(cct.DefaultCwd)
+	s.Conversation("x")
+	src := New(f.Root, policy(t, config.ModeMetrics), 100)
+	d := newDB(t)
+	cur := snapshot(t, src, "", false, d)
+	want, _ := parseCursor(cur)
+
+	dir := filepath.Dir(s.Path)
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	check := func(what, cur string) {
+		t.Helper()
+		c, _ := parseCursor(cur)
+		if len(c.Files) != len(want.Files) {
+			t.Fatalf("%s dropped entries of an unreadable project: %v", what, c.Files)
+		}
+	}
+	cs, err := src.Changes(ctx, cur, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("Changes", cs.Cursor)
+	check("Snapshot", snapshot(t, src, cur, false, d))
+
+	// Readable again: nothing is collected twice.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	n := len(d.all)
+	if cs, err := src.Changes(ctx, cur, 100); err != nil || len(cs.Records) != 0 {
+		t.Fatalf("re-collected after the project became readable: %d records, %v", len(cs.Records), err)
+	}
+	if len(d.all) != n {
+		t.Fatal("unexpected records")
 	}
 }

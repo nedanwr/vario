@@ -36,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nedanwr/vario/internal/model"
@@ -165,27 +166,63 @@ type transcript struct {
 	main bool
 }
 
+// listing is the result of discovery: the transcripts found and the cursor
+// keys (or key prefixes ending in "/") below which entries could not be read.
+// Cursor entries there are kept: the files may still exist.
+type listing struct {
+	files      []transcript
+	unreadable []string
+}
+
+// keep reports whether the cursor entry rel must be kept although its file
+// was not listed, because its directory could not be read.
+func (l listing) keep(rel string) bool {
+	for _, u := range l.unreadable {
+		if rel == u || (strings.HasSuffix(u, "/") && strings.HasPrefix(rel, u)) {
+			return true
+		}
+	}
+	return false
+}
+
 // list discovers transcripts below the root in a stable order.
-func (s *Source) list() ([]transcript, error) {
+func (s *Source) list() (listing, error) {
 	st, err := os.Stat(s.root)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return listing{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	if !st.IsDir() {
-		return nil, fmt.Errorf("%w: %s is not a directory", ErrUnavailable, s.root)
+		return listing{}, fmt.Errorf("%w: %s is not a directory", ErrUnavailable, s.root)
 	}
-	return listTranscripts(s.root)
+	return scanTranscripts(s.root)
 }
 
 func listTranscripts(root string) ([]transcript, error) {
+	l, err := scanTranscripts(root)
+	return l.files, err
+}
+
+// gone reports whether err means that a path no longer exists.
+func gone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+func scanTranscripts(root string) (listing, error) {
 	projects, err := os.ReadDir(root)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return listing{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	var out []transcript
+	var unreadable []string
 	add := func(dir, rel string, e fs.DirEntry, session, agent string, main bool) {
 		info, err := e.Info()
-		if err != nil || !info.Mode().IsRegular() {
+		if err != nil {
+			if !gone(err) {
+				unreadable = append(unreadable, rel)
+			}
+			return
+		}
+		if !info.Mode().IsRegular() {
 			return
 		}
 		out = append(out, transcript{rel: rel, path: filepath.Join(dir, e.Name()), size: info.Size(), mod: info.ModTime().UnixNano(),
@@ -198,7 +235,11 @@ func listTranscripts(root string) ([]transcript, error) {
 		pdir := filepath.Join(root, p.Name())
 		entries, err := os.ReadDir(pdir)
 		if err != nil {
-			continue // unreadable project directories are reported by doctor
+			// Unreadable project directories are reported by doctor.
+			if !gone(err) {
+				unreadable = append(unreadable, p.Name()+"/")
+			}
+			continue
 		}
 		for _, e := range entries {
 			name := e.Name()
@@ -214,6 +255,9 @@ func listTranscripts(root string) ([]transcript, error) {
 				sdir := filepath.Join(pdir, name, "subagents")
 				subs, err := os.ReadDir(sdir)
 				if err != nil {
+					if !gone(err) && !errors.Is(err, syscall.ENOTDIR) {
+						unreadable = append(unreadable, p.Name()+"/"+name+"/subagents/")
+					}
 					continue
 				}
 				for _, se := range subs {
@@ -228,7 +272,7 @@ func listTranscripts(root string) ([]transcript, error) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].rel < out[j].rel })
-	return out, nil
+	return listing{files: out, unreadable: unreadable}, nil
 }
 
 // Snapshot reads every transcript. Without a previous cursor, or with
@@ -238,10 +282,11 @@ func listTranscripts(root string) ([]transcript, error) {
 func (s *Source) Snapshot(ctx context.Context, prevCursor string, includeHistory bool, emit func([]model.Record) error) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	files, err := s.list()
+	l, err := s.list()
 	if err != nil {
 		return "", err
 	}
+	files := l.files
 	prev, ok := parseCursor(prevCursor)
 	full := includeHistory || !ok
 	cur := &cursor{V: cursorVersion, Files: map[string]*fileState{}}
@@ -272,7 +317,7 @@ func (s *Source) Snapshot(ctx context.Context, prevCursor string, includeHistory
 		}
 	}
 	for rel := range cur.Files {
-		if !seen[rel] {
+		if !seen[rel] && !l.keep(rel) {
 			delete(cur.Files, rel)
 		}
 	}
@@ -292,10 +337,11 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 	if !ok {
 		return sources.ChangeSet{Reconcile: "no valid cursor"}, nil
 	}
-	files, err := s.list()
+	l, err := s.list()
 	if err != nil {
 		return sources.ChangeSet{}, err
 	}
+	files := l.files
 	if limit <= 0 {
 		limit = s.batchSize
 	}
@@ -337,7 +383,7 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 	}
 	if !more {
 		for rel := range cur.Files {
-			if !seen[rel] {
+			if !seen[rel] && !l.keep(rel) {
 				delete(cur.Files, rel)
 				changed = true
 			}
