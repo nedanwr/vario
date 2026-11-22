@@ -163,7 +163,7 @@ func Inspect(ctx context.Context, path string) (Report, error) {
 			parent = &fileState{SDK: p}
 		}
 		attr := &fileState{}
-		if hi, err := scanHeadAll(f, headInfo{}); err == nil {
+		if hi, err := scanHeadAll(f, headInfo{}, t.mainSession()); err == nil {
 			attr.SDK, attr.Own, _ = hi.attribution(parent.sdk(), true)
 		}
 		sdk[t.rel] = attr.SDK

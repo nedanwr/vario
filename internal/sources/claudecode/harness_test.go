@@ -433,7 +433,7 @@ func (r failingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 func TestScanHeadReportsReadErrorAfterFragment(t *testing.T) {
 	failure := errors.New("disk failure")
 	f := failingReaderAt{data: []byte(`{"type":"assistant","message":{"model":"m"}}`), err: failure}
-	hi, err := scanHead(f, headInfo{})
+	hi, err := scanHead(f, headInfo{}, "")
 	if !errors.Is(err, failure) {
 		t.Fatalf("err = %v, want %v", err, failure)
 	}
@@ -442,7 +442,7 @@ func TestScanHeadReportsReadErrorAfterFragment(t *testing.T) {
 	}
 
 	// At the end of the file the fragment is still read as before.
-	hi, err = scanHead(failingReaderAt{data: f.data, err: io.EOF}, headInfo{})
+	hi, err = scanHead(failingReaderAt{data: f.data, err: io.EOF}, headInfo{}, "")
 	if err != nil || !hi.response {
 		t.Fatalf("at EOF: response = %v, err = %v; want a response", hi.response, err)
 	}
@@ -495,5 +495,33 @@ func TestChangesPersistsAttributionProgress(t *testing.T) {
 	}
 	if len(again.Records) != 0 || again.Cursor != cs.Cursor {
 		t.Fatalf("records %d, cursor changed %v", len(again.Records), again.Cursor != cs.Cursor)
+	}
+}
+
+// In a main transcript, lines copied from another session (a fork or resume)
+// do not decide its attribution; lines without a session id still count.
+func TestScanHeadSkipsForeignSessionLines(t *testing.T) {
+	data := strings.Join([]string{
+		`{"type":"user","sessionId":"other","entrypoint":"sdk-ts"}`,
+		`{"type":"attachment","sessionId":"other","attachment":{"type":"deferred_tools_delta","addedNames":["mcp__t3-code__x"]}}`,
+		`{"type":"assistant","sessionId":"other","message":{"model":"m"}}`,
+		`{"type":"user","sessionId":"own","entrypoint":"cli"}`,
+		`{"type":"assistant","message":{"model":"m"}}`,
+	}, "\n") + "\n"
+	hi, err := scanHeadAll(strings.NewReader(data), headInfo{}, "own")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hi.entry != "cli" || hi.marker || !hi.response || hi.next != int64(len(data)) {
+		t.Fatalf("got entry %q marker %v response %v next %d; want cli, false, true, %d", hi.entry, hi.marker, hi.response, hi.next, len(data))
+	}
+
+	// Without a session (not a main transcript) every line counts.
+	hi, err = scanHeadAll(strings.NewReader(data), headInfo{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hi.entry != "sdk-ts" || !hi.marker || !hi.response {
+		t.Fatalf("no session: got entry %q marker %v response %v; want sdk-ts, true, true", hi.entry, hi.marker, hi.response)
 	}
 }

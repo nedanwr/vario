@@ -91,8 +91,10 @@ type headInfo struct {
 
 // scanHead continues hi's scan of a transcript, from hi.next up to its first
 // response, the end of the file, or the first line that starts after
-// headScanMax more bytes (hi.more).
-func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
+// headScanMax more bytes (hi.more). A nonempty session is the session a main
+// transcript belongs to: lines copied there from another session are skipped,
+// as the normalizer skips them.
+func scanHead(f io.ReaderAt, hi headInfo, session string) (headInfo, error) {
 	hi.end, hi.more = false, false
 	if hi.response {
 		return hi, nil
@@ -123,6 +125,7 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 		}
 		var h struct {
 			Type       lstr  `json:"type"`
+			SessionID  lstr  `json:"sessionId"`
 			Entrypoint lstr  `json:"entrypoint"`
 			IsAPIError lbool `json:"isApiErrorMessage"`
 			Message    struct {
@@ -130,6 +133,9 @@ func scanHead(f io.ReaderAt, hi headInfo) (headInfo, error) {
 			} `json:"message"`
 		}
 		if json.Unmarshal(line, &h) != nil {
+			continue
+		}
+		if session != "" && h.SessionID != "" && string(h.SessionID) != session {
 			continue
 		}
 		if hi.entry == "" {
@@ -178,10 +184,10 @@ func listsT3Tools(line []byte) bool {
 
 // scanHeadAll continues hi's scan step by step up to the first response or
 // the end of the file.
-func scanHeadAll(f io.ReaderAt, hi headInfo) (headInfo, error) {
+func scanHeadAll(f io.ReaderAt, hi headInfo, session string) (headInfo, error) {
 	for {
 		var err error
-		if hi, err = scanHead(f, hi); err != nil || !hi.more {
+		if hi, err = scanHead(f, hi, session); err != nil || !hi.more {
 			return hi, err
 		}
 	}
@@ -240,7 +246,7 @@ func attribute(f io.ReaderAt, t transcript, fst, parent *fileState, mod time.Tim
 	if err != nil {
 		return false, err
 	}
-	if hi, err = scanHeadAll(f, hi); err != nil {
+	if hi, err = scanHeadAll(f, hi, t.mainSession()); err != nil {
 		return false, err
 	}
 	settled := fst.Off > 0 || time.Since(mod) >= settleAfter
@@ -254,6 +260,15 @@ func attribute(f io.ReaderAt, t transcript, fst, parent *fileState, mod time.Tim
 	}
 	fst.SDK, fst.Own, fst.Own0, fst.Scan = sdk, own, own, nil
 	return true, nil
+}
+
+// mainSession returns the session a main transcript belongs to ("" for other
+// files, whose lines are not checked against it).
+func (t transcript) mainSession() string {
+	if !t.main {
+		return ""
+	}
+	return t.session
 }
 
 // parentRel returns the cursor key of the session transcript a subagent
