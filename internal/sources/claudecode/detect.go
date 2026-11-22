@@ -136,10 +136,14 @@ type Report struct {
 func Inspect(ctx context.Context, path string) (Report, error) {
 	root := ResolveRoot(path)
 	r := Report{Root: root}
-	files, err := listTranscripts(root)
+	l, err := scanTranscripts(root)
 	if err != nil {
 		return r, err
 	}
+	files := l.files
+	// Directories discovery could not list (keys ending in "/") and entries
+	// it could not stat are access errors too.
+	r.Unreadable = append(r.Unreadable, l.unreadable...)
 	versions := map[string]bool{}
 	sdk := map[string]string{}
 	for _, t := range files {

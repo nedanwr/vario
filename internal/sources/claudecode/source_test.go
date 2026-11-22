@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -856,6 +857,13 @@ func TestUnreadableProjectKeepsCursorEntries(t *testing.T) {
 	}
 	check("Changes", cs.Cursor)
 	check("Snapshot", snapshot(t, src, cur, false, d))
+	rep, err := Inspect(ctx, f.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proj := filepath.Base(dir) + "/"; !slices.Contains(rep.Unreadable, proj) {
+		t.Fatalf("Inspect did not report the unreadable project %s: %v", proj, rep.Unreadable)
+	}
 
 	// Readable again: nothing is collected twice.
 	if err := os.Chmod(dir, 0o700); err != nil {
