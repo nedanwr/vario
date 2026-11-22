@@ -447,3 +447,53 @@ func TestScanHeadReportsReadErrorAfterFragment(t *testing.T) {
 		t.Fatalf("at EOF: response = %v, err = %v; want a response", hi.response, err)
 	}
 }
+
+// Attribution progress is kept in the cursor although no records are emitted.
+func TestChangesPersistsAttributionProgress(t *testing.T) {
+	f := cct.New(t)
+	src := New(f.Root, policy(t, config.ModeMetrics), 100)
+	cur := snapshot(t, src, "", false, newDB(t))
+
+	s := f.Session(cct.DefaultCwd)
+	s.Entrypoint = "sdk-ts"
+	s.Append(s.Prompt("hello"))
+	s.AppendRaw(`{"type":"progress","data":"` + strings.Repeat("x", headScanMax+1) + "\"}\n")
+
+	scan := func(cur string) *headScan {
+		t.Helper()
+		c, ok := parseCursor(cur)
+		if !ok {
+			t.Fatal("invalid cursor")
+		}
+		fst := c.Files[firstKey(c)]
+		if fst == nil || fst.Scan == nil {
+			t.Fatalf("no progress: %+v", fst)
+		}
+		return fst.Scan
+	}
+	cs, err := src.Changes(ctx, cur, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := scan(cs.Cursor).Off
+
+	// More of the start is written, still undecided: the scan advances in a
+	// file the cursor already knows, emitting nothing.
+	s.AppendRaw(`{"type":"progress","data":"` + strings.Repeat("y", headScanMax+1) + "\"}\n")
+	prev := cs.Cursor
+	if cs, err = src.Changes(ctx, prev, 100); err != nil {
+		t.Fatal(err)
+	}
+	if len(cs.Records) != 0 || cs.Cursor == prev || scan(cs.Cursor).Off <= first {
+		t.Fatalf("records %d, cursor changed %v", len(cs.Records), cs.Cursor != prev)
+	}
+
+	// Without new bytes, nothing changed: the cursor is returned as is.
+	again, err := src.Changes(ctx, cs.Cursor, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Records) != 0 || again.Cursor != cs.Cursor {
+		t.Fatalf("records %d, cursor changed %v", len(again.Records), again.Cursor != cs.Cursor)
+	}
+}

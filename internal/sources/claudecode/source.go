@@ -373,7 +373,8 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 		if err := s.readFile(ctx, t, fst, cur.Files[parentRel(t)], b, true); err != nil {
 			return sources.ChangeSet{}, err
 		}
-		if fst.Off != before.Off || fst.Size != before.Size || fst.MTime != before.MTime || fst.Epoch != before.Epoch {
+		if fst.Off != before.Off || fst.Size != before.Size || fst.MTime != before.MTime || fst.Epoch != before.Epoch ||
+			!sameScan(fst.Scan, before.Scan) {
 			changed = true
 		}
 		if b.full() && fst.Off < t.size {
@@ -399,6 +400,14 @@ func (s *Source) Changes(ctx context.Context, cursorStr string, limit int) (sour
 		cur.Clock = b.version
 	}
 	return sources.ChangeSet{Records: recs, Cursor: cur.String(), More: more}, nil
+}
+
+// sameScan reports whether two attribution progress records are equal.
+func sameScan(a, b *headScan) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // batcher collects the records of a read, keeping only the last revision of
