@@ -18,7 +18,6 @@ import (
 	"github.com/nedanwr/vario/internal/privacy"
 	"github.com/nedanwr/vario/internal/service"
 	"github.com/nedanwr/vario/internal/sources"
-	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/spool"
 	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
@@ -195,13 +194,13 @@ func newClient(cfg *config.Config) (*clickhouse.Client, error) {
 	return clickhouse.New(cfg.ClickHouse, pw)
 }
 
-// sourcePath returns the configured database path for T3 Code, or the first default.
+// sourcePath returns the configured path of a source, or its default location.
 func sourcePath(sc config.SourceConfig) string {
 	if sc.Path != "" {
 		return sc.Path
 	}
-	if d := t3code.DefaultPaths(); len(d) > 0 {
-		return d[0]
+	if k, ok := lookupKind(sc.Kind); ok {
+		return k.defaultPath()
 	}
 	return ""
 }
@@ -215,9 +214,8 @@ func buildSources(cfg *config.Config, policy *privacy.Policy, only string) ([]so
 		if only == "" && !sc.Enabled {
 			continue
 		}
-		switch sc.Kind {
-		case config.SourceT3Code:
-			out = append(out, t3code.New(sourcePath(sc), policy, cfg.Collector.BatchSize))
+		if k, ok := lookupKind(sc.Kind); ok {
+			out = append(out, k.open(sourcePath(sc), policy, cfg.Collector.BatchSize))
 		}
 	}
 	return out, nil

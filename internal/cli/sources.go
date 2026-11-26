@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/nedanwr/vario/internal/config"
 	"github.com/nedanwr/vario/internal/sources"
-	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/spool"
 )
 
@@ -22,17 +20,69 @@ func (a *app) sourcesCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sources",
 		Short: "Discover and configure data sources",
+		Long: `Without a subcommand, sources shows every supported source: whether it is
+installed on this computer (read-only discovery) and how it is configured.
+
+Supported sources:
+  t3code      T3 Code (~/.t3/userdata/statev2.sqlite)
+  claudecode  Claude Code (~/.claude/projects, or $CLAUDE_CONFIG_DIR/projects)`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return a.sourcesOverview(cmd.Context()) },
 	}
 	cmd.AddCommand(a.sourcesDetectCmd(), a.sourcesListCmd(), a.sourcesAddCmd())
 	return cmd
 }
 
-// candidatePaths returns default discovery paths plus any configured path.
-func (a *app) candidatePaths() []string {
-	paths := t3code.DefaultPaths()
+// sourcesOverview prints discovery results and configuration for every kind.
+func (a *app) sourcesOverview(ctx context.Context) error {
+	var cfg *config.Config
+	if path, err := a.resolveConfigPath(); err == nil {
+		if c, err := config.Load(path); err == nil {
+			cfg = c
+		}
+	}
+	for i, k := range sourceKinds {
+		if i > 0 {
+			fmt.Fprintln(a.stdout)
+		}
+		fmt.Fprintf(a.stdout, "%s (%s)\n", k.name, k.kind)
+		sc, configured := config.SourceConfig{}, false
+		if cfg != nil {
+			sc, configured = cfg.Source(k.kind)
+		}
+		switch {
+		case cfg == nil:
+			fmt.Fprintln(a.stdout, "  configured: no configuration yet (run `vario init`)")
+		case !configured:
+			fmt.Fprintf(a.stdout, "  configured: no (enable with `vario sources add %s`)\n", k.kind)
+		default:
+			fmt.Fprintf(a.stdout, "  configured: enabled=%t  %s\n", sc.Enabled, sourcePath(sc))
+		}
+		found := false
+		for _, d := range visibleDetections(k.detect(ctx, a.candidatePaths(k))) {
+			found = found || d.Compatible
+			mark := "✗"
+			if d.Compatible {
+				mark = "✓"
+			}
+			fmt.Fprintf(a.stdout, "  %s %s: %s\n", mark, d.Path, d.Detail)
+			for _, f := range d.Facts {
+				fmt.Fprintf(a.stdout, "      %s: %s\n", f.Name, f.Value)
+			}
+		}
+		if !found && !configured {
+			fmt.Fprintf(a.stdout, "  not detected; if it stores data elsewhere: `vario sources add %s --path <%s>`\n", k.kind, k.pathHelp)
+		}
+	}
+	return nil
+}
+
+// candidatePaths returns a kind's default discovery paths plus any configured path.
+func (a *app) candidatePaths(k sourceKind) []string {
+	paths := k.defaults()
 	if path, err := a.resolveConfigPath(); err == nil {
 		if cfg, err := config.Load(path); err == nil {
-			if sc, ok := cfg.Source(config.SourceT3Code); ok && sc.Path != "" {
+			if sc, ok := cfg.Source(k.kind); ok && sc.Path != "" {
 				paths = append([]string{sc.Path}, paths...)
 			}
 		}
@@ -43,6 +93,25 @@ func (a *app) candidatePaths() []string {
 		if !seen[p] {
 			seen[p] = true
 			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// visibleDetections omits alternative locations that do not exist when
+// another one does.
+func visibleDetections(ds []sources.Detection) []sources.Detection {
+	exists := false
+	for _, d := range ds {
+		exists = exists || d.Exists
+	}
+	if !exists {
+		return ds[:min(len(ds), 1)]
+	}
+	var out []sources.Detection
+	for _, d := range ds {
+		if d.Exists {
+			out = append(out, d)
 		}
 	}
 	return out
@@ -65,21 +134,25 @@ func (a *app) sourcesDetectCmd() *cobra.Command {
 		Use:   "detect",
 		Short: "Discover supported local data sources (read-only)",
 		Long: `Detect looks for supported AI applications in their default locations and
-any configured location. Databases are opened read-only and never modified.
+any configured location. Sources are only read, never modified.
 
-Supported: T3 Code (~/.t3/userdata/statev2.sqlite by default).`,
+Supported: T3 Code (~/.t3/userdata/statev2.sqlite by default) and Claude Code
+(~/.claude/projects, $CLAUDE_CONFIG_DIR/projects or ~/.config/claude/projects).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if len(paths) == 0 {
-				paths = a.candidatePaths()
-			}
 			found := false
-			for _, d := range t3code.Detect(cmd.Context(), paths) {
-				printDetection(a.stdout, d)
-				found = found || d.Compatible
+			for _, k := range sourceKinds {
+				ps := paths
+				if len(ps) == 0 {
+					ps = a.candidatePaths(k)
+				}
+				for _, d := range visibleDetections(k.detect(cmd.Context(), ps)) {
+					printDetection(a.stdout, d)
+					found = found || d.Compatible
+				}
 			}
 			if !found {
-				fmt.Fprintln(a.stdout, "\nNo compatible sources found. If T3 Code stores data elsewhere, run `vario sources add t3code --path <statev2.sqlite>`.")
+				fmt.Fprintln(a.stdout, "\nNo compatible sources found. If a source stores data elsewhere, run `vario sources add <t3code|claudecode> --path <path>`.")
 			}
 			return nil
 		},
@@ -97,7 +170,7 @@ func (a *app) sourcesListCmd() *cobra.Command {
 				return err
 			}
 			if len(cfg.Sources) == 0 {
-				fmt.Fprintln(a.stdout, "No sources configured. Run `vario sources detect` and `vario sources add t3code`.")
+				fmt.Fprintln(a.stdout, "No sources configured. Run `vario sources` and `vario sources add <t3code|claudecode>`.")
 				return nil
 			}
 			store, _ := spool.OpenReadOnly(statePath(cfg))
@@ -113,7 +186,7 @@ func (a *app) sourcesListCmd() *cobra.Command {
 				path := sourcePath(sc)
 				cur, last := "-", "-"
 				if store != nil {
-					cur, last = cursorSummary(cmd.Context(), store, t3code.SourceID(path))
+					cur, last = cursorSummary(cmd.Context(), store, sc.Kind, sourceID(sc))
 				}
 				fmt.Fprintf(tw, "%s\t%t\t%s\t%s\t%s\n", sc.Kind, sc.Enabled, path, cur, last)
 			}
@@ -122,18 +195,11 @@ func (a *app) sourcesListCmd() *cobra.Command {
 	}
 }
 
-func cursorSummary(ctx context.Context, store *spool.Store, id string) (string, string) {
+func cursorSummary(ctx context.Context, store *spool.Store, kind, id string) (string, string) {
 	cur, last := "-", "-"
 	if c, ok, _ := store.Cursor(ctx, id); ok {
-		var v struct {
-			Epoch int64 `json:"epoch"`
-			Seq   int64 `json:"seq"`
-		}
-		if json.Unmarshal([]byte(c), &v) == nil {
-			cur = fmt.Sprintf("seq %d", v.Seq)
-			if v.Epoch > 1 {
-				cur += fmt.Sprintf(" (epoch %d)", v.Epoch)
-			}
+		if k, ok := lookupKind(kind); ok {
+			cur = k.summary(c)
 		}
 	}
 	if v, _, ok, _ := store.KV(ctx, "source."+id+".last_sync"); ok && v != "" {
@@ -154,16 +220,24 @@ func (a *app) sourcesAddCmd() *cobra.Command {
 	var path string
 	var disabled, force bool
 	cmd := &cobra.Command{
-		Use:   "add t3code",
+		Use:   "add <t3code|claudecode>",
 		Short: "Configure and enable a source",
-		Long: `Add validates that the source database exists and has a compatible schema,
-then enables it in the configuration. Use --path when the database is not in
-its default location.`,
+		Long: `Add validates that the source exists and can be read, then enables it in the
+configuration. Use --path when it is not in its default location:
+
+  t3code      the path of T3 Code's statev2.sqlite
+  claudecode  Claude Code's configuration directory (~/.claude, or
+              $CLAUDE_CONFIG_DIR) or its projects directory
+
+Enabling a source does not affect other sources or data already collected.
+The running collector picks it up after a restart; the first synchronization
+reads its history in full.`,
 		Args:      cobra.ExactArgs(1),
-		ValidArgs: []string{config.SourceT3Code},
+		ValidArgs: config.SourceKinds,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if args[0] != config.SourceT3Code {
-				return withCode(ExitUsage, fmt.Errorf("unsupported source %q (supported: %s)", args[0], config.SourceT3Code))
+			k, ok := lookupKind(args[0])
+			if !ok {
+				return withCode(ExitUsage, fmt.Errorf("unsupported source %q (supported: %s)", args[0], supportedList()))
 			}
 			cfgPath, err := a.resolveConfigPath()
 			if err != nil {
@@ -183,15 +257,18 @@ its default location.`,
 			}
 			check := path
 			if check == "" {
-				check = sourcePath(config.SourceConfig{})
+				check = sourcePath(config.SourceConfig{Kind: k.kind})
 			}
-			d := t3code.Detect(cmd.Context(), []string{check})[0]
+			d := k.detect(cmd.Context(), []string{check})[0]
 			printDetection(a.stdout, d)
 			if !d.Compatible && !force {
 				return fmt.Errorf("source not usable at %s (use --force to add it anyway)", check)
 			}
+			if d.Compatible {
+				check = d.Path
+			}
 			next := cfg.Clone()
-			next.UpsertSource(config.SourceConfig{Kind: config.SourceT3Code, Enabled: !disabled, Path: check})
+			next.UpsertSource(config.SourceConfig{Kind: k.kind, Enabled: !disabled, Path: check})
 			if _, err := config.Update(cfgPath, cfg.Fingerprint(), config.Diff(cfg, next)); err != nil {
 				return err
 			}
@@ -199,15 +276,15 @@ its default location.`,
 			if disabled {
 				state = "added (disabled)"
 			}
-			fmt.Fprintf(a.stdout, "\nSource t3code %s in %s\n", state, cfgPath)
-			fmt.Fprintln(a.stdout, "Next: `vario backfill --source t3code` or `vario run`.")
+			fmt.Fprintf(a.stdout, "\nSource %s %s in %s\n", k.kind, state, cfgPath)
+			fmt.Fprintf(a.stdout, "Next: `vario backfill --source %s` or `vario run`.\n", k.kind)
 			a.serviceNotice(cfgPath, true)
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&path, "path", "", "path to T3 Code's statev2.sqlite")
+	cmd.Flags().StringVar(&path, "path", "", "source location (t3code: statev2.sqlite; claudecode: ~/.claude or its projects directory)")
 	cmd.Flags().BoolVar(&disabled, "disabled", false, "add the source without enabling it")
-	cmd.Flags().BoolVar(&force, "force", false, "add even if the database is missing or incompatible")
+	cmd.Flags().BoolVar(&force, "force", false, "add even if the source is missing or unreadable")
 	return cmd
 }
 

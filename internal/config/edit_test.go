@@ -237,17 +237,25 @@ func TestCreate(t *testing.T) {
 }
 
 func TestKeysRoundTrip(t *testing.T) {
+	// Paths are stored absolute, so the samples are absolute on this OS.
+	abs := func(p string) string {
+		if runtime.GOOS == "windows" {
+			return `C:` + filepath.FromSlash(p)
+		}
+		return p
+	}
 	samples := map[string]string{
 		"collector.poll_interval": "7s", "collector.reconcile_interval": "0s", "collector.batch_size": "42",
-		"collector.data_dir": "/var/vario", "collector.log_level": "debug",
+		"collector.data_dir": abs("/var/vario"), "collector.log_level": "debug",
 		"privacy.mode": "full", "privacy.allow_sensitive_content": "true", "privacy.redact_secrets": "false",
 		"privacy.max_field_bytes": "100",
 		"clickhouse.url":          "https://h:8443", "clickhouse.database": "db1", "clickhouse.create_database": "true",
-		"clickhouse.username": "u", "clickhouse.password_file": "/etc/pw", "clickhouse.timeout": "3s",
+		"clickhouse.username": "u", "clickhouse.password_file": abs("/etc/pw"), "clickhouse.timeout": "3s",
 		"clickhouse.flush_interval": "1s", "clickhouse.max_insert_rows": "9", "clickhouse.retry_initial_backoff": "1s",
-		"clickhouse.retry_max_backoff": "1m0s", "clickhouse.ca_file": "/etc/ca.pem", "clickhouse.tls_insecure_skip_verify": "true",
+		"clickhouse.retry_max_backoff": "1m0s", "clickhouse.ca_file": abs("/etc/ca.pem"), "clickhouse.tls_insecure_skip_verify": "true",
 		"clickhouse.allow_insecure_http": "true", "spool.max_size_mb": "64",
-		"sources.t3code.enabled": "true", "sources.t3code.path": "/x/statev2.sqlite",
+		"sources.t3code.enabled": "true", "sources.t3code.path": abs("/x/statev2.sqlite"),
+		"sources.claudecode.enabled": "true", "sources.claudecode.path": abs("/x/.claude/projects"),
 	}
 	p := writeConfig(t, "[clickhouse]\nurl = \"https://ch.example.com\"\n")
 	cfg, _ := Load(p)

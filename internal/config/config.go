@@ -26,7 +26,24 @@ const (
 	ModeFull     = "full"
 )
 
-const SourceT3Code = "t3code"
+// Supported source kinds.
+const (
+	SourceT3Code     = "t3code"
+	SourceClaudeCode = "claudecode"
+)
+
+// SourceKinds lists the supported source kinds.
+var SourceKinds = []string{SourceT3Code, SourceClaudeCode}
+
+// SupportedSource reports whether kind is a supported source kind.
+func SupportedSource(kind string) bool {
+	for _, k := range SourceKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
 
 type Duration struct{ time.Duration }
 
@@ -278,8 +295,8 @@ func (c *Config) Validate() error {
 
 	seen := map[string]bool{}
 	for i, s := range c.Sources {
-		if s.Kind != SourceT3Code {
-			add("sources[%d].kind %q is not supported (supported: %s)", i, s.Kind, SourceT3Code)
+		if !SupportedSource(s.Kind) {
+			add("sources[%d].kind %q is not supported (supported: %s)", i, s.Kind, strings.Join(SourceKinds, ", "))
 		}
 		if seen[s.Kind] {
 			add("sources[%d]: source %q is configured more than once", i, s.Kind)

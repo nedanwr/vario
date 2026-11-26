@@ -160,7 +160,7 @@ func TestReinitPreservesSettings(t *testing.T) {
 		t.Fatalf("reinit change: %+v", r)
 	}
 	after := readFile(t, cfgPath)
-	for _, want := range []string{`database = "telemetry"`, "batch_size = 777  # tuned", "# my note", fix.Path} {
+	for _, want := range []string{`database = "telemetry"`, "batch_size = 777  # tuned", "# my note", "path = " + tomlQuoted(fix.Path)} {
 		if !strings.Contains(after, want) {
 			t.Errorf("after reinit, file is missing %q:\n%s", want, after)
 		}

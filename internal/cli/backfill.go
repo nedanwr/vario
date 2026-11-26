@@ -21,11 +21,13 @@ func (a *app) backfillCmd() *cobra.Command {
 	var source string
 	var force, noDeliver bool
 	cmd := &cobra.Command{
-		Use:   "backfill --source t3code",
+		Use:   "backfill --source <t3code|claudecode>",
 		Short: "Import existing historical data from a source",
 		Long: `Backfill reads a consistent snapshot of the source's current state and its
 event history into the local spool, records the snapshot boundary as the
-incremental cursor, and then delivers the spool to ClickHouse.
+incremental cursor, and then delivers the spool to ClickHouse. For Claude
+Code it reads every session transcript (and subagent transcript); later
+runs read only what was appended since.
 
 Backfill is idempotent. Records already queued for the configured destination
 with identical content are skipped; --force re-sends everything. Cursors and
@@ -34,8 +36,8 @@ a full backfill. If ClickHouse is unreachable, data stays spooled and is
 delivered later by 'vario run' (exit code 3).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if source != config.SourceT3Code {
-				return withCode(ExitUsage, fmt.Errorf("unsupported source %q (supported: %s)", source, config.SourceT3Code))
+			if !config.SupportedSource(source) {
+				return withCode(ExitUsage, fmt.Errorf("unsupported source %q (supported: %s)", source, supportedList()))
 			}
 			cfg, err := a.loadConfig()
 			if err != nil {
@@ -101,7 +103,7 @@ delivered later by 'vario run' (exit code 3).`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&source, "source", "", "source to backfill (t3code)")
+	cmd.Flags().StringVar(&source, "source", "", "source to backfill (t3code or claudecode)")
 	cmd.Flags().BoolVar(&force, "force", false, "re-send all records and the full event history even if unchanged")
 	cmd.Flags().BoolVar(&noDeliver, "no-deliver", false, "only fill the local spool; do not contact ClickHouse")
 	_ = cmd.MarkFlagRequired("source")

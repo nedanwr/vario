@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/nedanwr/vario/internal/model"
-	"github.com/nedanwr/vario/internal/sources/t3code"
 	"github.com/nedanwr/vario/internal/spool"
 )
 
@@ -47,7 +46,7 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 
 			store, err := spool.OpenReadOnly(statePath(cfg))
 			if err != nil {
-				fmt.Fprintln(w, "\nNo local state yet: the collector has not run. Start it with `vario run` or `vario backfill --source t3code`.")
+				fmt.Fprintln(w, "\nNo local state yet: the collector has not run. Start it with `vario run` or `vario backfill --source <kind>`.")
 				return nil
 			}
 			defer store.Close()
@@ -82,10 +81,10 @@ ClickHouse; use 'vario doctor' for connectivity checks.`,
 			}
 			for _, sc := range cfg.Sources {
 				path := sourcePath(sc)
-				id := t3code.SourceID(path)
+				id := sourceID(sc)
 				cur, last := "none (not yet synchronized for this destination)", "never"
 				if hasState {
-					cur, last = cursorSummary(ctx, store, id)
+					cur, last = cursorSummary(ctx, store, sc.Kind, id)
 				}
 				fmt.Fprintf(w, "  %s  enabled=%t  %s\n", sc.Kind, sc.Enabled, path)
 				fmt.Fprintf(w, "    id             %s\n", id)

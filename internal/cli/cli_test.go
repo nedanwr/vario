@@ -27,7 +27,7 @@ func TestMain(m *testing.M) {
 	}
 	os.Setenv("HOME", home)
 	os.Setenv("USERPROFILE", home)
-	for _, k := range []string{config.EnvConfig, config.EnvHome, config.EnvPassword, "XDG_CONFIG_HOME", "XDG_STATE_HOME", "VISUAL", "EDITOR"} {
+	for _, k := range []string{config.EnvConfig, config.EnvHome, config.EnvPassword, "XDG_CONFIG_HOME", "XDG_STATE_HOME", "VISUAL", "EDITOR", "CLAUDE_CONFIG_DIR"} {
 		os.Unsetenv(k)
 	}
 	serviceManager = func() (service.Manager, error) { return nil, service.ErrUnsupported }
@@ -65,7 +65,7 @@ func isolateHome(t *testing.T) string {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	for _, k := range []string{config.EnvConfig, config.EnvHome, config.EnvPassword} {
+	for _, k := range []string{config.EnvConfig, config.EnvHome, config.EnvPassword, "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}
@@ -235,7 +235,8 @@ func TestInitDefaultLocationAndPermissions(t *testing.T) {
 		}
 	}
 	// --config overrides the default; $VARIO_HOME relocates it.
-	if p := vario(t, "", "--config", "/tmp/x/other.toml", "config", "path"); strings.TrimSpace(p.stdout) != "/tmp/x/other.toml" {
+	other := filepath.Join(home, "x", "other.toml")
+	if p := vario(t, "", "--config", other, "config", "path"); strings.TrimSpace(p.stdout) != other {
 		t.Fatalf("--config: %+v", p)
 	}
 	alt := filepath.Join(home, "alt")
@@ -406,21 +407,37 @@ func TestConfigEdit(t *testing.T) {
 }
 
 func TestSplitWords(t *testing.T) {
-	for in, want := range map[string]string{
-		`vim`:                    `vim`,
-		`code --wait`:            `code|--wait`,
-		`"/Apps/My Ed/ed" -n`:    `/Apps/My Ed/ed|-n`,
-		`'a b' c\ d`:             `a b|c d`,
-		`emacs; rm -rf /`:        `emacs;|rm|-rf|/`,
-		`vi $(touch /tmp/pwned)`: `vi|$(touch|/tmp/pwned)`,
+	for _, tc := range []struct {
+		in, posix, windows string
+	}{
+		{`vim`, `vim`, `vim`},
+		{`code --wait`, `code|--wait`, `code|--wait`},
+		{`"/Apps/My Ed/ed" -n`, `/Apps/My Ed/ed|-n`, `/Apps/My Ed/ed|-n`},
+		{`'a b' c\ d`, `a b|c d`, `a b|c\|d`},
+		{`emacs; rm -rf /`, `emacs;|rm|-rf|/`, `emacs;|rm|-rf|/`},
+		{`vi $(touch /tmp/pwned)`, `vi|$(touch|/tmp/pwned)`, `vi|$(touch|/tmp/pwned)`},
+		// Windows paths keep their backslashes, quoted or not.
+		{`"C:\Program Files\Ed\ed.exe" -w`, `C:Program FilesEded.exe|-w`, `C:\Program Files\Ed\ed.exe|-w`},
+		{`C:\Tools\vim.exe`, `C:Toolsvim.exe`, `C:\Tools\vim.exe`},
 	} {
-		got, err := splitWords(in)
-		if err != nil || strings.Join(got, "|") != want {
-			t.Errorf("splitWords(%q) = %q, %v; want %q", in, got, err, want)
+		for _, windows := range []bool{false, true} {
+			want := tc.posix
+			if windows {
+				want = tc.windows
+			}
+			got, err := splitWordsFor(tc.in, windows)
+			if err != nil || strings.Join(got, "|") != want {
+				t.Errorf("splitWordsFor(%q, windows=%t) = %q, %v; want %q", tc.in, windows, got, err, want)
+			}
 		}
 	}
-	if _, err := splitWords(`"unterminated`); err == nil {
-		t.Error("unterminated quote should fail")
+	for _, windows := range []bool{false, true} {
+		if _, err := splitWordsFor(`"unterminated`, windows); err == nil {
+			t.Error("unterminated quote should fail")
+		}
+	}
+	if _, err := splitWordsFor(`trailing\`, false); err == nil {
+		t.Error("a trailing escape should fail")
 	}
 }
 

@@ -78,3 +78,10 @@ max_size_mb = 512
 kind = "t3code"
 enabled = true
 path = "~/.t3/userdata/statev2.sqlite"
+
+# Claude Code session transcripts. path may be Claude Code's configuration
+# directory (~/.claude, or $CLAUDE_CONFIG_DIR) or its projects directory.
+[[sources]]
+kind = "claudecode"
+enabled = true
+path = "~/.claude/projects"

@@ -17,7 +17,7 @@ import (
 	"github.com/nedanwr/vario/internal/config"
 	"github.com/nedanwr/vario/internal/privacy"
 	"github.com/nedanwr/vario/internal/service"
-	"github.com/nedanwr/vario/internal/sources/t3code"
+	"github.com/nedanwr/vario/internal/sources/claudecode"
 	"github.com/nedanwr/vario/internal/spool"
 	"github.com/nedanwr/vario/internal/storage/clickhouse"
 )
@@ -115,15 +115,31 @@ administrative credentials and confirmation.`,
 					continue
 				}
 				enabled++
-				d := t3code.Detect(ctx, []string{sourcePath(sc)})[0]
-				if d.Compatible {
-					c.ok("%s: %s (%s, read-only access verified)", sc.Kind, d.Path, d.Detail)
-				} else {
+				k, _ := lookupKind(sc.Kind)
+				d := k.detect(ctx, []string{sourcePath(sc)})[0]
+				if !d.Compatible {
 					c.fail("%s: %s: %s", sc.Kind, d.Path, d.Detail)
+					continue
+				}
+				c.ok("%s: %s (%s, read-only access verified)", sc.Kind, d.Path, d.Detail)
+				if sc.Kind == config.SourceClaudeCode {
+					checkClaudeCode(ctx, c, cfg, d.Path)
+				}
+				a.checkSourceError(ctx, c, cfg, sc)
+			}
+			for _, k := range sourceKinds {
+				if _, ok := cfg.Source(k.kind); ok {
+					continue
+				}
+				for _, d := range k.detect(ctx, k.defaults()) {
+					if d.Compatible {
+						c.info("%s data found at %s but not enabled (enable with `vario sources add %s`)", k.name, d.Path, k.kind)
+						break
+					}
 				}
 			}
 			if enabled == 0 {
-				c.fail("no enabled sources; run `vario sources add t3code`")
+				c.fail("no enabled sources; run `vario sources` and `vario sources add <kind>`")
 			}
 
 			fmt.Fprintln(c.w, "\nLocal state")
@@ -172,6 +188,59 @@ administrative credentials and confirmation.`,
 	cmd.Flags().BoolVar(&fixSchema, "create-schema", false, "deprecated: run `vario migrate` instead")
 	_ = cmd.Flags().MarkDeprecated("create-schema", "use `vario migrate` (this flag runs it)")
 	return cmd
+}
+
+// checkClaudeCode reads every transcript once (read-only) and reports files
+// it cannot read and lines it cannot parse. No transcript content is printed.
+func checkClaudeCode(ctx context.Context, c *checker, cfg *config.Config, root string) {
+	rep, err := claudecode.Inspect(ctx, root)
+	if err != nil {
+		c.fail("claudecode: cannot list transcripts: %v", err)
+		return
+	}
+	for i, u := range rep.Unreadable {
+		if i == 5 {
+			c.hint(fmt.Sprintf("... and %d more", len(rep.Unreadable)-5))
+			break
+		}
+		c.fail("claudecode: cannot read %s", u)
+	}
+	if rep.Bad > 0 {
+		c.warn("claudecode: %d line(s) in %d transcript(s) are not valid JSON and are skipped (for example %s)", rep.Bad, len(rep.BadFiles), rep.BadFiles[0])
+	}
+	if rep.Lines > 0 && rep.Recognized == 0 {
+		c.warn("claudecode: %d transcript line(s) but none in a known format; this Claude Code version may write a format Vario does not understand", rep.Lines)
+	}
+	versions := "unknown"
+	if n := len(rep.Versions); n > 0 {
+		versions = rep.Versions[0]
+		if n > 1 {
+			versions += " … " + rep.Versions[n-1]
+		}
+	}
+	c.ok("claudecode: %d transcript(s), %d line(s) checked (Claude Code %s)", rep.Files, rep.Lines, versions)
+	if rep.T3Sessions+rep.T3Subagents > 0 {
+		// These sessions are attributed to T3 Code whether or not it is
+		// collected, so that no work is counted by both sources.
+		if t3, ok := cfg.Source(config.SourceT3Code); ok && t3.Enabled {
+			c.info("claudecode: %d session(s) run by T3 Code are collected from T3 Code (their subagents' usage from here)", rep.T3Sessions)
+		} else {
+			c.warn("claudecode: %d session(s) were run by T3 Code; they are collected from T3 Code, which is not enabled, so only their subagents' usage is collected", rep.T3Sessions)
+			c.hint("Run `vario sources add t3code` to collect them (see docs/claude-code.md).")
+		}
+	}
+}
+
+// checkSourceError reports the last synchronization error the collector recorded for a source.
+func (a *app) checkSourceError(ctx context.Context, c *checker, cfg *config.Config, sc config.SourceConfig) {
+	store, err := spool.OpenReadOnly(statePath(cfg))
+	if err != nil {
+		return
+	}
+	defer store.Close()
+	if v, at, ok, _ := store.KV(ctx, "source."+sourceID(sc)+".last_error"); ok && v != "" {
+		c.warn("%s: the collector's last synchronization failed (%s): %s", sc.Kind, at.Local().Format(time.DateTime), v)
+	}
 }
 
 func checkPrivate(c *checker, path, what string) {

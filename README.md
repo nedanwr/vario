@@ -4,7 +4,7 @@
 
 Vario is a lightweight, cross-platform command-line tool for AI observability. It reads the local data of AI applications on your machine (read-only), normalizes it, and delivers it to a ClickHouse database you control.
 
-> **Status: public beta (`v0.1.0-beta.2`).** Vario collects from T3 Code into self-hosted ClickHouse. The configuration, command-line interface and ClickHouse schema may still change between betas; schema changes ship as additive migrations (`vario migrate`), and anything that needs manual action is listed in the [changelog](CHANGELOG.md). Downgrades are not supported.
+> **Status: public beta (`v0.1.0-beta.3`).** Vario collects from T3 Code and Claude Code into self-hosted ClickHouse. The configuration, command-line interface and ClickHouse schema may still change between betas; schema changes ship as additive migrations (`vario migrate`), and anything that needs manual action is listed in the [changelog](CHANGELOG.md). Downgrades are not supported.
 
 ## What it collects
 
@@ -19,7 +19,7 @@ Vario runs as a single process, in the foreground or as a per-user background se
 
 |              | Supported in this beta                                                                                                                         |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Source       | **T3 Code** (`~/.t3/userdata/statev2.sqlite`): backfill, continuous sync, token usage. No other source is supported.                            |
+| Sources      | **T3 Code** (`~/.t3/userdata/statev2.sqlite`) and **Claude Code** (`~/.claude/projects` session transcripts, see [Claude Code](docs/claude-code.md)): backfill, continuous sync, token usage. |
 | ClickHouse   | Self-hosted **24.8 LTS** and **25.8 LTS**, over HTTP(S). ClickHouse Cloud, other managed services and clusters are untested.                    |
 | Platforms    | macOS, Linux, Windows (amd64, arm64). The background service (`vario service`) is **macOS only**; elsewhere, run `vario run` under your own supervisor. |
 
@@ -37,7 +37,7 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/nedanwr/vario/master/scripts/install.ps1 | iex
 ```
 
-The installer picks the build for your OS and CPU, installs the current beta from [GitHub Releases](https://github.com/nedanwr/vario/releases), verifies its SHA-256 checksum, and puts `vario` in a per-user directory (`~/.local/bin`; `%LOCALAPPDATA%\Programs\Vario` on Windows). It needs no administrator rights, never touches your configuration and never starts the background service. Add `--version v0.1.0-beta.2` (`-Version` on Windows) for a specific version; see [Installing](docs/getting-started.md#install-and-build) for all options. `vario version` prints the version, commit and build date.
+The installer picks the build for your OS and CPU, installs the current beta from [GitHub Releases](https://github.com/nedanwr/vario/releases), verifies its SHA-256 checksum, and puts `vario` in a per-user directory (`~/.local/bin`; `%LOCALAPPDATA%\Programs\Vario` on Windows). It needs no administrator rights, never touches your configuration and never starts the background service. Add `--version v0.1.0-beta.3` (`-Version` on Windows) for a specific version; see [Installing](docs/getting-started.md#install-and-build) for all options. `vario version` prints the version, commit and build date.
 
 You can also download the archive for your platform (macOS, Linux, Windows; amd64 and arm64) from [GitHub Releases](https://github.com/nedanwr/vario/releases), [verify its checksum](docs/getting-started.md#verifying-downloads), and put `vario` on your `PATH`. Binaries are not signed; see [Code signing](docs/getting-started.md#code-signing).
 
@@ -46,7 +46,7 @@ Or build from source with Go 1.25 or newer (no CGO, no runtime dependencies):
 ```bash
 git clone https://github.com/nedanwr/vario.git
 cd vario
-git checkout v0.1.0-beta.2   # optional: a released version instead of the latest master
+git checkout v0.1.0-beta.3   # optional: a released version instead of the latest master
 make build                   # writes bin/vario with version information
 ```
 
@@ -56,7 +56,7 @@ make build                   # writes bin/vario with version information
 vario init                      # guided setup: ClickHouse access, database, user, collection mode, sources
 vario migrate                   # create Vario's schema, if init did not (administrative credentials)
 vario doctor                    # check configuration, source access, ClickHouse
-vario backfill --source t3code  # import existing history
+vario backfill --source t3code  # import existing history (and/or --source claudecode)
 vario run                       # collect continuously in the foreground (Ctrl-C to stop)
 vario service install           # or: run in the background at login (macOS)
 vario status                    # cursor, spool, delivery and service state
@@ -111,6 +111,7 @@ Vario detects when its ClickHouse database is **replaced** (dropped and recreate
 | ------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | [Getting started](docs/getting-started.md)        | Installation, checksums, `vario init`, interrupted setup, first collection                   |
 | [Configuration](docs/configuration.md)            | All commands, exit codes, `~/.vario/` layout, `vario config`, credentials                    |
+| [Claude Code](docs/claude-code.md)                | Claude Code discovery, backfill, token accounting, subagents, limitations                    |
 | [Privacy and security](docs/privacy.md)           | Collection modes, redaction and its limits, local file permissions, purging data             |
 | [ClickHouse](docs/clickhouse.md)                  | Requirements, permissions, access checks, schema, migrations, example queries                |
 | [Operations](docs/operations.md)                  | Sync, destinations, rollback detection, delivery, recovery, upgrades, service, troubleshooting, limitations |

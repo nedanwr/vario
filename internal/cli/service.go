@@ -63,7 +63,7 @@ switching to a different configuration file.`,
 				return err
 			}
 			if len(cfg.Sources) == 0 {
-				return withCode(ExitUsage, errors.New("no sources configured; run `vario sources add t3code` first"))
+				return withCode(ExitUsage, errors.New("no sources configured; run `vario sources add <kind>` (t3code or claudecode) first"))
 			}
 			if d := serviceDataDir(cfg); d != cfg.Collector.DataDir {
 				return withCode(ExitUsage, fmt.Errorf("the configuration leaves collector.data_dir empty, so the background service, which does not inherit $%s, "+

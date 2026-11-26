@@ -159,7 +159,7 @@ func sourceKeys(kind string) []Key {
 				c.UpsertSource(s)
 				return nil
 			}},
-		{Name: "sources." + kind + ".path", Help: "source database path (empty: default location)",
+		{Name: "sources." + kind + ".path", Help: "source data path (empty: default location)",
 			get: func(c *Config) any { return get(c).Path },
 			set: func(c *Config, raw string) error {
 				p, err := ExpandPath(raw)
@@ -203,7 +203,7 @@ var keys = append([]Key{
 	boolKey("clickhouse.allow_insecure_http", "allow plain http:// to remote hosts", func(c *Config) *bool { return &c.ClickHouse.AllowInsecureHTTP }),
 
 	intKey("spool.max_size_mb", "upper bound for undelivered data on disk", func(c *Config) *int { return &c.Spool.MaxSizeMB }),
-}, sourceKeys(SourceT3Code)...)
+}, append(sourceKeys(SourceT3Code), sourceKeys(SourceClaudeCode)...)...)
 
 // Keys lists every supported key in file order.
 func Keys() []Key { return keys }
